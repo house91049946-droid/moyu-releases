@@ -1,0 +1,565 @@
+"""從一個網址擷取文案與圖片（物件管理「網址匯入」用）。
+
+用途：房仲把自家刊登在其他平台（樂屋網、591、公司官網…）的物件網址貼進來，
+省掉手動複製文案、逐張下載圖片的功夫。擷取結果只是**草稿**，前端會強制先跳
+著作權提醒視窗，使用者確認、修改後再交給 AI 重寫。
+
+為什麼要開瀏覽器而不是直接 requests/httpx：
+    多數房產網站是 JS 渲染 + 有擋機器人（curl 直接吃 403），圖片也走 lazy-load，
+    只有真的把頁面跑起來、捲一遍，才拿得到完整的圖片清單。
+
+刻意用獨立的瀏覽器 profile（不吃 FB cookie）：
+    這是去別人的網站抓公開頁面，不該帶著客戶的 FB 登入狀態出門。
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import mimetypes
+import os
+import re
+import sys
+import time
+import uuid
+from pathlib import Path
+from urllib.parse import urlparse, urlsplit, urlunsplit
+
+from playwright.sync_api import sync_playwright
+
+from src.utils import raise_fd_limit
+
+_JSON_PATH = None
+_RESULT = None
+
+# 一般桌機 Chrome 的 UA。預設的 HeadlessChrome UA 會被不少房產網站直接回 403。
+_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+# 擷取上限：文案給 AI 當基底，太長只是塞垃圾；圖片 FB 一則也放不了那麼多
+MAX_TEXT_CHARS = 1500
+MAX_IMAGE_BYTES = 15 * 1024 * 1024
+MIN_IMAGE_BYTES = 8 * 1024          # 小於這個多半是 icon / 追蹤像素
+MIN_IMAGE_W, MIN_IMAGE_H = 400, 300  # 下載後看檔頭的真實尺寸（不是瀏覽器載到的）
+
+_EXT_BY_MIME = {
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+    "image/webp": ".webp", "image/gif": ".gif", "image/avif": ".avif",
+}
+
+# 頁面擷取（在瀏覽器裡跑）：回標題／描述／價格／正文行／圖片清單。
+# 正文採「readability-lite」：複製一份 body、砍掉導覽/頁尾/廣告類節點，再逐個
+# 文字節點收，這樣表格的欄位名與值會各自成行，比 innerText 糊成一團好讀。
+_EXTRACT_JS = r"""
+() => {
+  const meta = (n) => {
+    const el = document.querySelector(`meta[property="${n}"]`) || document.querySelector(`meta[name="${n}"]`);
+    return ((el && el.content) || '').trim();
+  };
+  const clsOf = (e) => (typeof e.className === 'string' ? e.className : '') + ' ' + (e.id || '');
+
+  // 價格要在「砍節點」之前抓——它常掛在 header / sticky bar 裡，一砍就沒了
+  let price_text = '';
+  for (const e of document.querySelectorAll('[class*=price i],[class*=Price]')) {
+    const t = (e.innerText || '').replace(/\s+/g, ' ').trim();
+    if (/^[\d,.]+\s*(萬|元)/.test(t) || /(總價|售價|開價)/.test(t)) { price_text = t.slice(0, 40); break; }
+  }
+
+  const JUNK = /nav|menu|header|footer|banner|cookie|sidebar|breadcrumb|crumb|share|social|recommend|related|advert|popup|modal|login|signup|subscribe|comment|search|leaflet|map-/i;
+  const clone = document.body.cloneNode(true);
+  clone.querySelectorAll('script,style,noscript,nav,header,footer,aside,form,select,button,svg,iframe,input').forEach(e => e.remove());
+  clone.querySelectorAll('*').forEach(e => { if (JUNK.test(clsOf(e))) e.remove(); });
+
+  const lines = [];
+  const walk = (el) => {
+    for (const node of el.childNodes) {
+      if (node.nodeType === 3) {
+        const t = node.textContent.replace(/\s+/g, ' ').trim();
+        if (t) lines.push(t);
+      } else if (node.nodeType === 1) {
+        walk(node);
+      }
+    }
+  };
+  walk(clone);
+
+  const UIWORD = /^(首頁|登入|註冊|分享|複製連結|列印|檢舉|追蹤|比較|收藏|更多|展開|收合|查看全部|回上頁|上一頁|下一頁|小|中|大|NEW|新|\d+)$/;
+  // 走到「其他物件／實價登錄／免責聲明」這種尾段就停——後面全是別的物件的資料，
+  // 混進基底文案只會讓 AI 生出張冠李戴的內容
+  const TAIL = /^(社區簡介|實價登錄|成交行情|相關物件|推薦物件|類似物件|附近物件|周邊物件|熱門物件|同社區|你可能|猜你|延伸閱讀|免責聲明|網站地圖|客服)/;
+  const seen = new Set(); const text_lines = [];
+  for (const l of lines) {
+    if (TAIL.test(l)) break;
+    if (l.length < 2 || UIWORD.test(l) || seen.has(l)) continue;
+    seen.add(l); text_lines.push(l);
+  }
+
+  // 跟文案有關的欄位：開價／坪數／格局／屋齡／樓層／車位。
+  // 這些多半掛在頁首的摘要區（會被上面的 JUNK 清掉），所以在清之前先從原始 DOM 撈，
+  // 而且**每個標籤只取第一筆**——同樣格式的字串在「實價登錄」比較區會再出現一輪，
+  // 那是別的物件的數字，混進來就變成錯誤資訊。
+  const seenTxt = new Set();
+  const collect = (sel, re, maxLen, innermost) => {
+    const arr = [];
+    document.querySelectorAll(sel).forEach(e => {
+      // 外層容器會把「車位／車位類型／車位價格」整組串成一長串 → 裡面還有別的欄位列
+      // 就跳過它。只看「有沒有子元素也是欄位列」，不能看「有沒有子 div」——
+      // 「格局 2 房 2 廳」那列的每個值本身就是子 div，那樣連它一起濾掉了。
+      if (innermost && Array.from(e.querySelectorAll('div,li,tr,dd')).some(
+            c => re.test(((c.innerText || '').replace(/\s+/g, ' ')).trim()))) return;
+      const s = ((e.innerText || '').replace(/\s+/g, ' ')).trim();
+      if (!s || s.length > maxLen || !re.test(s) || seenTxt.has(s)) return;
+      seenTxt.add(s); arr.push(s);
+    });
+    return arr;
+  };
+  const price_lines = collect('[class*=price]', /^[\d,.]+\s*(萬|元)|^總\s+[\d,.]|萬\/坪/, 40, false);
+  // 只挑跟廣告文案有關的欄位。法定用途、管理方式、公設比那些是查資料用的，
+  // 貼進貼文只是雜訊，AI 拿去寫還可能把不相干的數字寫進去。
+  const spec_rows = collect(
+    'div,li,section,dd,tr',
+    /^(格局|屋齡|樓層|主建物|車位|車位類型|類型|型態)\s/, 45, true);
+
+  // 特色描述：整塊拿 innerText，不要逐個文字節點收。
+  // 房仲的賣點文字常夾雜 <span> 做粗體／換色，逐節點收會把「電梯三房+平面車位
+  // 只要1100萬」這種一句話切成三行——那是整頁最該原汁原味帶走的東西。
+  let feature = '';
+  const LABEL = /^(特色描述|物件描述|房屋描述|物件說明|屋主的話|備註說明)[:：]?$/;
+  const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  while (tw.nextNode()) {
+    const txt = (tw.currentNode.textContent || '').trim();
+    if (!LABEL.test(txt)) continue;
+    let p = tw.currentNode.parentElement;
+    for (let i = 0; i < 4 && p; i++, p = p.parentElement) {
+      const t = (p.innerText || '').trim();
+      if (t.length > txt.length + 40) { feature = t; break; }
+    }
+    if (feature) break;
+  }
+
+  const images = [];
+  document.querySelectorAll('img').forEach(i => {
+    const src = i.currentSrc || i.src || i.getAttribute('data-src') || i.getAttribute('data-original') || '';
+    if (!src || src.startsWith('data:')) return;
+    images.push({ src, w: i.naturalWidth || 0, h: i.naturalHeight || 0 });
+  });
+
+  return {
+    title: meta('og:title') || ((document.querySelector('h1') || {}).innerText || '').trim() || document.title || '',
+    description: meta('og:description') || meta('description') || '',
+    og_image: meta('og:image') || '',
+    site: meta('og:site_name') || location.hostname,
+    price_text,
+    feature,
+    price_lines,
+    spec_rows,
+    text_lines,
+    images,
+  };
+}
+"""
+
+
+# 頁面到齊了沒：看「真的載好的大圖數量」與正文長度，比任何載入事件都可靠
+_PROGRESS_JS = """() => [
+  Array.from(document.images).filter(i => i.naturalWidth >= 400 && i.naturalHeight >= 300).length,
+  ((document.body && document.body.innerText) || '').length,
+]"""
+
+
+def _launch(pw):
+    """開一個乾淨的無痕瀏覽器（不吃 FB profile、不留 cookie）。
+    優先用系統 Chrome（與專案其他地方一致），沒有就退回 Playwright 內建 Chromium。"""
+    print(f"[import] fd 上限：{raise_fd_limit()}", flush=True)   # 太低 Chrome 會卡死在載入
+    channel = None if os.environ.get("FB_USE_CHROMIUM") == "1" else "chrome"
+    try:
+        browser = pw.chromium.launch(headless=True, channel=channel) if channel \
+            else pw.chromium.launch(headless=True)
+    except Exception:
+        browser = pw.chromium.launch(headless=True)
+    context = browser.new_context(
+        locale="zh-TW", timezone_id="Asia/Taipei",
+        viewport={"width": 1280, "height": 900},
+        user_agent=_UA,
+        extra_http_headers={"accept-language": "zh-TW,zh;q=0.9"},
+    )
+    page = context.new_page()
+    page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>false});")
+    return browser, context, page
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+    # 失敗原因也印出來：失敗時原本只寫進結果 JSON（那支用完就刪），日誌檔留下 0 位元組，
+    # 客戶回報「匯入失敗」時完全無從查起
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[import] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+def _strip_query(u: str) -> str:
+    p = urlsplit(u)
+    return urlunsplit((p.scheme, p.netloc, p.path, "", ""))
+
+
+def _parse_price(text: str) -> int:
+    """「1,288 萬」→ 12880000；「1288萬」「總價 1,288 萬」皆可。抓不到回 0。"""
+    if not text:
+        return 0
+    m = re.search(r"([\d,]+(?:\.\d+)?)\s*萬", text)
+    if m:
+        with contextlib.suppress(ValueError):
+            return int(float(m.group(1).replace(",", "")) * 10000)
+    m = re.search(r"([\d,]{4,})\s*元", text)
+    if m:
+        with contextlib.suppress(ValueError):
+            return int(m.group(1).replace(",", ""))
+    return 0
+
+
+def image_size(data: bytes) -> tuple[int, int] | None:
+    """從檔頭讀出圖片長寬（PNG／JPEG／GIF／WebP）。認不得回 None。
+
+    只讀檔頭、不解碼整張圖，也不需要 Pillow——便攜包裡沒有它，為了看個長寬
+    多塞一個相依套件並不划算。
+    """
+    if len(data) < 24:
+        return None
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data[:3] == b"GIF":
+        return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk = data[12:16]
+        if chunk == b"VP8 ":
+            return (int.from_bytes(data[26:28], "little") & 0x3FFF,
+                    int.from_bytes(data[28:30], "little") & 0x3FFF)
+        if chunk == b"VP8L":
+            b = int.from_bytes(data[21:25], "little")
+            return (b & 0x3FFF) + 1, ((b >> 14) & 0x3FFF) + 1
+        if chunk == b"VP8X":
+            return (int.from_bytes(data[24:27], "little") & 0xFFFFFF) + 1, \
+                   (int.from_bytes(data[27:30], "little") & 0xFFFFFF) + 1
+        return None
+    if data[:2] == b"\xff\xd8":                 # JPEG：走到 SOF 區段才有長寬
+        i, n = 2, len(data)
+        while i + 9 < n:
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            seg = int.from_bytes(data[i + 2:i + 4], "big")
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                          0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                return (int.from_bytes(data[i + 7:i + 9], "big"),
+                        int.from_bytes(data[i + 5:i + 7], "big"))
+            i += 2 + max(seg, 2)
+    return None
+
+
+# 一看就不是內容照片的網址（圖示、logo、佈景元素）
+_ICON_RE = re.compile(r"\.svg(\?|$)|/(icon|icons|logo|sprite|avatar|badge|button|btn)[-_/.]", re.I)
+
+
+def _pick_candidates(raw: list[dict], og_image: str, limit: int) -> list[str]:
+    """挑「可能是內容照片」的網址——**不看瀏覽器載好了沒**。
+
+    先前是用 naturalWidth >= 400 過濾，那等於要求圖片已經下載並解碼完成。
+    但整頁的照片都是 lazy-load：網址早就在 DOM 裡，只是還沒載。客戶那台機器忙的
+    時候只有一兩張真的載完，其餘十幾張明明網址都拿到了卻被當成小圖丟掉——
+    「只匯入到 2 張圖」就是這樣來的。
+
+    所以這裡只做「明顯不是照片就排除」，真正的尺寸判斷留到下載之後看檔頭
+    （see image_size）——那時拿到的是真實長寬，跟機器快慢無關。
+    """
+    picked, seen = [], set()
+
+    def add(src: str) -> None:
+        src = (src or "").strip()
+        if not src.startswith(("http://", "https://")) or _ICON_RE.search(src):
+            return
+        key = _strip_query(src)
+        if key in seen:
+            return
+        seen.add(key)
+        picked.append(src)
+
+    # og:image 是網站自己標註的主圖，最不會錯，排第一個
+    add(og_image)
+    # 同一批照片通常放在同一個目錄（例：.../34886096_1_b.jpeg ～ _20_b.jpeg），
+    # 跟 og:image 同目錄的優先，其餘照 DOM 順序接在後面
+    og_dir = _strip_query(og_image).rsplit("/", 1)[0] if og_image else ""
+    same_dir = [it for it in raw if og_dir and (it.get("src") or "").startswith(og_dir)]
+    for it in same_dir + list(raw):
+        add(it.get("src") or "")
+        if len(picked) >= limit:
+            break
+    return picked[:limit]
+
+
+def _download(context, page_url: str, urls: list[str], out_dir: Path,
+              name_prefix: str, url_prefix: str,
+              max_images: int) -> tuple[list[str], list[str]]:
+    """用瀏覽器的 request context 下載（帶 cookie/referer，才不會被擋）。
+
+    尺寸在這裡才真正把關：讀下載回來的檔頭拿真實長寬，太小的（縮圖、佈景圖）
+    丟掉。這樣「夠不夠大」就與瀏覽器有沒有載完、機器快不快完全無關了。
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved, failed = [], []
+    for u in urls:
+        if len(saved) >= max_images:
+            break
+        try:
+            resp = context.request.get(u, headers={"referer": page_url}, timeout=30000)
+            if not resp.ok:
+                failed.append(f"{u}（HTTP {resp.status}）")
+                continue
+            body = resp.body()
+            if len(body) < MIN_IMAGE_BYTES or len(body) > MAX_IMAGE_BYTES:
+                failed.append(f"{u}（大小 {len(body)} 位元組，略過）")
+                continue
+            size = image_size(body)
+            if size and (size[0] < MIN_IMAGE_W or size[1] < MIN_IMAGE_H):
+                failed.append(f"{u}（{size[0]}×{size[1]}，太小）")
+                continue
+            ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+            ext = _EXT_BY_MIME.get(ctype) or mimetypes.guess_extension(ctype or "") \
+                or Path(urlparse(u).path).suffix or ".jpg"
+            if ext == ".jpe":
+                ext = ".jpg"
+            filename = f"{name_prefix}{uuid.uuid4().hex}{ext}"
+            (out_dir / filename).write_bytes(body)
+            saved.append(f"{url_prefix}{filename}")
+        except Exception as e:                      # 單張失敗不該讓整次匯入白做
+            failed.append(f"{u}（{e}）")
+    return saved, failed
+
+
+# 特色描述那一段的開頭；到下一個欄位標題或那句制式聲明就結束
+_FEATURE_START = re.compile(r"^(特色描述|物件描述|房屋描述|物件說明|屋主的話|備註說明|說明)[:：]?$")
+_FEATURE_END = re.compile(r"^(特色標籤|基本|坪數|車位|管理|社區簡介|物件資訊內容|地圖|周邊|交通|生活機能)")
+# 地址行：有縣市又有區鄉鎮
+_ADDR = re.compile(r"[縣市].*[區鄉鎮市]")
+
+
+def _clean_feature(text: str) -> str:
+    """整塊抓來的特色描述：去掉開頭的標籤、壓掉多餘空行、太長就截斷。"""
+    if not text:
+        return ""
+    lines = [l.strip() for l in text.splitlines()]
+    # 開頭常黏著分頁標籤（「詳細資訊」「物件詳情」），那是介面不是文案
+    while lines and (_FEATURE_START.match(lines[0]) or not lines[0]
+                     or re.match(r"^(詳細資訊|物件詳情|物件資訊|基本資料)$", lines[0])):
+        lines = lines[1:]
+    out = []
+    for l in lines:
+        if _FEATURE_END.match(l):
+            break
+        if not l and (not out or not out[-1]):
+            continue                       # 連續空行壓成一行
+        out.append(l)
+    body = "\n".join(out).strip()
+    return body[:800].rstrip() + "…" if len(body) > 800 else body
+
+
+def _feature_text(lines: list[str]) -> list[str]:
+    """抓「特色描述」那一段——房仲自己寫的賣點，整頁最值得留的文字。"""
+    try:
+        i = next(i for i, l in enumerate(lines) if _FEATURE_START.match(l))
+    except StopIteration:
+        return []
+    out = []
+    for l in lines[i + 1:]:
+        if _FEATURE_END.match(l) or len(out) >= 20:
+            break
+        out.append(l)
+    return out
+
+
+def _prune(lines: list[str], limit: int, by_label: bool = False) -> list[str]:
+    """同一個數字常常父子節點各中一次（「1,288 萬 含車位160萬」與「1,288 萬」）。
+    被別行包含的短行丟掉，留資訊完整的那一行。
+
+    by_label：同一個標籤只留第一筆。頁面下方的「實價登錄」比較區會再出現一次
+    「屋齡 8月」這種列——那是**別間房子**的數字，跟著進文案就是錯誤資訊。
+    """
+    out, labels = [], set()
+    for l in lines:
+        if any(l != o and l in o for o in lines) or l in out:
+            continue
+        label = l.split(" ")[0]
+        if by_label and label in labels:
+            continue
+        labels.add(label)
+        out.append(l)
+    return out[:limit]
+
+
+def _build_base_content(d: dict, price: int) -> str:
+    """組成給使用者編修 / 給 AI 當基底的草稿文案。
+
+    只留跟文案有關的東西：標題、地址／社區、開價與坪數、格局屋齡樓層、特色描述。
+    法定用途、管理方式、實價登錄比較、周邊交通那些**不放**——那是查資料用的，
+    貼進廣告文案只會變雜訊，AI 拿去寫還可能把別間房子的數字寫進來。
+    """
+    lines = d.get("text_lines") or []
+    parts = []
+
+    title = re.sub(r"^\[[^\]]{1,12}\]\s*", "", (d.get("title") or "").strip())
+    if title:
+        parts.append(title)
+
+    # 地址與社區：標題後面幾行裡找得到
+    head = []
+    for l in lines[:12]:
+        if _ADDR.search(l) and l not in head:
+            head.append(l)
+    if head:
+        parts.append(" · ".join(head[:2]))
+
+    facts = _prune(d.get("price_lines") or [], 4)
+    if not facts and price:
+        facts.append(f"開價 {price // 10000} 萬" if price >= 10000 else f"開價 {price} 元")
+    facts += _prune(d.get("spec_rows") or [], 8, by_label=True)
+    if facts:
+        parts.append("\n".join(facts))
+
+    feature = _clean_feature(d.get("feature") or "") or "\n".join(_feature_text(lines))
+    if feature:
+        parts.append("特色描述\n" + feature)
+
+    # 什麼結構化欄位都沒抓到（不是房產頁，或版面差太多）→ 退回整頁摘要，
+    # 有東西總比空手好，使用者自己刪比自己找快
+    if len(parts) <= 1:
+        desc = (d.get("description") or "").strip()
+        if desc:
+            parts.append(desc)
+        body = "\n".join(lines)
+        if len(body) > MAX_TEXT_CHARS:
+            body = body[:MAX_TEXT_CHARS].rstrip() + "\n…（原網頁內容過長，已截斷）"
+        if body:
+            parts.append(body)
+
+    return "\n\n".join(parts).strip()
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    parser = argparse.ArgumentParser(description="從網址擷取文案與圖片")
+    parser.add_argument("--url", required=True)
+    parser.add_argument("--out-dir", required=True, help="圖片存放目錄（絕對路徑）")
+    parser.add_argument("--url-prefix", required=True, help="回傳給前端的網址前綴，例如 /uploads/")
+    parser.add_argument("--name-prefix", default="imp_", help="存檔檔名前綴")
+    parser.add_argument("--max-images", type=int, default=20)
+    parser.add_argument("--result-json")
+    args = parser.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {
+        "schema": 2, "success": False, "error": "未完成",
+        "data": {"title": "", "base_content": "", "images": [], "price": 0,
+                 "source_url": args.url, "site": "", "skipped_images": []},
+    }
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    if not args.url.lower().startswith(("http://", "https://")):
+        _RESULT["error"] = "網址必須以 http:// 或 https:// 開頭"
+        sys.exit(1)
+
+    pw = sync_playwright().start()
+    try:
+        browser, context, page = _launch(pw)
+    except Exception as e:
+        _RESULT["error"] = f"開不了瀏覽器（{e}）"
+        with contextlib.suppress(Exception):
+            pw.stop()
+        sys.exit(1)
+    try:
+        # 只等「伺服器回應了」（commit），不等 domcontentloaded。
+        # 客戶回報匯入失敗查到的就是這個：從 .app 啟動的服務底下，同一個頁面
+        # commit 只要 0.8 秒、狀態 200、networkidle 也一直在觸發——頁面明明在跑，
+        # 但 domcontentloaded 等 60 秒都不來（頁面掛著第三方腳本，那個事件不保證
+        # 會到）。等一個不保證發生的事件＝把成功的擷取判成失敗。
+        try:
+            resp = page.goto(args.url, wait_until="commit", timeout=45000)
+        except Exception as e:
+            _RESULT["error"] = f"打不開這個網址（{e}）"
+            sys.exit(1)
+        if resp is not None and resp.status >= 400:
+            _RESULT["error"] = f"網頁回應 HTTP {resp.status}，可能需要登入或該站擋自動擷取"
+            sys.exit(1)
+
+        # 一邊捲一邊等，直到「載好的大圖數量」不再增加為止。
+        #
+        # 不寫死秒數，是因為同一台機器快慢可以差十倍：客戶那台開著低耗電模式、
+        # 又有四十個 Chrome 程序在跑時，實測連一次 page.evaluate 都要十幾秒，頁面
+        # readyState 整整半分鐘還停在 loading。固定等幾秒＝什麼都抓不到，而使用者
+        # 看到的只是「匯入失敗」。反過來在閒的機器上圖片幾秒就到齊，這個迴圈會提早
+        # 收工，不會白等。捲動是必要的：圖片都 lazy-load，不捲就永遠不會載。
+        t_wait = time.time()
+        deadline = t_wait + 60
+        rounds = stable = 0
+        last = -1
+        text_len = 0
+        while time.time() < deadline:
+            page.mouse.wheel(0, 1200)
+            page.wait_for_timeout(700)
+            try:
+                n, text_len = page.evaluate(_PROGRESS_JS)
+            except Exception:
+                continue                  # 導覽中 evaluate 會短暫失敗，下一輪再問
+            rounds += 1
+            stable = stable + 1 if n == last else 0
+            last = n
+            # 連續三輪沒再多＝載完了。但「一張圖都沒有、正文也還沒出來」不算載完，
+            # 那是頁面還沒開始渲染——這時提早收工只會匯入一片空白，寧可等好等滿。
+            if rounds >= 5 and stable >= 3 and (n > 0 or text_len >= 300):
+                break
+        print(f"[import] 等內容 {time.time() - t_wait:.0f}s，大圖 {max(last, 0)} 張、"
+              f"正文 {text_len} 字", flush=True)
+
+        d = page.evaluate(_EXTRACT_JS)
+        price = _parse_price(d.get("price_text") or "")
+        base_content = _build_base_content(d, price)
+
+        # 候選抓寬一點（要的兩倍再加幾張），下載後用真實尺寸淘汰縮圖與佈景圖
+        img_urls = _pick_candidates(d.get("images") or [], d.get("og_image") or "",
+                                    args.max_images * 2 + 6)
+        print(f"[import] 圖片候選 {len(img_urls)} 個", flush=True)
+        saved, failed = _download(context, args.url, img_urls, Path(args.out_dir),
+                                  args.name_prefix, args.url_prefix, args.max_images)
+
+        if not base_content and not saved:
+            _RESULT["error"] = "這個網頁沒抓到可用的文字或圖片（可能需要登入，或內容是圖片式排版）"
+            sys.exit(1)
+
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        _RESULT["data"].update({
+            "title": (d.get("title") or "").strip(),
+            "base_content": base_content,
+            "images": saved,
+            "price": price,
+            "site": d.get("site") or urlparse(args.url).hostname or "",
+            "skipped_images": failed[:10],
+        })
+        print(f"擷取完成：文案 {len(base_content)} 字、圖片 {len(saved)} 張"
+              f"（略過 {len(failed)} 張）", flush=True)
+    except SystemExit:
+        raise
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    finally:
+        for close in (context.close, browser.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+if __name__ == "__main__":
+    main()
