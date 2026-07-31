@@ -1,0 +1,174 @@
+"""舊便攜包 → 安裝版的一次性資料遷移（SPEC-P23 §3.2、驗收條件 8）。
+
+情境：客戶原本用解壓即跑的便攜包，資料就在程式資料夾旁邊；改用安裝版之後資料
+根切到 `%LOCALAPPDATA%\\moyu`。兩邊不會自動接上——客戶打開軟體會看到帳號、
+物件、授權全都不見了（其實還在舊資料夾，但他不知道）。
+
+所以安裝版第一次啟動時，自己去把舊資料搬過來。
+
+為什麼寫在這裡而不是 Inno Setup 的 [Code]：
+  - Pascal 那邊只能做很笨的複製，判斷「哪個資料夾才是舊的包」需要真的去看內容
+  - 這裡測得到（pytest），Inno 腳本測不到
+  - mac 將來若也做安裝版，同一份邏輯直接沿用
+
+⚠️ 必須在 init_db() **之前**跑。一旦建了空的 fb_poster.db，就分不出「全新安裝」
+   和「還沒搬過來」了。
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+from pathlib import Path
+
+from .config import DATA_DIR, DATA_ROOT
+
+# 這個包自己的根（backend/app/data_migration.py → 包根）。便攜包的目的地就是它。
+PKG_ROOT = Path(__file__).resolve().parents[2]
+
+# 要搬的四處：DB／上傳圖、cookie 與設定、截圖存證、Chrome 個人檔案。
+# 來源相對於舊包根；目的地兩種佈局各一份——安裝版在資料根底下，便攜包就在自己的
+# 包裡（規則見 config.py 與 FB_Auto/src/paths.py，三處必須一致）。
+MOVES = (
+    # (來源, 安裝版目的地／相對資料根, 便攜包目的地／相對新包根)
+    ("backend/data", "backend", "backend/data"),
+    ("FB_Auto/data", "fb_auto/data", "FB_Auto/data"),
+    ("FB_Auto/screenshot", "fb_auto/screenshot", "FB_Auto/screenshot"),
+    ("FB_Auto/user_data", "fb_auto/user_data", "FB_Auto/user_data"),
+)
+# Chrome 個人檔案裡的快取佔了絕大多數體積（實測一個 profile 197MB 裡有 136MB 是
+# Cache + Code Cache），而且它們是瀏覽器自己會重建的東西。搬它們只會讓客戶第一次
+# 啟動多等好幾十秒——健康檢查只等 90 秒，等過頭就變成假的「啟動失敗」。
+# 真正不能少的是 Cookies / Login Data / Local Storage 這些登入狀態。
+CHROME_CACHE_DIRS = {
+    "Cache", "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache",
+    "DawnWebGPUCache", "DawnGraphiteCache", "CacheStorage", "Service Worker",
+    "component_crx_cache", "optimization_guide_prediction_model_downloads",
+}
+SKIP_DIRS = {"logs", "__pycache__", ".update_staging", ".update_backup"} | CHROME_CACHE_DIRS
+SKIP_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}      # 作業系統的垃圾檔
+DB_REL = "backend/data/fb_poster.db"        # 用它認出「這是一個舊包」
+
+
+def _search_roots() -> list[Path]:
+    """客戶會把解壓後的資料夾放哪裡——桌面、下載、文件、家目錄。
+
+    不掃整顆硬碟：那會慢到讓啟動看起來像當掉，而且掃到別人的東西也不好。
+    真的放在冷門位置的客戶，用 MOYU_MIGRATE_FROM 指定即可。
+    """
+    home = Path.home()
+    names = ("Desktop", "Downloads", "Documents", "桌面", "下載", "文件")
+    # 新包旁邊優先：客戶解壓新版通常就落在舊版隔壁（我們自己打包也是），
+    # 那是最可能、也最不會誤判的位置
+    roots = [PKG_ROOT.parent, home] + [home / n for n in names]
+    onedrive = os.environ.get("OneDrive", "").strip()
+    if onedrive:
+        roots += [Path(onedrive)] + [Path(onedrive) / n for n in names]
+    return [r for r in roots if r.is_dir()]
+
+
+def find_old_package(explicit: str = "") -> Path | None:
+    """找出舊的便攜包資料夾（含 backend/data/fb_poster.db 的那個）。
+
+    有多個就挑資料庫最新的那個——客戶常常留著好幾版解壓的資料夾。
+    """
+    if explicit:
+        p = Path(explicit).expanduser()
+        return p if (p / DB_REL).is_file() else None
+
+    here = PKG_ROOT                                 # 目前這個包的根，別搬自己
+    found: list[Path] = []
+    for root in _search_roots():
+        try:
+            for cand in list(root.glob("moyu-*")) + list(root.glob("*/moyu-*")):
+                if cand.is_dir() and (cand / DB_REL).is_file() and cand.resolve() != here:
+                    found.append(cand)
+        except OSError:
+            continue                                # 權限不足之類，換下一個位置
+    if not found:
+        return None
+    return max(found, key=lambda p: (p / DB_REL).stat().st_mtime)
+
+
+def _copy_tree(src: Path, dst: Path) -> tuple[int, int, list[str]]:
+    """複製而不是搬移：舊資料夾原封不動留著，客戶想反悔還回得去。
+
+    已存在的檔案一律不覆蓋——這只在「新的那邊還沒有資料」時跑，真的撞名
+    表示狀況跟預期不同，保留新的比較安全。
+    """
+    files = total = 0
+    errors: list[str] = []
+    for s in src.rglob("*"):
+        rel = s.relative_to(src)
+        if any(part in SKIP_DIRS for part in rel.parts) or s.name in SKIP_FILES:
+            continue
+        if not s.is_file() or s.is_symlink():
+            continue
+        target = dst / rel
+        if target.exists():
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(s, target)
+            files += 1
+            total += target.stat().st_size
+        except OSError as e:
+            errors.append(f"{rel}: {e}")
+    return files, total, errors
+
+
+def migrate_if_needed() -> dict:
+    """第一次啟動時，把上一版的資料（帳號、cookie、物件、授權）搬過來。回傳摘要。
+
+    兩種情境都要顧：
+      - 安裝版：資料根切到 %LOCALAPPDATA%\\moyu，跟舊便攜包完全不相干
+      - 便攜包：每個解壓出來的資料夾各有一份 data，換新版＝資料全部歸零
+
+    後者尤其會咬人——啟動器這類包根的檔案不在補丁範圍，客戶只能重新下載整包；
+    要是新包一開起來帳號和 cookie 全不見、每個 FB 帳號都得重登，那形同懲罰
+    願意更新的客戶。
+
+    任何情況都不該讓後端起不來：找不到舊資料、複製失敗、權限不足，一律只記錄。
+    """
+    if (DATA_DIR / "fb_poster.db").is_file():
+        return {"status": "skipped", "reason": "已有資料，不需要遷移"}
+
+    old = find_old_package(os.environ.get("MOYU_MIGRATE_FROM", "").strip())
+    if not old:
+        return {"status": "not_found", "reason": "找不到舊版資料夾（全新安裝就是正常的）"}
+
+    files = total = 0
+    errors: list[str] = []
+    for src_rel, root_rel, pkg_rel in MOVES:
+        src = old / src_rel
+        if not src.is_dir():
+            continue
+        dst = (DATA_ROOT / root_rel) if DATA_ROOT else (PKG_ROOT / pkg_rel)
+        f, b, errs = _copy_tree(src, dst)
+        files, total, errors = files + f, total + b, errors + errs
+
+    result = {
+        "status": "migrated" if files else "not_found",
+        "source": str(old),
+        "files": files,
+        "bytes": total,
+        "errors": errors[:10],
+    }
+    if files:
+        # 留一筆給儀表板：客戶必須看得到「資料是從哪裡搬過來的」，
+        # 不然他只會覺得「東西怎麼自己出現了」或「是不是少了什麼」
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            (DATA_DIR / ".migration.json").write_text(
+                json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+    return result
+
+
+def read_state() -> dict | None:
+    try:
+        data = json.loads((DATA_DIR / ".migration.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
