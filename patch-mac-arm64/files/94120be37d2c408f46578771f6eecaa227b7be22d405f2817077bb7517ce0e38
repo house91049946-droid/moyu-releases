@@ -1,0 +1,117 @@
+"""版本檢查：比對本機版本與雲端下發的最新版本（served_config.json 的 app 區塊）。"""
+import json
+
+from fastapi import APIRouter
+
+from ..config import settings
+
+router = APIRouter(prefix="/api/version", tags=["version"])
+
+
+def _vtuple(v: str) -> tuple:
+    try:
+        return tuple(int(x) for x in v.strip().split("."))
+    except ValueError:
+        return ()
+
+
+@router.get("/check")
+async def check():
+    """回傳本機版本 + 雲端最新版本（讀下發設定快取，不打網路）。"""
+    current = settings.app_version
+    latest, url, notes = "", "", ""
+    try:
+        from ..fbauto_bridge import FB_AUTO_DATA_DIR
+        p = FB_AUTO_DATA_DIR / "served_config.json"
+        if p.exists():
+            app_cfg = (json.loads(p.read_text(encoding="utf-8")) or {}).get("app") or {}
+            latest = str(app_cfg.get("latest_version") or "")
+            url = str(app_cfg.get("download_url") or "")
+            notes = str(app_cfg.get("notes") or "")
+    except Exception:
+        pass
+
+    update = bool(latest) and _vtuple(latest) > _vtuple(current)
+    return {"current": current, "latest": latest or None,
+            "update_available": update, "download_url": url, "notes": notes,
+            # 上次啟動時補丁更新做了什麼（由 _apply_update.py 寫下）。
+            # 客戶必須看得到「剛剛更新了什麼」，不然背後換了檔案他毫無所覺。
+            "last_update": _read_update_state(),
+            # 這次背景下載的狀態；staged = 已下載好，重開就生效
+            "download": _read_download_state(current),
+            # 舊便攜包的資料是否被搬過來（安裝版第一次啟動才有）
+            "migration": _read_migration_state()}
+
+
+def _read_migration_state() -> dict | None:
+    try:
+        from ..data_migration import read_state
+        return read_state()
+    except Exception:      # noqa: BLE001
+        return None
+
+
+def _read_download_state(current: str) -> dict | None:
+    """讀背景下載器留下的狀態；讀不到就回 None（不是錯誤）。
+
+    已經套用到位的就不要再回報成 staged——狀態檔若因故沒被清掉（或客戶用別的
+    方式套用了），儀表板會一直掛著「已下載完成，重開就生效」，叫客戶重開一個
+    早就裝好的更新。以實際跑起來的版本為準。
+    """
+    try:
+        from ..update_downloader import read_state
+        state = read_state()
+    except Exception:      # noqa: BLE001 — 版本頁不該因為更新模組出事就壞掉
+        return None
+    if state and state.get("status") == "staged" and state.get("version") == current:
+        return None
+    return state
+
+
+@router.post("/check-update-now")
+async def check_update_now():
+    """手動觸發一次補丁檢查／下載（不等背景排程）。同步跑，最多 60 秒。"""
+    from starlette.concurrency import run_in_threadpool
+    try:
+        from ..update_downloader import check_and_stage
+        return await run_in_threadpool(check_and_stage, 60.0)
+    except Exception as e:      # noqa: BLE001
+        return {"status": "error", "reason": str(e)}
+
+
+def _read_update_state() -> dict | None:
+    """讀 _apply_update.py 留下的狀態；讀不到就回 None（不是錯誤）。"""
+    from ..config import DATA_DIR
+    p = DATA_DIR / ".update_state.json"
+    try:
+        if not p.is_file():
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("action") not in ("applied", "rolled_back", "failed"):
+        return None
+    return data
+
+
+@router.post("/dismiss-migration-notice")
+async def dismiss_migration_notice():
+    """客戶確認資料都在了 → 刪掉遷移狀態，下次不再顯示。"""
+    from ..config import DATA_DIR
+    try:
+        (DATA_DIR / ".migration.json").unlink(missing_ok=True)
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True}
+
+
+@router.post("/dismiss-update-notice")
+async def dismiss_update_notice():
+    """客戶關掉更新提示 → 刪掉狀態檔，下次不再顯示。"""
+    from ..config import DATA_DIR
+    p = DATA_DIR / ".update_state.json"
+    try:
+        p.unlink(missing_ok=True)
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True}
