@@ -1,5 +1,5 @@
 {
- "version": "1.0.8",
+ "version": "1.0.9",
  "platform": "mac-arm64",
  "min_runtime": "3.12.11",
  "deps_hash": "7ab6ae4131584b6f80ea34e69bb5a3491b1d0e4e2a6ab63d99b6eb833a77bff1",
@@ -126,7 +126,7 @@
   },
   {
    "path": "backend/app/config.py",
-   "sha256": "c7a40bdbea2da59e2b8449bca81c41a5c96cf66a65b50b2ca5437ab3fafc7be4",
+   "sha256": "b50fcb7af376c9eb3c54a6f7327bce9df77af347549ae5f2099f20cffceb9467",
    "size": 2211
   },
   {
@@ -411,8 +411,8 @@
   },
   {
    "path": "FB_Auto/src/run_login.py",
-   "sha256": "0a75d6f709756e52f77a96d59cebb9831e2b80ed6214b448ba670991bbcdc70b",
-   "size": 27661
+   "sha256": "a0366a102b7313f2f35d886a7b39df65d2af4ef4c4e9db2843fb95509098ffe2",
+   "size": 28910
   },
   {
    "path": "FB_Auto/src/run_nurture.py",
