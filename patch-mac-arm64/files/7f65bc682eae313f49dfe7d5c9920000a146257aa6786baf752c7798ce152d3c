@@ -1,0 +1,90 @@
+"""CLI wrapper — Cookie 登入（不輸入帳密，直接用已儲存的 cookie 登入主頁）。"""
+import argparse
+import atexit
+import json
+import sys
+import time
+
+from src.utils import launch_browser, capture_screenshot
+
+
+_JSON_PATH: str | None = None
+_RESULT: dict | None = None
+
+
+def main():
+    global _JSON_PATH, _RESULT
+
+    parser = argparse.ArgumentParser(description="FB Auto — Cookie 登入（直接進主頁）")
+    parser.add_argument("--fbid", required=True, help="FB numeric ID（必須已有 cookie）")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--keep-open", action="store_true", help="登入後保持瀏覽器開啟，不自動關閉")
+    parser.add_argument("--result-json", help="結果 JSON 輸出路徑")
+    args = parser.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {"schema": 2, "success": False, "fbid": args.fbid, "error": "未完成", "data": {}}
+    if _JSON_PATH:
+        atexit.register(_write_result_json)
+
+    browser = context = page = None
+    try:
+        browser, context, page = launch_browser(fbid=args.fbid, headless=args.headless)
+
+        from src.login import _try_cookie_login, _get_fbid_from_cookies
+
+        if not _try_cookie_login(page, context, args.fbid):
+            _RESULT["error"] = "Cookie 已失效，請重新使用帳密登入"
+            print(f"❌ {_RESULT['error']}")
+            sys.exit(1)
+
+        actual_fbid = _get_fbid_from_cookies(context)
+        if not actual_fbid:
+            _RESULT["error"] = "Cookie 登入後無法取得 fbid"
+            sys.exit(1)
+
+        print(f"✓ Cookie 登入成功 — fbid={actual_fbid}")
+        _RESULT["success"] = True
+        _RESULT["fbid"] = actual_fbid
+        _RESULT["error"] = ""
+
+        if args.keep_open:
+            # 保持瀏覽器開啟直到使用者手動關閉視窗
+            print(f"\n{'═' * 55}")
+            print("瀏覽器保持開啟中，請手動使用。")
+            print("關閉瀏覽器視窗後此程式會自動結束。")
+            print(f"{'═' * 55}")
+            try:
+                # 輪詢等待瀏覽器被使用者關閉。
+                # 用 is_closed()（本地狀態，不打瀏覽器）而不是 page.title()——
+                # title() 每秒都要進頁面執行一次 JS，客戶正在打字或捲動時會被插隊。
+                while not page.is_closed() and context.pages:
+                    time.sleep(1)
+                print("瀏覽器已關閉，程式結束。")
+            except KeyboardInterrupt:
+                print("使用者中斷")
+
+    except KeyboardInterrupt:
+        _RESULT["error"] = "使用者中斷"
+        sys.exit(0)
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        if page:
+            capture_screenshot(page, args.fbid, "cookie_login_error")
+        sys.exit(1)
+    finally:
+        if context:
+            context.close()  # launch_browser 的 browser 與 context 同物件，close 一次即可
+
+
+def _write_result_json():
+    if _JSON_PATH and _RESULT is not None:
+        try:
+            with open(_JSON_PATH, "w", encoding="utf-8") as f:
+                json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[result-json] 寫檔失敗: {e}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

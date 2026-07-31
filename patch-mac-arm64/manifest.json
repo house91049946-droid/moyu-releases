@@ -1,5 +1,5 @@
 {
- "version": "1.0.5",
+ "version": "1.0.6",
  "platform": "mac-arm64",
  "min_runtime": "3.12.11",
  "deps_hash": "7ab6ae4131584b6f80ea34e69bb5a3491b1d0e4e2a6ab63d99b6eb833a77bff1",
@@ -126,7 +126,7 @@
   },
   {
    "path": "backend/app/config.py",
-   "sha256": "e266673c65992cfed7a27bbb3a76314b20cf2681e4c83b32304659e5e3265328",
+   "sha256": "9664399aeccfde79dbbe67f356ee0be10cc7936b81aa6b6db46e5e1ffa609dfe",
    "size": 2211
   },
   {
@@ -381,8 +381,8 @@
   },
   {
    "path": "FB_Auto/src/run_cookie_login.py",
-   "sha256": "2f35ab292f8d7ae661ad58af4a30099d6df983cdcfc52738ea05fee51a0819b3",
-   "size": 3294
+   "sha256": "7f65bc682eae313f49dfe7d5c9920000a146257aa6786baf752c7798ce152d3c",
+   "size": 3353
   },
   {
    "path": "FB_Auto/src/run_delete_marketplace.py",
@@ -411,8 +411,8 @@
   },
   {
    "path": "FB_Auto/src/run_login.py",
-   "sha256": "3d47ca22ed9b2b63850770369881b6af8439f6baa1d691d251338ce7a26543a9",
-   "size": 25118
+   "sha256": "3de127a670da0edb089a69b3ac917a582c6791aad7fb6564d1a36e99e43c38c6",
+   "size": 25535
   },
   {
    "path": "FB_Auto/src/run_nurture.py",
@@ -441,8 +441,8 @@
   },
   {
    "path": "FB_Auto/src/utils.py",
-   "sha256": "6e36d4bec63f37ffb289fcb4795ff57d61dc70fe9dd7e631232f1a778ee06a6b",
-   "size": 12601
+   "sha256": "1ebff94c4f8d2dc5f9e6cbae26953ba012bf970e137a11e1767f36cce854a40f",
+   "size": 13250
   },
   {
    "path": "frontend/.next/BUILD_ID",
