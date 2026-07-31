@@ -1,0 +1,243 @@
+"""補丁更新的下載端（SPEC-P23 §4 步驟 2）。
+
+分工很清楚，別搞混：
+  - 這支只負責「抓下來、驗好、排進 staging」，**不動任何正在用的檔案**。
+  - 真正換檔是下次啟動時 `_apply_update.py` 做的——那時 backend/frontend
+    都還沒起來，python.exe / node.exe 沒被鎖才覆蓋得了（見 updater.py）。
+
+所以這支在服務執行中跑是安全的：它寫的都是 staging 底下的新檔案。
+
+雲端要提供兩個位址（放在下發設定的 app 區塊，廠商後台可改）：
+  - `manifest_url`     ：最新版 manifest.json 的網址
+  - `files_base_url`   ：內容定址的檔案倉庫前綴，客戶端抓 `<prefix>/<sha256>`
+兩者任一沒設就整個功能靜默停用（等於現況：只提示有新版，不做增量更新）。
+內容定址的好處是同一份檔案跨版本共用，發版只要把新檔案丟進同一個目錄。
+"""
+from __future__ import annotations
+
+import json
+import shutil
+import threading
+import time
+from pathlib import Path
+
+import httpx
+
+from .config import DATA_DIR
+from .update_signing import signing_enabled, verify_manifest
+from .updater import (LIGHT_TOPS, MANIFEST_NAME, PENDING_NAME, diff_manifests,
+                      safe_target, verify_sha256)
+
+STAGING = DATA_DIR / ".update_staging"
+STATE_FILE = DATA_DIR / ".update_download.json"
+
+# 保險絲：輕層整包才 20MB 上下，補丁正常是幾百 KB。真的算出上百 MB
+# 一定是哪裡錯了（manifest 對錯平台、被竄改），寧可不更新也不要把客戶的
+# 網路灌爆。超過就退回「請整包下載」。
+MAX_PATCH_BYTES = 60 * 1024 * 1024
+# 開機那一次的檢查已經由啟動器在起服務前做掉了（_check_update.py，下載完當場套用），
+# 所以這個背景迴圈只負責「開著不關的長時間工作階段」——房仲常常整天掛著跑排程。
+# 第一次拖久一點，才不會跟剛開機的其他工作搶頻寬。
+CHECK_DELAY_SEC = 1800
+RECHECK_HOURS = 6
+
+
+def _client(timeout: float) -> httpx.Client:
+    """獨立成一個函式：測試時換掉它就能塞 MockTransport，不必真的連網。"""
+    return httpx.Client(timeout=timeout, follow_redirects=True)
+
+
+def package_root() -> Path | None:
+    """回傳包根（manifest.json 所在）。開發環境沒有 manifest → None，整個功能跳過。"""
+    base = Path(__file__).resolve().parents[2]
+    return base if (base / "manifest.json").is_file() else None
+
+
+def _local_manifest(base: Path) -> dict | None:
+    try:
+        data = json.loads((base / "manifest.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def _endpoints(platform: str) -> tuple[str, str]:
+    """從下發設定讀 manifest_url / files_base_url（沒有就回空字串）。
+
+    網址裡的 `{platform}` 會換成本機平台（win64 / mac-arm64）——Windows 與 mac
+    的輕層內容不同，各自一份 manifest，但後台只要填一組帶佔位符的網址。
+    只收 https：套用的是會被執行的程式碼，明文 http 不能接受（§7）。
+    """
+    try:
+        from .fbauto_bridge import FB_AUTO_DATA_DIR
+        p = FB_AUTO_DATA_DIR / "served_config.json"
+        app_cfg = (json.loads(p.read_text(encoding="utf-8")) or {}).get("app") or {}
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+        return "", ""
+    m = str(app_cfg.get("manifest_url") or "").strip().replace("{platform}", platform)
+    f = str(app_cfg.get("files_base_url") or "").strip().replace("{platform}", platform)
+    return (m, f) if m.startswith("https://") and f.startswith("https://") else ("", "")
+
+
+def write_state(status: str, **extra) -> dict:
+    """狀態寫檔給儀表板讀。失敗不影響更新本身，所以吞掉 OSError。"""
+    state = {"status": status, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **extra}
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+    return state
+
+
+def read_state() -> dict | None:
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def _staged_version() -> str:
+    """已經排好隊的版本（避免每次檢查都重抓一樣的東西）。"""
+    try:
+        data = json.loads((STAGING / PENDING_NAME).read_text(encoding="utf-8"))
+        return str(data.get("version") or "")
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+        return ""
+
+
+def check_and_stage(timeout: float = 30.0) -> dict:
+    """查雲端 manifest → 比對 → 下載變動檔到 staging → 寫 pending_update.json。
+
+    回傳的 status：
+      disabled  未打包／雲端沒設位址 —— 什麼都沒做
+      none      已是最新
+      full      輕層補不齊（Python/Chromium/依賴變動），要走整包下載
+      staged    已下載完成，下次啟動時套用
+      error     這次失敗（下次再試，不影響現行版本）
+    """
+    base = package_root()
+    if not base:
+        return write_state("disabled", reason="非打包環境")
+    local = _local_manifest(base)
+    if not local:
+        return write_state("disabled", reason="本機 manifest 讀不到")
+    manifest_url, files_base = _endpoints(str(local.get("platform") or ""))
+    if not manifest_url:
+        return write_state("disabled", reason="雲端未設定 manifest_url / files_base_url")
+
+    try:
+        with _client(timeout) as c:
+            r = c.get(manifest_url)
+            r.raise_for_status()
+            raw = r.content                     # 驗簽要用原始位元組，不能重新序列化
+            sig = ""
+            if signing_enabled():
+                s = c.get(manifest_url + ".sig")
+                s.raise_for_status()
+                sig = s.text
+            remote = json.loads(raw)
+    except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
+        return write_state("error", reason=f"取得雲端 manifest 失敗：{e}")
+    if not isinstance(remote, dict):
+        return write_state("error", reason="雲端 manifest 格式不對")
+
+    # 簽章要在「用 manifest 做任何事之前」驗——它決定我們要下載並執行什麼
+    ok, why = verify_manifest(raw, sig)
+    if not ok:
+        return write_state("error", reason=why)
+
+    plan = diff_manifests(local, remote)
+    if plan["mode"] == "none":
+        return write_state("none", reason=plan["reason"], version=local.get("version"))
+    if plan["mode"] == "full":
+        # 整包下載沿用既有的「有新版可下載」提示（app.download_url），這裡只記狀態
+        return write_state("full", reason=plan["reason"], version=remote.get("version"))
+    if plan["bytes"] > MAX_PATCH_BYTES:
+        return write_state("full", version=remote.get("version"),
+                           reason=f"增量體積異常（{plan['bytes'] / 1e6:.0f}MB），改走整包下載")
+
+    version = str(remote.get("version") or "")
+    if _staged_version() == version:
+        return write_state("staged", version=version, files=len(plan["download"]),
+                           bytes=plan["bytes"], reason="已經排好隊，等下次啟動套用")
+
+    # 重抓一版就從乾淨的 staging 開始：殘留的舊版檔案會讓 apply 套出混版
+    shutil.rmtree(STAGING, ignore_errors=True)
+    try:
+        STAGING.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return write_state("error", reason=f"建立 staging 失敗：{e}")
+
+    try:
+        with _client(timeout) as c:
+            for f in plan["download"]:
+                rel, sha = str(f.get("path", "")), str(f.get("sha256", ""))
+                if len(sha) != 64 or not all(ch in "0123456789abcdef" for ch in sha.lower()):
+                    raise ValueError(f"manifest 的 sha256 不合法：{rel}")
+                dst = safe_target(STAGING, rel, LIGHT_TOPS)   # 防目錄逃逸，同 apply 那套
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                url = files_base.rstrip("/") + "/" + sha.lower()
+                with c.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    tmp = dst.with_name(dst.name + ".part")
+                    with open(tmp, "wb") as out:
+                        for chunk in resp.iter_bytes(256 * 1024):
+                            out.write(chunk)
+                if not verify_sha256(tmp, sha):
+                    tmp.unlink(missing_ok=True)
+                    raise ValueError(f"下載內容雜湊不符：{rel}")
+                tmp.replace(dst)
+    except (httpx.HTTPError, ValueError, OSError) as e:
+        shutil.rmtree(STAGING, ignore_errors=True)
+        return write_state("error", reason=f"下載失敗，維持現行版本：{e}")
+
+    # 連同新版 manifest 一起排隊：套用完要換掉包根那份，本機版本才會前進。
+    # 少了這步，客戶端會每次檢查都算出同一份差異、無限重抓重套。
+    try:
+        (STAGING / MANIFEST_NAME).write_bytes(raw)
+    except OSError as e:
+        shutil.rmtree(STAGING, ignore_errors=True)
+        return write_state("error", reason=f"寫入新版 manifest 失敗：{e}")
+
+    pending = {
+        "version": version,
+        "files": [{"path": f["path"], "sha256": f["sha256"], "size": f.get("size")}
+                  for f in plan["download"]],
+        "remove": plan["remove"],
+        "staged_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    try:
+        (STAGING / PENDING_NAME).write_text(json.dumps(pending, ensure_ascii=False),
+                                            encoding="utf-8")
+    except OSError as e:
+        shutil.rmtree(STAGING, ignore_errors=True)
+        return write_state("error", reason=f"寫入待套用清單失敗：{e}")
+
+    return write_state("staged", version=version, files=len(plan["download"]),
+                       bytes=plan["bytes"], reason=plan["reason"])
+
+
+def start_background_checks() -> threading.Thread | None:
+    """背景定期檢查。用 thread 不用 asyncio task：httpx 同步版就夠，
+    而且任何例外都關在這裡，絕不會波及事件迴圈或擋住啟動。"""
+    if not package_root():
+        return None                     # 開發環境不跑
+
+    def loop():
+        time.sleep(CHECK_DELAY_SEC)
+        while True:
+            try:
+                s = check_and_stage()
+                print(f"[update] 檢查結果：{s.get('status')}"
+                      f"（{s.get('reason', '')}）", flush=True)
+                if s.get("status") == "disabled":
+                    return              # 沒設定就不必每 6 小時吵一次
+            except Exception as e:      # noqa: BLE001 — 更新檢查永遠不該弄掛服務
+                print(f"[update] 檢查時發生未預期錯誤（忽略）：{e}", flush=True)
+            time.sleep(RECHECK_HOURS * 3600)
+
+    t = threading.Thread(target=loop, name="update-checker", daemon=True)
+    t.start()
+    return t
