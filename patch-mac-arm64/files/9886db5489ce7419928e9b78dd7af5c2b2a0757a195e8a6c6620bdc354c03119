@@ -1,0 +1,53 @@
+"""跨平台子進程 spawn / kill（POSIX ↔ Windows）。
+
+- spawn_kwargs()：讓子進程成為獨立進程組（供之後整組終止）。
+  POSIX：start_new_session=True；Windows：CREATE_NEW_PROCESS_GROUP。
+- kill_tree()：終止子進程及其所有子孫（含 Chrome）。
+  優先 psutil（跨平台、可靠）；退路 POSIX killpg / Windows taskkill。
+"""
+import contextlib
+import os
+import signal
+import subprocess
+import sys
+
+IS_WIN = sys.platform.startswith("win")
+
+
+def spawn_kwargs() -> dict:
+    """Popen kwargs：讓子進程有獨立進程組。
+    Windows 另加 CREATE_NO_WINDOW：常駐服務隱藏啟動後，子 CLI 才不會彈出新主控台黑窗
+    （Playwright 開的 Chrome 是 GUI 程序，不受此旗標影響）。"""
+    if IS_WIN:
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+    return {"start_new_session": True}
+
+
+def kill_tree(proc, sig=signal.SIGTERM) -> None:
+    """終止 proc 及其所有子孫。任何錯誤都吞掉。"""
+    if proc is None:
+        return
+    with contextlib.suppress(Exception):
+        if proc.poll() is not None:
+            return
+
+    # 優先 psutil：跨平台、砍整棵樹最可靠
+    try:
+        import psutil
+        parent = psutil.Process(proc.pid)
+        for child in parent.children(recursive=True):
+            with contextlib.suppress(Exception):
+                child.kill()
+        with contextlib.suppress(Exception):
+            parent.kill()
+        return
+    except Exception:
+        pass
+
+    # 退路
+    if IS_WIN:
+        with contextlib.suppress(Exception):
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        with contextlib.suppress(ProcessLookupError, Exception):
+            os.killpg(os.getpgid(proc.pid), sig)

@@ -1,0 +1,215 @@
+"""FB Auto Poster - 主應用程式入口
+
+行銷快手復刻版 - Facebook/Instagram 行銷自動化工具
+
+啟動方式:
+    cd backend
+    uvicorn app.main:app --host 127.0.0.1 --port 3081 --reload
+"""
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from .config import settings, DATA_DIR
+from .database import init_db
+from .scheduler.task_runner import task_scheduler
+
+from .api.accounts import router as accounts_router
+from .api.articles import router as articles_router
+from .api.clubs import router as clubs_router
+from .api.comments import router as comments_router
+from .api.logs import router as logs_router
+from .api.marketplace import router as marketplace_router
+from .api.nurture import router as nurture_router
+from .api.posts import router as posts_router
+
+
+async def _cloud_heartbeat_loop():
+    """SaaS：每 6h 打 heartbeat（續期 token/回報存活）＋ 重抓下發設定。
+    啟動時先跑一次；失敗靜默（離線寬限由 cloud_client 處理）。"""
+    import asyncio
+    import contextlib
+    from .cloud_client import cloud_enabled, heartbeat, fetch_config
+    while True:
+        with contextlib.suppress(Exception):
+            if cloud_enabled():
+                await asyncio.to_thread(heartbeat)
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(fetch_config)
+        await asyncio.sleep(6 * 3600)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 啟動時
+    # 舊便攜包 → 安裝版的一次性資料遷移，必須在 init_db() 之前：
+    # 一旦建了空的 fb_poster.db，就分不出「全新安裝」和「還沒搬過來」了。
+    import traceback
+    try:
+        from .data_migration import migrate_if_needed
+        r = migrate_if_needed()
+        if r["status"] == "migrated":
+            print(f"[startup] 已從舊版搬入 {r['files']} 個檔案"
+                  f"（{r['bytes'] / 1e6:.1f} MB）：{r['source']}", flush=True)
+    except Exception:
+        print("[startup] 資料遷移失敗，服務仍繼續啟動：", flush=True)
+        traceback.print_exc()
+    init_db()
+    from .database import migrate_plaintext_passwords
+    migrate_plaintext_passwords()
+    task_scheduler.start()
+    # 排程還原一律不得阻擋後端啟動：任一失敗只記錄，服務仍要起得來
+    from .scheduler.task_runner import restore_jobs
+    from .scheduler.marketplace_runner import restore_marketplace_schedules
+    from .scheduler.group_post_runner import restore_group_post_schedules
+    for name, restore in (
+        ("task_runner", restore_jobs),
+        ("marketplace", restore_marketplace_schedules),
+        ("group_post", restore_group_post_schedules),
+    ):
+        try:
+            await restore()
+        except Exception:
+            print(f"[startup] {name} 排程還原失敗，服務仍繼續啟動：", flush=True)
+            traceback.print_exc()
+    # SaaS：heartbeat + 下發設定背景迴圈（含啟動時先跑一次）
+    import asyncio
+    hb_task = asyncio.create_task(_cloud_heartbeat_loop())
+    # 補丁更新：背景下載新版檔案到 staging，下次啟動由 _apply_update.py 套用。
+    # 同樣不得阻擋啟動——這裡只起一條 daemon thread，例外全關在裡面。
+    try:
+        from .update_downloader import start_background_checks
+        start_background_checks()
+    except Exception:
+        print("[startup] 更新檢查啟動失敗，服務仍繼續啟動：", flush=True)
+        traceback.print_exc()
+    yield
+    # 關閉時：停排程器並盡力中止仍在跑的子進程
+    hb_task.cancel()
+    task_scheduler.stop()
+    from .fbauto_bridge import _RUNNING, kill_job
+    for key in list(_RUNNING.keys()):
+        kill_job(key)
+
+
+app = FastAPI(
+    title=settings.app_name,
+    version=settings.app_version,
+    description="Facebook 自動發文、養號、加社團一站式行銷工具",
+    lifespan=lifespan,
+    redirect_slashes=False,
+)
+
+# CORS：白名單來源（wildcard 配 credentials 會被瀏覽器拒，改讀 env 白名單）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# SaaS 授權硬鎖：未啟用授權（或超過離線寬限）→ 除白名單外所有 API 一律 403。
+# 白名單：健康檢查、授權管理（要能輸入金鑰）、版本檢查、疑難排解。
+# 疑難排解放行的理由：授權出問題時（例如已付款但授權沒生效）客戶正需要匯出診斷包
+# 回報，若被 gate 擋住就變成死結。它只讀日誌與環境資訊，不含機密。
+# 開發環境由 start_servers 腳本設 MOYU_DEV_MODE=1 放行（客戶包不設）。
+LICENSE_GATE_WHITELIST = ("/api/health", "/api/license", "/api/version", "/api/troubleshoot")
+
+
+def _gate_blocks(path: str) -> bool:
+    return path.startswith("/api") and not any(path.startswith(w) for w in LICENSE_GATE_WHITELIST)
+
+
+@app.middleware("http")
+async def license_gate(request, call_next):
+    if _gate_blocks(request.url.path):
+        from .cloud_client import license_gate_ok
+        import asyncio as _aio
+        if not await _aio.to_thread(license_gate_ok):
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=403, content={
+                "detail": "尚未啟用授權或授權已失效，請至「工具箱 → 授權管理」輸入金鑰",
+                "code": "license_required",
+            })
+    return await call_next(request)
+
+# API 路由
+app.include_router(accounts_router)
+app.include_router(articles_router)
+app.include_router(clubs_router)
+app.include_router(comments_router)
+app.include_router(logs_router)
+app.include_router(marketplace_router)
+app.include_router(nurture_router)
+app.include_router(posts_router)
+
+from .api.jobs import router as jobs_router
+app.include_router(jobs_router)
+
+from .api.properties import router as properties_router
+app.include_router(properties_router)
+
+from .api.group_post import router as group_post_router
+app.include_router(group_post_router)
+
+from .api.feedback import router as feedback_router
+app.include_router(feedback_router)
+
+from .api.license import router as license_router
+app.include_router(license_router)
+
+from .api.version import router as version_router
+app.include_router(version_router)
+
+from .api.troubleshoot import router as troubleshoot_router
+app.include_router(troubleshoot_router)
+
+# 靜態檔案：上傳圖片
+from .config import DATA_DIR
+uploads_dir = DATA_DIR / "uploads"
+uploads_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(uploads_dir)), name="uploads")
+
+
+@app.get("/api/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "app": settings.app_name,
+        "version": settings.app_version,
+    }
+
+
+@app.get("/api/status")
+async def system_status():
+    """取得系統運行狀態"""
+    from sqlalchemy import select, func
+    from .database import async_session_factory, Account, PostTask, PostHistory, Group
+
+    async with async_session_factory() as session:
+        acc_count = await session.scalar(select(func.count(Account.id)))
+        running_tasks = await session.scalar(
+            select(func.count(PostTask.id)).where(PostTask.status == "running")
+        )
+        today = __import__("datetime").datetime.utcnow().date()
+        today_posts = await session.scalar(
+            select(func.count(PostHistory.id)).where(
+                func.date(PostHistory.post_time) == today
+            )
+        )
+        group_count = await session.scalar(select(func.count(Group.id)))
+
+    return {
+        "accounts": acc_count,
+        "running_tasks": running_tasks,
+        "today_posts": today_posts,
+        "group_count": group_count,
+        "scheduler_running": task_scheduler._scheduler.running if task_scheduler._scheduler else False,
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host=settings.host, port=settings.port, reload=settings.debug)

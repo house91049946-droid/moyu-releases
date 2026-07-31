@@ -1,0 +1,342 @@
+"""P2 CLI — Marketplace 商品上架 + 分享到社團。
+
+⚠️ 首次使用前：請手動用瀏覽器走一次 marketplace/create/item/ 流程，
+    確認實際 DOM 結構後更新 src/marketplacePost.py 中的選擇器。
+"""
+import argparse
+import atexit
+import json
+import sys
+from pathlib import Path
+
+from src.utils import launch_browser, capture_screenshot, perform_checks, wait_if_verification_needed, CheckResult
+from src.login import login_facebook, _try_cookie_login, _get_fbid_from_cookies
+from src.marketplacePost import (
+    MarketplaceItem,
+    post_one_sale_item,
+    share_item_to_group,
+    load_shop_article,
+    list_shop_articles,
+    load_share_groups,
+    save_share_groups,
+    _already_posted,
+)
+
+_JSON_PATH: str | None = None
+_RESULT: dict | None = None
+
+
+def _write_result_json():
+    """atexit 回呼：寫出 result JSON。任何錯誤只印警告，不得拋出。"""
+    if _JSON_PATH and _RESULT is not None:
+        try:
+            with open(_JSON_PATH, "w", encoding="utf-8") as f:
+                try:
+                    from src.utils import collect_screenshots
+                    _RESULT.setdefault("data", {})["screenshots"] = collect_screenshots()
+                except Exception:
+                    pass
+                json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[result-json] 寫檔失敗: {e}", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="FB Auto Poster P2 — Marketplace 商品上架與社團分享",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用範例：
+  # 列出所有可用商品
+  python -m src.run_p2 --list
+
+  # 上架一個商品
+  python -m src.run_p2 --email user@example.com --password "xxx" \\
+      --item "精銳闊無限視野全新未住大2房平車"
+
+  # 上架 + 分享到社團
+  python -m src.run_p2 --fbid 1000123456789 \\
+      --item "商品名稱" \\
+      --share-to "https://mbasic.facebook.com/groups/123456/"
+
+  # 僅分享已有商品到社團
+  python -m src.run_p2 --fbid 1000123456789 \\
+      --share-url "https://www.facebook.com/marketplace/item/xxx/" \\
+      --share-to "https://mbasic.facebook.com/groups/123456/"
+        """,
+    )
+    parser.add_argument("--email", help="FB 登入 email")
+    parser.add_argument("--password", help="FB 密碼")
+    parser.add_argument("--fbid", help="已知的 FB numeric ID")
+    parser.add_argument("--list", action="store_true", help="列出所有可用商品文案")
+    parser.add_argument("--item", help="商品名稱（對應 shop_article 檔案，不含 .json）")
+    parser.add_argument("--images-dir", help="圖片目錄（預設 data/shop_article_images/）")
+    parser.add_argument("--share-to", help="目標社團 mbasic URL")
+    parser.add_argument("--share-groups", nargs="+", help="在對象頁勾選的社團名稱（多個以空白分隔）")
+    parser.add_argument("--share-url", help="直接分享指定 Marketplace item URL")
+    parser.add_argument("--list-mp-groups", action="store_true",
+                        help="列出上次抓到的對象頁社團清單（data/marketplace_groups_<fbid>.json）")
+    parser.add_argument("--set-share-groups", nargs="+",
+                        help="設定預設轉發社團並存檔（之後上架自動勾選），需搭配 --fbid")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--result-json", help="結果 JSON 輸出路徑（供 backend 橋接）")
+    parser.add_argument("--keep-open", action="store_true", help="遇到驗證時保持瀏覽器開啟")
+    parser.add_argument("--repost", action="store_true", help="即使此商品已上架過仍重新上架")
+    parser.add_argument("--skip-if-posted", action="store_true",
+                        help="此商品已上架過則直接略過（機器模式預設，取代互動詢問）")
+    parser.add_argument("--category", help="Marketplace 類別名稱（如「其他」）；覆寫商品檔設定")
+    parser.add_argument("--dry-run", action="store_true", help="走完表單/勾選但不發佈（安全測試）")
+
+    args = parser.parse_args()
+
+    # ── atexit result-json 機制 ──
+    global _JSON_PATH, _RESULT
+    fbid = args.fbid
+    _JSON_PATH = args.result_json
+    _RESULT = {
+        "schema": 2,
+        "success": False,
+        "fbid": fbid or "",
+        "error": "未完成",
+        "data": {"results": [], "item_url": None, "status": ""},
+    }
+    if _JSON_PATH:
+        atexit.register(_write_result_json)
+
+    # 列出模式（唯讀，無需 result-json）
+    if args.list:
+        articles = list_shop_articles()
+        print(f"可用商品文案 ({len(articles)} 個):")
+        for a in articles:
+            print(f"  - {a}")
+        return
+
+    # 列出對象頁社團清單（唯讀）
+    if args.list_mp_groups:
+        if not args.fbid:
+            print("❌ 需要 --fbid")
+            if _RESULT is not None:
+                _RESULT["error"] = "需要 --fbid"
+            sys.exit(1)
+        from src.paths import DATA_DIR
+        p = DATA_DIR / f"marketplace_groups_{args.fbid}.json"
+        if not p.exists():
+            print("尚無社團清單。先執行一次上架（可不勾選），程式會自動抓取並存檔。")
+            return
+        import json as _json
+        with open(p, encoding="utf-8") as f:
+            groups = _json.load(f)
+        selected = set(load_share_groups(args.fbid))
+        print(f"對象頁社團 ({len(groups)} 個)，* = 已設為預設轉發:")
+        for i, g in enumerate(groups):
+            mark = "*" if g in selected else " "
+            print(f" {mark} [{i}] {g}")
+        return
+
+    # 設定預設轉發社團（唯讀寫入，無需 result-json）
+    if args.set_share_groups:
+        if not args.fbid:
+            print("❌ 需要 --fbid")
+            if _RESULT is not None:
+                _RESULT["error"] = "需要 --fbid"
+            sys.exit(1)
+        save_share_groups(args.fbid, args.set_share_groups)
+        print(f"✅ 已儲存 {len(args.set_share_groups)} 個預設轉發社團:")
+        for g in args.set_share_groups:
+            print(f"  - {g}")
+        return
+
+    # 直接分享模式（不建立新商品）
+    if args.share_url and not args.item:
+        if not args.share_to:
+            msg = "需要 --share-to 指定目標社團"
+            print(f"❌ {msg}")
+            if _RESULT is not None:
+                _RESULT["error"] = msg
+            sys.exit(1)
+        if not args.fbid:
+            msg = "需要 --fbid"
+            print(f"❌ {msg}")
+            if _RESULT is not None:
+                _RESULT["error"] = msg
+            sys.exit(1)
+
+        fbid = args.fbid
+        browser, context, page = launch_browser(fbid=fbid, headless=args.headless)
+        try:
+            if not _try_cookie_login(page, context, fbid):
+                msg = "Cookie 登入失敗"
+                print(f"❌ {msg}")
+                if _RESULT is not None:
+                    _RESULT["error"] = msg
+                sys.exit(1)
+            result = share_item_to_group(page, fbid, args.share_url, args.share_to)
+            print(f"分享結果: {result.status}")
+            if result.error:
+                print(f"錯誤: {result.error}")
+            if _RESULT is not None:
+                _RESULT["success"] = result.status == "成功"
+                _RESULT["fbid"] = fbid
+                _RESULT["data"]["results"] = [{
+                    "group_url": args.share_to,
+                    "status": result.status,
+                    "permalink": "",
+                    "error": result.error or "",
+                }]
+        finally:
+            context.close()
+        return
+
+    # 上架模式
+    if not args.item:
+        msg = "需要 --item 指定商品名稱（或 --list 列出）"
+        print(f"❌ {msg}")
+        if _RESULT is not None:
+            _RESULT["error"] = msg
+        sys.exit(1)
+
+    # 載入商品
+    item = load_shop_article(args.item, images_dir=args.images_dir or "")
+    if item is None:
+        msg = "找不到商品，請確認名稱正確"
+        print(f"❌ {msg}")
+        if _RESULT is not None:
+            _RESULT["error"] = msg
+        sys.exit(1)
+
+    print(f"商品: {item.item_name}")
+    print(f"類型: {item.item_type}")
+    print(f"價格: {item.item_price}")
+    print(f"圖片: {len(item.images)} 張")
+    print()
+
+    # 啟動瀏覽器 + 登入
+    fbid = args.fbid or "temp"
+    browser, context, page = launch_browser(fbid=fbid, headless=args.headless)
+
+    try:
+        # 登入
+        if args.email and args.password:
+            result = login_facebook(page, context, args.email, args.password)
+            print(f"登入: {result.status}")
+            if result.fbid:
+                fbid = result.fbid
+                if _RESULT is not None:
+                    _RESULT["fbid"] = fbid
+            else:
+                msg = "登入失敗"
+                print(f"❌ {msg}")
+                if _RESULT is not None:
+                    _RESULT["error"] = msg
+                sys.exit(1)
+        elif args.fbid:
+            if not _try_cookie_login(page, context, args.fbid):
+                msg = "Cookie 登入失敗，請提供 --email/--password"
+                print(f"❌ {msg}")
+                if _RESULT is not None:
+                    _RESULT["error"] = msg
+                sys.exit(1)
+            fbid = args.fbid
+        else:
+            msg = "需要 --email/--password 或 --fbid"
+            print(f"❌ {msg}")
+            if _RESULT is not None:
+                _RESULT["error"] = msg
+            sys.exit(1)
+
+        print(f"fbid: {fbid}")
+
+        # 檢查是否已上架過（機器模式：以旗標決定，不再互動詢問）
+        existing = _already_posted(fbid, item.item_name)
+        if existing and not args.repost:
+            print(f"⚠️ 此商品已上架過: {existing}")
+            if args.skip_if_posted:
+                print("已上架過，依 --skip-if-posted 略過")
+                if _RESULT is not None:
+                    _RESULT["error"] = "已上架過，略過（--skip-if-posted）"
+                return
+            # 互動模式（有 tty）才詢問；無 stdin 一律略過，避免 EOFError
+            if sys.stdin and sys.stdin.isatty():
+                ans = input("要重新上架嗎？(y/N): ")
+                if ans.lower() != "y":
+                    print("已取消")
+                    if _RESULT is not None:
+                        _RESULT["error"] = "使用者取消（已上架過）"
+                    return
+            else:
+                print("非互動環境且未指定 --repost，略過")
+                if _RESULT is not None:
+                    _RESULT["error"] = "已上架過，略過（非互動環境）"
+                return
+
+        # 上架
+        print("\n上架中...")
+        if args.category:
+            item.category = args.category
+        mp_result = post_one_sale_item(page, fbid, item, share_groups=args.share_groups,
+                                       dry_run=args.dry_run)
+        print(f"上架結果: {mp_result.status}")
+        if mp_result.item_url:
+            print(f"商品網址: {mp_result.item_url}")
+        if mp_result.error:
+            print(f"訊息: {mp_result.error}")
+
+        # 分享到社團
+        share_results: list[dict] = []
+        if args.share_to and mp_result.success and mp_result.item_url:
+            print(f"\n分享到社團: {args.share_to}")
+            share_result = share_item_to_group(page, fbid, mp_result.item_url, args.share_to)
+            print(f"分享結果: {share_result.status}")
+            if share_result.error:
+                print(f"錯誤: {share_result.error}")
+            share_results = [{
+                "group_url": args.share_to,
+                "status": share_result.status,
+                "permalink": "",
+                "error": share_result.error or "",
+            }]
+
+        # ── 更新結果 ──
+        if _RESULT is not None:
+            _RESULT["success"] = mp_result.success
+            _RESULT["fbid"] = fbid
+            _RESULT["error"] = mp_result.error or ""
+            _RESULT["data"]["item_url"] = mp_result.item_url or None
+            _RESULT["data"]["results"] = share_results
+            _RESULT["data"]["status"] = mp_result.status
+            _RESULT["data"]["audience_selected"] = mp_result.audience_selected
+            _RESULT["data"]["extra_listed"] = mp_result.extra_listed
+            # 「已提交」統計（非「已公開」：部分社團需管理員審核，實際上線時間不定）
+            _extra_ok = sum(b.get("selected", 0) for b in mp_result.extra_listed)
+            _RESULT["data"]["groups_submitted"] = mp_result.audience_selected + _extra_ok
+            _RESULT["data"]["note"] = "已提交社團數；部分社團需管理員審核，實際公開時間視社團而定"
+
+        # 反偵測：成功後別立刻關瀏覽器，先回首頁隨機瀏覽/滑動一下再離開（模擬真人）
+        if mp_result.success and not args.dry_run:
+            try:
+                from src.utils import warm_up_browse
+                warm_up_browse(page, min_sec=15, max_sec=40)
+            except Exception as e:
+                print(f"[marketplace] 收尾瀏覽略過: {e}", flush=True)
+
+        print("\n✓ P2 執行完畢")
+
+    except KeyboardInterrupt:
+        print("\n⚠ 使用者中斷")
+        if _RESULT is not None:
+            _RESULT["error"] = "使用者中斷"
+    except Exception as e:
+        print(f"\n❌ 錯誤: {e}")
+        if _RESULT is not None:
+            _RESULT["error"] = str(e)
+        capture_screenshot(page, fbid or "unknown", "marketplace_error")
+        raise
+    finally:
+        if args.keep_open:
+            check = perform_checks(page, fbid or "unknown")
+            wait_if_verification_needed(check, page, fbid or "unknown")
+        context.close()
+
+
+if __name__ == "__main__":
+    main()

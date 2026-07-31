@@ -1,0 +1,5 @@
+{
+  "tests/test_scheduler.py::test_cycle_uses_interval_trigger": true,
+  "tests/test_scheduler.py::test_once_uses_date_trigger": true,
+  "tests/test_scheduler.py::test_restore_jobs": true
+}

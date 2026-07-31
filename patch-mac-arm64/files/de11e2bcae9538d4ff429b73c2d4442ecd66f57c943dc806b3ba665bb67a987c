@@ -1,0 +1,79 @@
+"""P4 CLI wrapper — 帳號養號（供 backend bridge 呼叫）。"""
+import argparse
+import atexit
+import json
+import sys
+
+from src.config_loader import T
+from src.utils import launch_browser, capture_screenshot, perform_checks, wait_if_verification_needed, CheckResult
+from src.login import login_facebook, _try_cookie_login
+from src.raiseaccount_www import raiseaccount_www
+
+_JSON_PATH: str | None = None
+_RESULT: dict | None = None
+
+
+def main():
+    global _JSON_PATH, _RESULT
+
+    parser = argparse.ArgumentParser(description="FB Auto P4 — 帳號養號（raise account）")
+    parser.add_argument("--fbid", required=True)
+    parser.add_argument("--duration", type=int, default=5, help="養號時長（分鐘）")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--result-json", help="結果 JSON 輸出路徑")
+    parser.add_argument("--keep-open", action="store_true", help="遇到驗證時保持瀏覽器開啟")
+    args = parser.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {
+        "schema": 2,
+        "success": False,
+        "fbid": args.fbid,
+        "error": "未完成",
+        "data": {"duration_min": args.duration, "actions_performed": 0, "duration_sec": 0},
+    }
+    if _JSON_PATH:
+        atexit.register(_write_result_json)
+
+    browser = context = page = None
+    try:
+        browser, context, page = launch_browser(fbid=args.fbid, headless=args.headless)
+
+        if not _try_cookie_login(page, context, args.fbid):
+            _RESULT["error"] = "Cookie 登入失敗，請先用 CLI 登入一次"
+            sys.exit(1)
+
+        result = raiseaccount_www(page, args.fbid, duration_sec=args.duration * 60)
+
+        _RESULT["success"] = result.success
+        _RESULT["error"] = result.aborted_reason or ""
+        _RESULT["data"]["actions_performed"] = result.actions_performed
+        _RESULT["data"]["duration_sec"] = result.duration_sec
+
+    except KeyboardInterrupt:
+        _RESULT["error"] = "使用者中斷"
+        sys.exit(0)
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    finally:
+        if page and args.keep_open:
+            check = perform_checks(page, args.fbid)
+            wait_if_verification_needed(check, page, args.fbid)
+        if context:
+            context.close()  # launch_browser 的 browser 與 context 同物件，close 一次即可
+
+
+def _write_result_json():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            try:
+                from src.utils import collect_screenshots
+                _RESULT.setdefault("data", {})["screenshots"] = collect_screenshots()
+            except Exception:
+                pass
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+
+
+if __name__ == "__main__":
+    main()

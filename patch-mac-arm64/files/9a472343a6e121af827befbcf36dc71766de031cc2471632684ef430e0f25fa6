@@ -1,0 +1,79 @@
+"""P16 排程規劃 + 預算把關（純函式，可單測）。
+
+- 時間模式 (a) points：從 3-5 個固定時間點隨機挑 daily_count 個，可加隨機偏移。
+- 時間模式 (b) window：在時間區段內隨機灑 daily_count 個時間。
+- 預算把關：一則貼文 = 1 商品 + N 社團轉發，需同時不超過 10 商品 / 50 總則。
+"""
+import datetime
+import random
+
+
+def _parse_hhmm(s: str) -> tuple[int, int]:
+    h, m = s.split(":")
+    return int(h), int(m)
+
+
+def plan_daily_times(
+    mode: str,
+    time_points: list[str],
+    window_start: str,
+    window_end: str,
+    daily_count: int,
+    random_delay: bool,
+    base_date: datetime.date,
+    rng: random.Random | None = None,
+) -> list[datetime.datetime]:
+    """回傳今天要執行的 datetime 清單（已排序、去重）。"""
+    rng = rng or random
+    times: list[datetime.datetime] = []
+
+    if mode == "points":
+        pts = [p for p in (time_points or []) if p]
+        if not pts:
+            return []
+        chosen = rng.sample(pts, min(daily_count, len(pts)))
+        for hhmm in chosen:
+            h, m = _parse_hhmm(hhmm)
+            dt = datetime.datetime.combine(base_date, datetime.time(h, m))
+            if random_delay:
+                dt += datetime.timedelta(minutes=rng.randint(-15, 15))
+            times.append(dt)
+    else:  # window
+        sh, sm = _parse_hhmm(window_start)
+        eh, em = _parse_hhmm(window_end)
+        start = datetime.datetime.combine(base_date, datetime.time(sh, sm))
+        end = datetime.datetime.combine(base_date, datetime.time(eh, em))
+        total_min = int((end - start).total_seconds() // 60)
+        if total_min <= 0:
+            return []
+        k = min(daily_count, total_min)
+        offsets = sorted(rng.sample(range(total_min), k))
+        times = [start + datetime.timedelta(minutes=o) for o in offsets]
+
+    # 去重 + 排序
+    return sorted(set(times))
+
+
+def can_afford(remaining_listings: int, remaining_posts: int, groups_planned: int) -> bool:
+    """本則需要 1 商品 + groups_planned 轉發，檢查是否在剩餘額度內。"""
+    need_posts = 1 + max(0, groups_planned)
+    return remaining_listings >= 1 and remaining_posts >= 1  # 至少發得出商品
+
+
+def groups_within_budget(remaining_posts: int, groups_planned: int) -> int:
+    """商品發出後，剩餘 posts 額度還能轉發幾個社團（商品本身佔 1）。"""
+    return max(0, min(groups_planned, remaining_posts - 1))
+
+
+def next_allowed_after_cooldown(
+    last_finish: datetime.datetime | None,
+    cooldown_min_sec: int,
+    cooldown_max_sec: int,
+    rng: random.Random | None = None,
+) -> datetime.datetime | None:
+    """前一個工作結束後，下一個最早可進場時間（隨機冷卻 5-10 分鐘）。"""
+    if last_finish is None:
+        return None
+    rng = rng or random
+    wait = rng.randint(cooldown_min_sec, max(cooldown_min_sec, cooldown_max_sec))
+    return last_finish + datetime.timedelta(seconds=wait)

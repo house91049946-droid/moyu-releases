@@ -1,0 +1,72 @@
+"""P13：密碼 Fernet 加解密 + 明文相容 + 遷移冪等。
+
+執行：cd backend && python3 -m pytest tests/test_crypto.py -v
+"""
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.crypto import encrypt_secret, decrypt_secret, is_encrypted, DecryptError, _PREFIX
+
+
+def test_roundtrip():
+    enc = encrypt_secret("hunter2")
+    assert enc.startswith(_PREFIX)
+    assert enc != "hunter2"
+    assert decrypt_secret(enc) == "hunter2"
+
+
+def test_empty_stays_empty():
+    assert encrypt_secret("") == ""
+    assert decrypt_secret("") == ""
+
+
+def test_plaintext_passthrough():
+    # 無 enc: 前綴 → 視為明文原樣回傳（相容既有資料）
+    assert decrypt_secret("legacy_plain_pw") == "legacy_plain_pw"
+    assert is_encrypted("legacy_plain_pw") is False
+    assert is_encrypted(encrypt_secret("x")) is True
+
+
+def test_bad_ciphertext_raises():
+    with pytest.raises(DecryptError):
+        decrypt_secret(_PREFIX + "not-a-valid-token")
+
+
+def test_unicode():
+    enc = encrypt_secret("密碼🔒test")
+    assert decrypt_secret(enc) == "密碼🔒test"
+
+
+def test_migration_idempotent(tmp_path, monkeypatch):
+    """migrate_plaintext_passwords：明文→密文，跑兩次結果一致。"""
+    import app.database as db
+    from sqlalchemy import create_engine, select
+    from sqlalchemy.orm import sessionmaker
+
+    url = f"sqlite:///{tmp_path/'m.db'}"
+    db.sync_engine = create_engine(url)
+    db.SyncSession = sessionmaker(db.sync_engine)
+    db.Base.metadata.create_all(db.sync_engine)
+    db._ensure_columns()
+
+    from app.database import Account, migrate_plaintext_passwords
+    with db.SyncSession() as s:
+        s.add(Account(email="a@b.c", password="plain_pw"))
+        s.add(Account(email="d@e.f", password=""))  # 空密碼不動
+        s.commit()
+
+    n1 = migrate_plaintext_passwords()
+    assert n1 == 1  # 只有 a@b.c 需要加密
+
+    with db.SyncSession() as s:
+        acc = s.execute(select(Account).where(Account.email == "a@b.c")).scalar_one()
+        assert is_encrypted(acc.password)
+        assert decrypt_secret(acc.password) == "plain_pw"
+
+    n2 = migrate_plaintext_passwords()
+    assert n2 == 0  # 冪等：第二次沒有明文可加密

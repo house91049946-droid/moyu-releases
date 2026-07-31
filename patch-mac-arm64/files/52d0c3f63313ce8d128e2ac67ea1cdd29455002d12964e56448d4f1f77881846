@@ -1,0 +1,718 @@
+"""社團發文模組：使用 www.facebook.com 在社團逐一發文（mbasic 已停用）。"""
+import datetime
+import json
+import random
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from playwright.sync_api import Page
+
+from src.config_loader import T
+from src.paths import DATA_DIR
+from src.utils import (
+    enhanced_get,
+    enhanced_click,
+    human_sleep,
+    perform_checks,
+    find_and_hover_post_time,
+    CheckResult,
+)
+
+
+def _to_www_group_url(group_url: str) -> str:
+    """mbasic / m → www；保留 groups/{id} 路徑。"""
+    url = (group_url or "").strip()
+    url = url.replace("mbasic.facebook.com", "www.facebook.com")
+    url = url.replace("m.facebook.com", "www.facebook.com")
+    if "facebook.com" not in url and re.fullmatch(r"\d+", url):
+        url = f"https://www.facebook.com/groups/{url}/"
+    if not url.endswith("/"):
+        url = url.split("?")[0].rstrip("/") + "/"
+    return url
+
+
+def _t_first(key: str, fallback: str = "") -> str:
+    try:
+        val = T(key)
+    except Exception:
+        return fallback
+    if isinstance(val, list):
+        return val[0] if val else fallback
+    return val or fallback
+
+
+def _save_diag(page: Page, name: str) -> None:
+    try:
+        out = DATA_DIR / "screenshots" / "group_post"
+        out.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = out / f"{ts}_{name}.png"
+        page.screenshot(path=str(path), full_page=False)
+        print(f"[post] diag screenshot: {path}", flush=True)
+    except Exception as e:
+        print(f"[post] diag screenshot failed: {e}", flush=True)
+
+
+def _type_in_dialog_editor(page: Page, editor, content: str) -> bool:
+    """在建立貼文 dialog 內打字。不可點 dialog 外（會關掉彈窗）。"""
+    try:
+        editor.click(timeout=5000)
+        human_sleep(0.2, 0.5)
+        try:
+            is_mac = page.evaluate("navigator.platform").startswith("Mac")
+        except Exception:
+            is_mac = True
+        page.keyboard.press("Meta+A" if is_mac else "Control+A")
+        page.keyboard.press("Backspace")
+        human_sleep(0.1, 0.3)
+        for char in content:
+            page.keyboard.type(char, delay=random.randint(25, 90))
+        human_sleep(0.4, 0.8)
+        return True
+    except Exception as e:
+        print(f"[post] dialog typing failed: {e}", flush=True)
+        try:
+            editor.fill(content)
+            return True
+        except Exception as e2:
+            print(f"[post] dialog fill failed: {e2}", flush=True)
+            return False
+
+
+def _is_inside_article(locator) -> bool:
+    """留言／回覆框通常在 role=article 裡；發文框不在。"""
+    try:
+        return locator.locator("xpath=ancestor::*[@role='article']").count() > 0
+    except Exception:
+        return False
+
+
+def _composer_dialog(page: Page):
+    """只認「建立貼文」對話框（有發佈鈕 + 編輯器），排除留言相關 dialog。"""
+    post_text = _t_first("m_post", "發佈")
+    publish = _t_first("publish", "發佈")
+    create_post = _t_first("create_post", "建立貼文")
+    comment_ph = _t_first("leave_a_message_box", "留言……")
+
+    dialogs = page.locator("[role='dialog']")
+    n = min(dialogs.count(), 8)
+    for i in range(n):
+        d = dialogs.nth(i)
+        try:
+            if not d.is_visible():
+                continue
+        except Exception:
+            continue
+        # 排除明顯留言 dialog
+        try:
+            txt = (d.inner_text(timeout=1500) or "")[:800]
+        except Exception:
+            txt = ""
+        if comment_ph and comment_ph.rstrip("….").rstrip(".") in txt and create_post not in txt:
+            # 只有留言提示、沒有建立貼文標題 → 跳過
+            if post_text not in txt and publish not in txt and "Post" not in txt:
+                continue
+
+        has_editor = d.locator(
+            "div[role='textbox'][contenteditable='true'], "
+            "div[contenteditable='true'][role='textbox'], "
+            "div[contenteditable='true']"
+        ).count() > 0
+        if not has_editor:
+            continue
+
+        has_publish = d.locator(
+            f"[aria-label='{post_text}'], [aria-label='{publish}'], "
+            "[aria-label='Post'], [aria-label='Publish'], "
+            f"div[role='button']:has-text('{post_text}'), "
+            f"div[role='button']:has-text('{publish}')"
+        ).count() > 0
+        # 標題列常有「建立貼文」
+        has_title = False
+        try:
+            has_title = create_post in txt or "Create post" in txt or "建立貼文" in txt
+        except Exception:
+            pass
+        if has_publish or has_title:
+            return d
+    return None
+
+
+def _find_post_editor(page: Page):
+    """只取建立貼文 dialog 內的編輯器——絕不回落留言框。"""
+    d = _composer_dialog(page)
+    if d is None:
+        return page.locator("__gp_no_composer_editor__")  # count()==0
+    return d.locator(
+        "div[role='textbox'][contenteditable='true'], "
+        "div[contenteditable='true'][role='textbox'], "
+        "div[contenteditable='true']"
+    ).first
+
+
+def _click_trigger_open_composer(page: Page, loc) -> bool:
+    try:
+        if loc.count() == 0 or not loc.is_visible():
+            return False
+        if _is_inside_article(loc):
+            return False
+        loc.scroll_into_view_if_needed(timeout=3000)
+        loc.click(timeout=5000)
+        human_sleep(1.5, 3)
+        return _composer_dialog(page) is not None
+    except Exception:
+        return False
+
+
+def _dismiss_overlays(page: Page) -> None:
+    """關掉 Messenger／新訊息等浮層，避免點到錯的鉛筆。"""
+    try:
+        page.keyboard.press("Escape")
+        human_sleep(0.3, 0.6)
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    for sel in (
+        "[aria-label='關閉']",
+        "[aria-label='Close']",
+        "[aria-label='關閉聊天']",
+        "div[aria-label='新訊息'] [aria-label='關閉']",
+    ):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_visible():
+                loc.click(timeout=1500)
+                human_sleep(0.3, 0.6)
+        except Exception:
+            continue
+
+
+def _log_create_candidates(page: Page) -> None:
+    """失敗診斷：列出頁面上可能的建立貼文按鈕／pagelet。"""
+    try:
+        info = page.evaluate(
+            """() => ({
+              labels: [...document.querySelectorAll('[aria-label],[role="button"]')]
+                .slice(0, 300)
+                .map(el => (el.getAttribute('aria-label') || el.innerText || '').trim().slice(0, 60))
+                .filter(t => t && /(貼文|Post|寫點|發佈|建立|composer)/i.test(t))
+                .slice(0, 40),
+              pagelets: [...document.querySelectorAll('[data-pagelet]')]
+                .map(el => el.getAttribute('data-pagelet'))
+                .filter(t => t && /composer|Composer|Feed|Group/i.test(t))
+                .slice(0, 40),
+              bodyHint: (document.body && document.body.innerText || '').includes('只有管理員可以發文')
+                || (document.body && document.body.innerText || '').includes('Only admins can post'),
+            })"""
+        )
+        print(f"[post] create-like labels: {info.get('labels')}", flush=True)
+        print(f"[post] pagelets: {info.get('pagelets')}", flush=True)
+        print(f"[post] admin_only_hint: {info.get('bodyHint')}", flush=True)
+    except Exception as e:
+        print(f"[post] label dump failed: {e}", flush=True)
+
+
+def _open_group_composer(page: Page) -> bool:
+    """點開社團「建立貼文」dialog（避開留言／回覆框）。"""
+    try:
+        return _open_group_composer_inner(page)
+    except Exception as e:
+        print(f"[post] open composer error: {e}", flush=True)
+        _log_create_candidates(page)
+        return _composer_dialog(page) is not None
+
+
+def _click_feed_composer_strip(page: Page) -> bool:
+    """點社團動態上方的發文列。
+
+    現版 FB 常見 placeholder 是「留個言吧……」（會變），下方有
+    「不具名貼文／感受／票選活動」。點了才會開「建立貼文」dialog。
+    絕不可把文案直接 fill 進這個列——那不是真正的編輯器。
+    """
+    strip_markers = ("不具名貼文", "票選活動", "感受 / 活動", "感受", "Anonymous post", "Poll")
+    placeholders = (
+        "留個言吧",
+        "寫點內容",
+        "寫點什麼",
+        "在想什麼",
+        "在社團中發佈",
+        "Write something",
+        "What's on your mind",
+        "你在想什麼",
+    )
+
+    # 優先：同時含 placeholder + 不具名／票選 的卡片（排除 article 內留言）
+    for marker in strip_markers:
+        try:
+            cards = page.locator("[role='main'] div").filter(has_text=marker)
+            n = min(cards.count(), 12)
+        except Exception:
+            continue
+        for i in range(n):
+            card = cards.nth(i)
+            try:
+                if _is_inside_article(card):
+                    continue
+                # 卡片內找 placeholder 觸發列
+                trigger = None
+                for ph in placeholders:
+                    t = card.get_by_text(ph, exact=False).first
+                    if t.count() == 0:
+                        continue
+                    if _is_inside_article(t):
+                        continue
+                    trigger = t
+                    break
+                if trigger is None:
+                    # 有些版面 placeholder 在 role=button
+                    btn = card.locator("[role='button']").first
+                    if btn.count() and not _is_inside_article(btn):
+                        trigger = btn
+                if trigger is None:
+                    continue
+                trigger.scroll_into_view_if_needed(timeout=3000)
+                trigger.click(timeout=5000)
+                human_sleep(1.5, 3)
+                if _composer_dialog(page) is not None:
+                    print(f"[post] opened composer via feed strip (marker={marker})", flush=True)
+                    return True
+                # 點到了但沒開 → Escape 再試下一個
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+            except Exception:
+                continue
+
+    # 次選：直接點「留個言吧」但不在 article 內
+    for ph in placeholders:
+        try:
+            locs = page.get_by_text(ph, exact=False)
+            for i in range(min(locs.count(), 8)):
+                loc = locs.nth(i)
+                if _is_inside_article(loc):
+                    continue
+                # 附近要有社團發文列特徵，避免點到貼文留言 sticky bar
+                try:
+                    near = loc.locator(
+                        "xpath=ancestor::div[1]/following-sibling::div[1] | xpath=ancestor::div[2]"
+                    )
+                    near_txt = ""
+                    try:
+                        near_txt = loc.evaluate(
+                            """el => {
+                              let p = el;
+                              for (let i = 0; i < 6 && p; i++) p = p.parentElement;
+                              return (p && p.innerText || '').slice(0, 200);
+                            }"""
+                        ) or ""
+                    except Exception:
+                        near_txt = ""
+                    if not any(m in near_txt for m in strip_markers):
+                        # 摸魚等社團可能沒有「不具名」列；若在 main 頂部仍可試
+                        box = loc.bounding_box()
+                        if not box or box["y"] > 700:
+                            continue
+                except Exception:
+                    continue
+                if _click_trigger_open_composer(page, loc):
+                    print(f"[post] opened composer via placeholder: {ph}", flush=True)
+                    return True
+        except Exception as e:
+            print(f"[post] placeholder '{ph}' skip: {e}", flush=True)
+    return False
+
+
+def _open_group_composer_inner(page: Page) -> bool:
+    create_post = _t_first("create_post", "建立貼文")
+    write_box = _t_first("write_content_box", "寫點內容……")
+    write_short = _t_first("write_content", "寫點內容")
+
+    _dismiss_overlays(page)
+    try:
+        page.evaluate("window.scrollTo(0, 0)")
+        page.locator("[role='main']").first.evaluate("el => el && el.scrollTo(0, 0)")
+    except Exception:
+        pass
+    human_sleep(0.8, 1.5)
+
+    if _composer_dialog(page) is not None:
+        return True
+
+    # 0) 動態上方「留個言吧……」發文列（點開 → 建立貼文 dialog）
+    if _click_feed_composer_strip(page):
+        return True
+
+    # 1) data-pagelet 內嵌編輯器（部分社團版面）
+    for sel in (
+        '[data-pagelet="GroupInlineComposer"]',
+        '[data-pagelet*="InlineComposer"]',
+        '[data-pagelet*="Composer"]',
+    ):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_visible():
+                btn = loc.locator("[role='button']").first
+                target = btn if btn.count() else loc
+                if _click_trigger_open_composer(page, target):
+                    print(f"[post] opened composer via pagelet: {sel}", flush=True)
+                    return True
+        except Exception:
+            continue
+
+    # 2) 明確「建立貼文」aria-label
+    explicit_names = [
+        create_post, "建立貼文", "Create post", "Create a public post",
+        "建立公開貼文", "建立帖子",
+    ]
+    for name in explicit_names:
+        if not name:
+            continue
+        for loc in (
+            page.get_by_role("button", name=name),
+            page.locator(f"[aria-label='{name}']"),
+        ):
+            try:
+                n = min(loc.count(), 5)
+            except Exception:
+                continue
+            for i in range(n):
+                if _click_trigger_open_composer(page, loc.nth(i)):
+                    print(f"[post] opened composer via explicit: {name}", flush=True)
+                    return True
+
+    # 3) 其他上方文案觸發（不在 article 內）
+    top_texts = [
+        write_box, write_short, "寫點內容", "寫點什麼", "在想什麼",
+        "在社團中發佈貼文", "寫點什麼吧", "留個言吧",
+        "Write something", "What's on your mind", "你在想什麼",
+    ]
+    for text in top_texts:
+        if not text:
+            continue
+        try:
+            by_role = page.get_by_role("button", name=re.compile(re.escape(text[:8])))
+            candidates = by_role if by_role.count() > 0 else page.get_by_text(text, exact=False)
+        except Exception as e:
+            print(f"[post] top strip skip '{text}': {e}", flush=True)
+            continue
+        for i in range(min(candidates.count(), 8)):
+            if _click_trigger_open_composer(page, candidates.nth(i)):
+                print(f"[post] opened composer via top strip: {text}", flush=True)
+                return True
+
+    # 4) 僅點帶「建立貼文」標籤的 FAB
+    try:
+        fab = page.evaluate_handle(
+            """() => {
+              const buttons = [...document.querySelectorAll('[role="button"], a[role="link"]')];
+              const createLabels = ['建立貼文', 'Create post', '建立帖子', '建立公開貼文'];
+              let best = null, bestScore = -1;
+              for (const b of buttons) {
+                const label = (b.getAttribute('aria-label') || '').trim();
+                if (!createLabels.some(t => label.includes(t))) continue;
+                const r = b.getBoundingClientRect();
+                if (r.width < 10 || r.height < 10) continue;
+                const score = r.bottom + r.right;
+                if (score > bestScore) { bestScore = score; best = b; }
+              }
+              return best;
+            }"""
+        )
+        el = fab.as_element() if fab else None
+        if el:
+            el.click(timeout=5000)
+            human_sleep(1.5, 3)
+            if _composer_dialog(page) is not None:
+                print("[post] opened composer via labeled FAB", flush=True)
+                return True
+    except Exception as e:
+        print(f"[post] FAB click skipped: {e}", flush=True)
+
+    _log_create_candidates(page)
+    return _composer_dialog(page) is not None
+
+
+def _attach_media(page: Page, media_paths: list[str]) -> bool:
+    """在建立貼文 dialog 附加圖片／影片。"""
+    if not media_paths:
+        return True
+    existing = [p for p in media_paths if Path(p).exists()]
+    if not existing:
+        print(f"[post] media files missing: {media_paths}", flush=True)
+        return False
+
+    d = _composer_dialog(page)
+    root = d if d is not None else page
+
+    # 先點「相片／影片」讓 file input 出現（有些版面預設沒有）
+    for label in ("相片／影片", "相片/影片", "照片/视频", "Photo/video", "Photo/Video"):
+        try:
+            btn = root.get_by_role("button", name=re.compile(re.escape(label), re.I))
+            if btn.count() == 0:
+                btn = root.locator(f"[aria-label='{label}']")
+            if btn.count() > 0 and btn.first.is_visible():
+                btn.first.click(timeout=3000)
+                human_sleep(0.8, 1.5)
+                break
+        except Exception:
+            continue
+
+    file_input = root.locator("input[type='file']").first
+    if file_input.count() == 0:
+        file_input = page.locator("input[type='file']").first
+    if file_input.count() == 0:
+        print("[post] Warning: No file input for media upload", flush=True)
+        _save_diag(page, "no_file_input")
+        return False
+
+    try:
+        file_input.set_input_files(existing)
+    except Exception as e:
+        print(f"[post] set_input_files failed: {e}", flush=True)
+        _save_diag(page, "media_attach_failed")
+        return False
+
+    has_video = any(
+        Path(p).suffix.lower() in {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
+        for p in existing
+    )
+    # 影片上傳較久；等發佈鈕或預覽出現
+    wait = (8, 20) if has_video else (3, 8)
+    print(f"[post] attached {len(existing)} media file(s), video={has_video}", flush=True)
+    human_sleep(wait[0], wait[1])
+    return True
+
+
+def _click_publish(page: Page) -> bool:
+    """只點建立貼文 dialog 內的發佈——不點留言送出。"""
+    post_text = _t_first("m_post", "發佈")
+    publish = _t_first("publish", "發佈")
+    d = _composer_dialog(page)
+    if d is None:
+        return False
+
+    # 等發佈鈕可點（有內容後才會亮）
+    for _ in range(15):
+        try:
+            btn = d.get_by_role("button", name=re.compile(r"^(發佈|发布|Post|Publish)$"))
+            if btn.count() == 0:
+                btn = d.locator(
+                    f"[aria-label='{post_text}'], [aria-label='{publish}'], "
+                    "[aria-label='Post'], [aria-label='Publish']"
+                ).first
+            if btn.count() == 0:
+                human_sleep(0.5, 0.8)
+                continue
+            target = btn.first if hasattr(btn, "first") else btn
+            disabled = target.get_attribute("aria-disabled")
+            if disabled in ("true", "True"):
+                human_sleep(0.5, 0.9)
+                continue
+            target.click(timeout=5000)
+            print("[post] clicked publish", flush=True)
+            return True
+        except Exception:
+            human_sleep(0.5, 0.8)
+    return False
+
+
+@dataclass
+class PostResult:
+    success: bool
+    status: str  # '成功' | '失敗' | '審核'
+    permalink: str | None = None
+    error: str | None = None
+
+
+def _write_schedule_log(
+    event_type: str,
+    result: str,
+    fbid: str,
+    title: str,
+    permalink: str | None = None,
+    job_id: str | None = None,
+    error: str = "",
+):
+    """寫一行 schedule.log。格式：時間;類型;結果;帳號;物件標題;貼文URL;工作序號[;err=...]"""
+    ts = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    permalink = permalink or ""
+    job_id = job_id or str(int(time.time() * 10000))
+    line = f"{ts};{event_type};{result};{fbid};{title};{permalink};{job_id}"
+    if error:
+        line += f";err={error}"
+    line += "\n"
+
+    log_path = DATA_DIR / "schedule.log"
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(line)
+    print(f"[log] {line.strip()}")
+
+
+def _update_post_status(fbid: str, permalink: str, status: str):
+    """更新 postStatus.json。"""
+    status_path = DATA_DIR / "postStatus.json"
+
+    # 讀取現有資料
+    existing: dict = {}
+    if status_path.exists():
+        with open(status_path, "r", encoding="utf-8") as f:
+            try:
+                existing = json.load(f)
+            except json.JSONDecodeError:
+                existing = {}
+
+    # 更新
+    if fbid not in existing:
+        existing[fbid] = {}
+
+    now = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    existing[fbid][permalink] = {
+        "postTime": now,
+        "removed": False,
+        "like": "0",
+        "comment": "0",
+    }
+
+    with open(status_path, "w", encoding="utf-8") as f:
+        json.dump(existing, f, ensure_ascii=False, indent=2)
+
+
+def www_postclub_main(
+    page: Page,
+    fbid: str,
+    group_url: str,
+    content: str,
+    images: list[str] | None = None,
+    title: str = "",
+) -> PostResult:
+    """
+    在指定 FB 社團發一篇貼文（走 www 版；mbasic 已停用）。
+
+    Args:
+        page: Playwright Page 物件
+        fbid: FB numeric ID
+        group_url: 社團 URL（mbasic / www 皆可）
+        content: 貼文文案
+        images: 圖片／影片本機路徑列表（可選）
+        title: 物件標題（用於 log 記錄）
+
+    Returns:
+        PostResult
+    """
+    title = title or content[:20]
+    target_url = _to_www_group_url(group_url)
+
+    # Step 1: 健康檢查
+    check = perform_checks(page, fbid)
+    if check != CheckResult.OK:
+        error_msg = f"Pre-check failed: {check.value}"
+        _write_schedule_log("自動發文", "失敗", fbid, title, error=error_msg)
+        return PostResult(success=False, status="失敗", error=error_msg)
+
+    # Step 2: 導覽到社團頁面（www）
+    print(f"[post] goto group: {target_url}", flush=True)
+    if not enhanced_get(page, target_url):
+        error_msg = f"Cannot reach group: {target_url}"
+        _write_schedule_log("自動發文", "失敗", fbid, title, error=error_msg)
+        return PostResult(success=False, status="失敗", error=error_msg)
+
+    human_sleep(2, 4)
+
+    # Step 3: 開編輯器並輸入
+    if not _open_group_composer(page):
+        _save_diag(page, "no_composer")
+        error_msg = "Cannot find post editor"
+        _write_schedule_log("自動發文", "失敗", fbid, title, error=error_msg)
+        return PostResult(success=False, status="失敗", error=error_msg)
+
+    editor = _find_post_editor(page)
+    if editor.count() == 0:
+        _save_diag(page, "no_editor")
+        error_msg = "Cannot find post editor"
+        _write_schedule_log("自動發文", "失敗", fbid, title, error=error_msg)
+        return PostResult(success=False, status="失敗", error=error_msg)
+
+    # 在 dialog 內打字（不可用會點空白的 simulate_human_typing，會關掉彈窗）
+    if not _type_in_dialog_editor(page, editor, content):
+        _save_diag(page, "type_failed")
+        error_msg = "Cannot type content"
+        _write_schedule_log("自動發文", "失敗", fbid, title, error=error_msg)
+        return PostResult(success=False, status="失敗", error=error_msg)
+    human_sleep(1, 2)
+
+    # Step 4: 上傳圖片／影片
+    if images:
+        if not _attach_media(page, images):
+            # 媒體失敗不硬擋發文（純文案仍可送），但記 log
+            print("[post] media attach incomplete, continue with text", flush=True)
+
+    # Step 5: 點擊發佈
+    if _composer_dialog(page) is None:
+        _save_diag(page, "dialog_lost_before_publish")
+        error_msg = "Composer dialog closed before publish"
+        _write_schedule_log("自動發文", "失敗", fbid, title, error=error_msg)
+        return PostResult(success=False, status="失敗", error=error_msg)
+    if not _click_publish(page):
+        _save_diag(page, "no_publish")
+        error_msg = "Cannot find post button"
+        _write_schedule_log("自動發文", "失敗", fbid, title, error=error_msg)
+        return PostResult(success=False, status="失敗", error=error_msg)
+    human_sleep(3, 6)
+
+    # Step 6: 判定結果
+    # 檢查是否失敗
+    body_text = ""
+    try:
+        body_text = page.locator("body").inner_text(timeout=5000)
+    except Exception:
+        pass
+
+    # 失敗檢查
+    for key in ("something_went_wrong", "duplicate_post"):
+        try:
+            val = T(key)
+            if isinstance(val, list):
+                val = val[0]
+            if val in body_text:
+                error_msg = f"Post failed: {val}"
+                _write_schedule_log("自動發文", "失敗", fbid, title, error=error_msg)
+                return PostResult(success=False, status="失敗", error=error_msg)
+        except KeyError:
+            pass
+
+    # 被擋檢查
+    blocked_text = T("blocked_from_this_group")
+    if isinstance(blocked_text, list):
+        blocked_text = blocked_text[0]
+    if blocked_text in body_text:
+        error_msg = "Blocked from this group"
+        _write_schedule_log("自動發文", "失敗", fbid, title, error=error_msg)
+        return PostResult(success=False, status="失敗", error=error_msg)
+
+    # 審核檢查（貼文送出但待審核）
+    pending_keywords = ["審核", "待審", "pending", "review"]
+    if any(kw in body_text.lower() for kw in pending_keywords):
+        _write_schedule_log("自動發文", "審核", fbid, title)
+        return PostResult(success=True, status="審核")
+
+    # 成功檢查：找 permalink
+    permalink = find_and_hover_post_time(page)
+    if permalink:
+        _write_schedule_log("自動發文", "成功", fbid, title, permalink)
+        _update_post_status(fbid, permalink, "success")
+        print(f"[post] Success — permalink: {permalink}")
+        return PostResult(success=True, status="成功", permalink=permalink)
+
+    # 如果沒找到 permalink 但也沒有錯誤 → 可能成功但無法確認
+    # 保守處理：判定為審核（可能是首次發文需要審核）
+    if "發佈" not in body_text or "write_content_box" not in body_text:
+        _write_schedule_log("自動發文", "審核", fbid, title)
+        return PostResult(success=True, status="審核")
+
+    # 仍在編輯頁面 → 確定沒有送出
+    error_msg = "Post did not submit (still on editor page)"
+    _write_schedule_log("自動發文", "失敗", fbid, title, error=error_msg)
+    return PostResult(success=False, status="失敗", error=error_msg)

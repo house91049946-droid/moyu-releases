@@ -1,0 +1,1577 @@
+"""P2 — Facebook Marketplace 商品上架與社團分享。
+
+⚠️ 重要：Marketplace UI 錨點需要透過瀏覽器實測確認。
+         本模組提供框架，但 CSS/text 選擇器需在直播瀏覽器中調試。
+         實作前建議先手動走一次 marketplace/create/item/ 流程，
+         記錄實際 DOM 結構後更新本檔案的選擇器。
+"""
+import contextlib
+import datetime
+import json
+import os
+import random
+import re
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from playwright.sync_api import Page, BrowserContext
+
+from src.config_loader import T
+from src.paths import DATA_DIR, COOKIES_DIR
+from src.utils import (
+    enhanced_get,
+    enhanced_click,
+    human_sleep,
+    human_idle,
+    warm_up_browse,
+    perform_checks,
+    CheckResult,
+    capture_screenshot,
+    simulate_human_typing,
+    simulate_human_click,
+)
+
+# ── 商品類型參數表（與原版 auctionParameters 一致）────────────────────
+
+AUCTION_PARAMETERS = {
+    "product": {
+        "label": "一般商品 (包含房屋出售)",
+        "required": [
+            {"key": "item_name", "label": "商品名稱"},
+            {"key": "item_price", "label": "商品價格"},
+            {
+                "key": "condition",
+                "label": "商品狀況",
+                "options": {
+                    "new": "全新",
+                    "likeNew": "二手 - 近全新",
+                    "good": "二手 - 良好",
+                    "fair": "二手 - 普通",
+                },
+            },
+        ],
+    },
+    "house": {
+        "label": "房屋出租",
+        "required": [
+            {"key": "rentalType", "label": "出租類型"},
+            {"key": "bedrooms", "label": "臥室數量"},
+            {"key": "bathrooms", "label": "衛浴數量"},
+            {"key": "price", "label": "價格"},
+            {"key": "address", "label": "地址"},
+        ],
+    },
+    "carTruck": {
+        "label": "汽車/卡車",
+        "required": [
+            {"key": "vehicleType", "label": "車輛類型"},
+            {"key": "year", "label": "年份"},
+            {"key": "brand", "label": "廠牌"},
+            {"key": "model", "label": "型號"},
+            {"key": "mileage", "label": "里程數"},
+            {"key": "price", "label": "價格"},
+        ],
+    },
+    "motorcycle": {
+        "label": "摩托車",
+        "required": [
+            {"key": "vehicleType", "label": "車輛類型"},
+            {"key": "year", "label": "年份"},
+            {"key": "brand", "label": "廠牌"},
+            {"key": "model", "label": "型號"},
+            {"key": "mileage", "label": "里程數"},
+            {"key": "price", "label": "價格"},
+        ],
+    },
+    "vehicleOthers": {
+        "label": "車輛(其他)",
+        "required": [
+            {"key": "year", "label": "年份"},
+            {"key": "brand", "label": "廠牌"},
+            {"key": "model", "label": "型號"},
+            {"key": "price", "label": "價格"},
+        ],
+    },
+}
+
+# 狀況中英對照
+CONDITION_MAP = {
+    "new": "全新",
+    "likeNew": "二手 - 近全新",
+    "good": "二手 - 良好",
+    "fair": "二手 - 普通",
+}
+
+
+# ── 資料模型 ────────────────────────────────────────────────────────
+
+@dataclass
+class MarketplaceItem:
+    """商品刊登的完整資料（對應 shop_article JSON）。"""
+    item_type: str            # product / house / carTruck / motorcycle / vehicleOthers
+    item_name: str            # 商品名稱
+    item_price: int           # 價格
+    condition: str = ""       # new / likeNew / good / fair
+    item_location: str = ""   # 地點
+    description: str = ""     # 完整介紹文案 (原版 word 欄位)
+    category: str = ""        # Marketplace 類別名稱（如「其他」）；空則選第一個
+    images: list[str] = field(default_factory=list)  # 圖片絕對路徑或檔名
+    fields: dict = field(default_factory=dict)        # 商品類型特定欄位
+
+
+@dataclass
+class MarketplaceResult:
+    success: bool
+    status: str               # '成功' | '失敗' | '審核' | 'need_debug'
+    item_url: str | None = None
+    error: str | None = None
+    audience_selected: int = 0            # 對象頁勾選數（第一批 ≤20）
+    extra_listed: list = field(default_factory=list)  # 補刊各批結果 [{batch, selected, errors}]
+
+
+# ── 資料讀寫 ────────────────────────────────────────────────────────
+
+def load_shop_article(article_name: str, images_dir: str = "") -> MarketplaceItem | None:
+    """
+    從 data/shop_article/<名稱>.json 載入商品文案。
+
+    Args:
+        article_name: 商品名稱（對應 JSON 檔名，不含 .json）
+        images_dir: 圖片目錄（預設 data/shop_article_images/）
+
+    Returns:
+        MarketplaceItem 或 None
+    """
+    article_path = DATA_DIR / "shop_article" / f"{article_name}.json"
+    if not article_path.exists():
+        print(f"[marketplace] Article not found: {article_path}")
+        return None
+
+    with open(article_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    content = data.get("content", {})
+    item_type = content.get("itemType", "product")
+
+    # 價格欄位：house 用 price，product 用 item_price
+    price = content.get("price") or content.get("item_price", 0)
+
+    images = data.get("images", [])
+    # 轉為絕對路徑
+    if not images_dir:
+        images_dir = str(DATA_DIR / "shop_article_images")
+    absolute_images = []
+    for img in images:
+        p = Path(images_dir) / img
+        if p.exists():
+            absolute_images.append(str(p))
+        else:
+            # 可能是相對路徑
+            absolute_images.append(img)
+
+    # 收集 type-specific fields
+    fields = {}
+    for key, val in content.items():
+        if key not in ("itemType", "item_name", "item_location", "word", "item_price", "price", "condition", "images", "category"):
+            fields[key] = val
+
+    return MarketplaceItem(
+        item_type=item_type,
+        item_name=content.get("item_name", article_name),
+        item_price=int(price) if price else 0,
+        condition=content.get("condition", "new"),
+        item_location=content.get("item_location", ""),
+        description=content.get("word", ""),
+        category=content.get("category", ""),
+        images=absolute_images,
+        fields=fields,
+    )
+
+
+def list_shop_articles() -> list[str]:
+    """列出所有可用的商品文案。"""
+    d = DATA_DIR / "shop_article"
+    if not d.exists():
+        return []
+    return sorted([f.stem for f in d.glob("*.json")])
+
+
+def _load_products_json() -> dict:
+    """讀取 products.json。"""
+    p = DATA_DIR / "products.json"
+    if not p.exists():
+        return {}
+    with open(p, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+
+def _save_products_json(data: dict):
+    """寫入 products.json。"""
+    p = DATA_DIR / "products.json"
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _update_products_tracking(fbid: str, item_name: str, item_url: str):
+    """更新 products.json 中的商品追蹤。"""
+    products = _load_products_json()
+    if fbid not in products:
+        products[fbid] = {}
+    products[fbid][item_name] = {
+        "modifiedDate": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "itemUrl": item_url,
+    }
+    _save_products_json(products)
+
+
+def _already_posted(fbid: str, item_name: str) -> str | None:
+    """檢查商品是否已上架過，回傳既有 item_url。"""
+    products = _load_products_json()
+    acc = products.get(fbid, {})
+    item = acc.get(item_name, {})
+    return item.get("itemUrl") or None
+
+
+# ── 排程 log 寫入（與 P1 共用 schedule.log）─────────────────────────
+
+def _write_schedule_log(event_type: str, result: str, fbid: str, title: str,
+                         url: str = "", error: str = ""):
+    ts = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    job_id = str(int(time.time() * 10000))
+    line = f"{ts};{event_type};{result};{fbid};{title};{url};{job_id}"
+    if error:
+        line += f";err={error}"
+    line += "\n"
+    log_path = DATA_DIR / "schedule.log"
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(line)
+    print(f"[log] {line.strip()}")
+
+
+# ── Marketplace 上架主流程 ──────────────────────────────────────────
+
+# FB 類別下拉的項目不是 role=option，而是 menuitem 家族（帶 icon 的父類別）。
+# 用 role-agnostic 選擇器同時吃多種角色，避免 querySelectorAll 回傳 0。
+_CAT_OPT_SEL = "[role='option'],[role='menuitem'],[role='menuitemradio'],[role='menuitemcheckbox']"
+
+
+def _wait_category_options(page: Page, sel: str, timeout_sec: float = 12.0) -> int:
+    """等類別下拉選項出現（FB 常延遲渲染，立刻 query 會得到 0）。"""
+    deadline = time.time() + timeout_sec
+    last = 0
+    while time.time() < deadline:
+        try:
+            last = page.locator(sel).count()
+        except Exception:
+            last = 0
+        if last > 0:
+            return last
+        # 也等 listbox / menu 容器出現
+        with contextlib.suppress(Exception):
+            page.wait_for_selector(
+                "[role='listbox'],[role='menu']," + sel,
+                timeout=800,
+                state="visible",
+            )
+        human_sleep(0.35, 0.7)
+    return last
+
+
+def _select_category_option(page: Page, category_name: str) -> bool:
+    """在已開啟的類別下拉中選取指定類別（如「其他商品」在最下方）。
+    會捲動選項清單載入完整項目後精確比對；找不到才退回第一個。
+    選擇器與別名可由雲端下發（FB 改版免更新客戶端）。"""
+    from src.served_config import get as cfg
+    sel = cfg("selectors.mp_category_option_sel", _CAT_OPT_SEL)
+    cfg_aliases = cfg("selectors.mp_category_aliases", ["其他商品", "其他", "其它"])
+    target = (category_name or "").strip()
+
+    n = _wait_category_options(page, sel, timeout_sec=12.0)
+    if n == 0:
+        print("[marketplace] 類別選單尚未出現選項，再等一輪…", flush=True)
+        human_sleep(1.0, 1.8)
+        n = _wait_category_options(page, sel, timeout_sec=8.0)
+
+    # 先捲動選項清單到底（分類廣告/其他商品在最下方，可能需 lazy load）
+    try:
+        for _ in range(8):
+            opts = page.locator(sel).all()
+            if opts:
+                opts[-1].scroll_into_view_if_needed(timeout=2000)
+            page.mouse.wheel(0, 400)
+            human_sleep(0.3, 0.6)
+    except Exception:
+        pass
+    # 診斷截圖 + 印出目前看到的所有類別選項，方便對照
+    try:
+        all_opts = page.evaluate(
+            """(sel) => [...document.querySelectorAll(sel)].map(o => (o.innerText||'').trim().split('\\n')[0].trim()).filter(Boolean)""",
+            sel,
+        )
+        print(f"[marketplace] 類別選單現有選項({len(all_opts)}): {all_opts}", flush=True)
+        capture_screenshot(page, "category_diag", "category_dropdown")
+    except Exception:
+        pass
+
+    if target:
+        # 別名正規化：若目標屬於雲端下發的別名族（如「其他」↔「其他商品」），改用完整別名清單比對
+        if target in cfg_aliases:
+            aliases = list(dict.fromkeys(cfg_aliases + [target]))  # 保序去重
+        else:
+            aliases = [target]
+        # 只比對每個選項的「第一行文字」，避免比到父群組（如「分類廣告」）聚合後的整段文字
+        try:
+            idx = page.evaluate("""([sel, names]) => {
+                const opts = [...document.querySelectorAll(sel)];
+                const first = (o) => (o.innerText || '').trim().split('\\n')[0].trim();
+                // Tier 1: 第一行完全相等
+                for (const name of names)
+                    for (let i = 0; i < opts.length; i++)
+                        if (first(opts[i]) === name) return i;
+                // Tier 2: 第一行以目標開頭（「其他」→「其他商品」）
+                for (const name of names)
+                    for (let i = 0; i < opts.length; i++)
+                        if (first(opts[i]).startsWith(name)) return i;
+                // Tier 3: 第一行包含目標
+                for (const name of names)
+                    for (let i = 0; i < opts.length; i++)
+                        if (first(opts[i]).includes(name)) return i;
+                return -1;
+            }""", [sel, aliases])
+            if idx >= 0:
+                opt = page.locator(sel).nth(idx)
+                chosen = ""
+                with contextlib.suppress(Exception):
+                    chosen = (opt.inner_text(timeout=1500) or "").strip().split("\n")[0].strip()
+                opt.scroll_into_view_if_needed(timeout=2000)
+                human_sleep(0.2, 0.5)
+                simulate_human_click(page, opt)
+                print(f"[marketplace] 類別選擇: 目標「{target}」→ 實選「{chosen}」")
+                return True
+            print(f"[marketplace] ⚠️ 類別選單（role）找不到「{target}」(別名 {aliases})，改用純文字定位")
+        except Exception as e:
+            print(f"[marketplace] 類別比對失敗: {e}")
+
+        # 後備 1：純文字精確定位（不依賴 role），對每個別名嘗試
+        for name in aliases:
+            try:
+                loc = page.get_by_text(name, exact=True)
+                if loc.count() > 0:
+                    el = loc.last  # 下拉在 DOM 較後面，取最後一個較準
+                    el.scroll_into_view_if_needed(timeout=2000)
+                    human_sleep(0.2, 0.5)
+                    simulate_human_click(page, el)
+                    print(f"[marketplace] 類別選擇(文字定位): {name}")
+                    return True
+            except Exception:
+                continue
+        print(f"[marketplace] ⚠️ 純文字也找不到「{target}」，退回第一個")
+
+    # 退回：選第一個選項
+    opts = page.locator(sel).all()
+    if opts:
+        simulate_human_click(page, opts[0])
+        return True
+    page.keyboard.press("ArrowDown")
+    human_sleep(0.3, 0.5)
+    page.keyboard.press("Enter")
+    return False
+
+
+def post_one_sale_item(
+    page: Page,
+    fbid: str,
+    item: MarketplaceItem,
+    lang: str = "zh",
+    share_groups: list[str] | None = None,
+    batch_min_sec: float = 45,
+    batch_max_sec: float = 120,
+    dry_run: bool = False,
+    warmup_min_sec: float = 60,
+    warmup_max_sec: float = 180,
+) -> MarketplaceResult:
+    """
+    在 Facebook Marketplace 建立一個商品刊登（www 版）。
+
+    ⚠️ 選擇器需要直播瀏覽器實測調整。
+        若定位失敗，會回傳 status='need_debug' 並截圖。
+    """
+    print(f"[marketplace] Posting item: {item.item_name}")
+    title = item.item_name[:30]
+
+    # 健康檢查
+    check = perform_checks(page, fbid)
+    if check != CheckResult.OK:
+        _write_schedule_log("自動上架", "失敗", fbid, title, error=check.value)
+        return MarketplaceResult(success=False, status="失敗", error=f"Pre-check: {check.value}")
+
+    # 反偵測：進入發文系統前，先到 FB 首頁動態瀏覽 1-3 分鐘模擬真人
+    # （dry_run 縮短為 5-10 秒，僅驗流程不需拖時間）
+    if dry_run:
+        warm_up_browse(page, min_sec=5, max_sec=10)
+    else:
+        warm_up_browse(page, min_sec=warmup_min_sec, max_sec=warmup_max_sec)
+
+    # 進入建立商品頁（URL 可由雲端下發，FB 改路徑免更新客戶端）
+    from src.served_config import get as cfg
+    create_url = cfg("selectors.mp_create_url", "https://www.facebook.com/marketplace/create/item/")
+    if not enhanced_get(page, create_url):
+        _write_schedule_log("自動上架", "失敗", fbid, title, error="cannot reach create page")
+        return MarketplaceResult(success=False, status="失敗", error="Cannot reach create page")
+
+    human_sleep(3, 6)
+
+    # ── 新版 Marketplace 填表流程（經瀏覽器實測驗證）──
+    errors = []
+
+    # 找 input[type='text']（標題=第0個, 價格=第1個）
+    text_inputs = page.locator("input[type='text']").all()
+    if len(text_inputs) < 2:
+        ss = capture_screenshot(page, fbid, "marketplace_no_inputs")
+        _write_schedule_log("自動上架", "失敗", fbid, title, error="no inputs")
+        return MarketplaceResult(success=False, status="need_debug", error=f"找不到輸入欄位. 截圖: {ss}")
+
+    human_idle(page)  # 進表單先隨機瀏覽一下（反偵測）
+
+    # 1. 類別：開下拉 → 等選項渲染 → 捲到底找目標類別（如「其他商品」）
+    combos = page.locator("label[role='combobox']").all()
+    if len(combos) >= 1:
+        simulate_human_click(page, combos[0])
+        human_sleep(1.2, 2.2)
+        if not _select_category_option(page, item.category):
+            # 再點一次 combobox 重試（偶發 listbox 沒展開）
+            with contextlib.suppress(Exception):
+                page.keyboard.press("Escape")
+                human_sleep(0.4, 0.8)
+                simulate_human_click(page, combos[0])
+                human_sleep(1.2, 2.0)
+            if not _select_category_option(page, item.category):
+                errors.append("category")
+        human_sleep(0.5, 1)
+    else:
+        errors.append("category")
+
+    # 2. 標題 — 模擬真人打字後，驗證是否完整，不完整則以 fill 補齊
+    simulate_human_typing(page, text_inputs[0], item.item_name)
+    human_sleep(0.4, 0.9)
+    try:
+        cur = (text_inputs[0].input_value() or "").strip()
+    except Exception:
+        cur = ""
+    if cur != (item.item_name or "").strip():
+        try:
+            text_inputs[0].fill(item.item_name)
+            print(f"[marketplace] 標題以 fill 補齊（打字不完整）")
+        except Exception:
+            pass
+    human_sleep(0.5, 1.5)
+
+    # 3. 價格 — 模擬真人打字
+    if not simulate_human_typing(page, text_inputs[1], str(item.item_price)):
+        text_inputs[1].fill(str(item.item_price))
+    human_sleep(0.5, 1.5)
+
+    # 4. 狀況：開啟 combobox 後依中文標籤選擇正確選項
+    if item.condition and len(combos) >= 2:
+        cond_label = CONDITION_MAP.get(item.condition, "全新")
+        if not _select_combobox_option(page, combos[1], cond_label):
+            errors.append("condition")
+            print(f"[marketplace] ⚠️ 狀況選擇失敗: {cond_label}")
+    elif not item.condition:
+        errors.append("condition")
+
+    # 5. 上傳圖片（必填：FB 要求至少 1 張圖才會啟用繼續按鈕）
+    if item.images:
+        _upload_images(page, item.images)
+    else:
+        errors.append("images")
+        print("[marketplace] ⚠️ 無圖片：繼續按鈕可能維持 disabled")
+
+    # 6. 說明/內文（文案主體 — 重要！）
+    if item.description:
+        if _fill_description(page, item.description):
+            print(f"[marketplace] ✅ 已填入說明（{len(item.description)} 字）", flush=True)
+        else:
+            errors.append("description")
+            print("[marketplace] ⚠️ 說明欄位填寫失敗", flush=True)
+            with contextlib.suppress(Exception):
+                capture_screenshot(page, fbid, "marketplace_no_desc")
+    else:
+        print("[marketplace] ⚠️ item.description 為空，略過說明填寫", flush=True)
+
+    # 6.5 地點（縣市）— best-effort，選填，失敗不阻擋上架
+    if getattr(item, "item_location", ""):
+        _fill_location(page, item.item_location)
+
+    # 7. simulate_human_typing 已透過 click-body 觸發 blur，等待 React 更新
+    human_sleep(1, 2)
+    # 點一下頁面空白處，確保最後一個 input 的 blur 事件已觸發
+    page.mouse.click(10, 10)
+    human_sleep(0.5, 1)
+
+    disabled = page.evaluate("""() => {
+        const btn = document.querySelector('div[aria-label="繼續"]');
+        return btn ? btn.getAttribute('aria-disabled') : 'not found';
+    }""")
+
+    if disabled == "true":
+        # 最後手段：JS 端派發事件
+        page.evaluate("""() => {
+            document.querySelectorAll('input[type="text"]').forEach((el) => {
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            });
+        }""")
+        human_sleep(1, 2)
+        page.mouse.click(10, 10)
+        human_sleep(0.5, 1)
+        disabled = page.evaluate("""() => {
+            const btn = document.querySelector('div[aria-label="繼續"]');
+            return btn ? btn.getAttribute('aria-disabled') : 'not found';
+        }""")
+
+    if disabled == "true":
+        ss = capture_screenshot(page, fbid, "marketplace_still_disabled")
+        print(f"[marketplace] 繼續按鈕仍 disabled，截圖: {ss}")
+        try:
+            btn_loc = page.locator("div[aria-label='繼續']").first
+            simulate_human_click(page, btn_loc)
+            human_sleep(3, 6)
+        except Exception:
+            pass
+    else:
+        _click_continue(page)
+        human_sleep(3, 6)
+
+    # ── 步驟 8（可選）：在對象頁選擇轉發社團（第一批 ≤20，隨機順序）──
+    group_share_count = 0
+    overflow_groups: list[str] = []
+    if "step=audience" in page.url:
+        # 未明確指定時，讀取使用者存的選擇（data/marketplace_share_<fbid>.json）
+        if share_groups is None:
+            share_groups = load_share_groups(fbid)
+            if share_groups:
+                print(f"[marketplace] 從設定檔載入 {len(share_groups)} 個轉發社團")
+        if share_groups:
+            import random
+            shuffled = list(share_groups)
+            random.shuffle(shuffled)               # 隨機順序（FB 對重複發文高度警戒）
+            first_batch = shuffled[:20]            # 對象頁一次上限 20
+            overflow_groups = shuffled[20:]        # 其餘發佈後用「在更多地方上架」補刊
+            group_share_count = _select_groups_on_audience_page(page, first_batch, fbid)
+        else:
+            # 沒有選擇任何社團時，仍抓一次清單存檔，方便使用者之後挑選
+            get_audience_groups(page, fbid)
+
+    if group_share_count > 0:
+        print(f"[marketplace] 對象頁已勾選 {group_share_count} 個社團")
+
+    # ── dry-run：走完組裝與勾選，但不發佈 ──
+    if dry_run:
+        capture_screenshot(page, fbid, "marketplace_dryrun")
+        print("[marketplace] dry-run：已填完表單/勾選社團，未按發佈")
+        return MarketplaceResult(success=True, status="dry_run",
+                                 audience_selected=group_share_count)
+
+    # ── 步驟 9：點擊發布 ──
+    _click_publish_marketplace(page)
+    human_sleep(3, 5)
+
+    # ── 確認刊登狀態（輪詢，避免「你的商品」尚在 loading 就誤判審核）──
+    confirmed = _confirm_listing_published(page, fbid, title, timeout_sec=45)
+    item_url = confirmed.get("item_url") or _extract_item_url(page)
+    current_url = page.url
+    if not item_url and "marketplace/item" in current_url:
+        item_url = current_url
+
+    on_more_places = confirmed.get("on_more_places") or _on_list_in_more_places_page(page)
+    seen_in_selling = bool(confirmed.get("seen_in_selling"))
+
+    if not item_url:
+        ss = capture_screenshot(page, fbid, "marketplace_unknown")
+        if on_more_places or seen_in_selling:
+            _write_schedule_log("自動上架", "成功", fbid, title)
+            reason = "在更多地方上架頁" if on_more_places else "你的商品列表"
+            print(f"[marketplace] ✓ 已發佈（{reason}確認成功，未取得 item URL）", flush=True)
+            return MarketplaceResult(success=True, status="成功",
+                                     audience_selected=group_share_count)
+        _write_schedule_log("自動上架", "審核", fbid, title)
+        return MarketplaceResult(success=True, status="審核", audience_selected=group_share_count,
+                                 error=f"無法確認刊登狀態. 截圖: {ss}")
+
+    _update_products_tracking(fbid, item.item_name, item_url)
+    _write_schedule_log("自動上架", "成功", fbid, title, url=item_url)
+    print(f"[marketplace] ✓ Published: {item_url}")
+
+    # ── 步驟 10：超過 20 個社團 → 用「在更多地方上架」分批補刊（亂速）──
+    extra_listed = []
+    if overflow_groups:
+        print(f"[marketplace] 尚有 {len(overflow_groups)} 個社團待補刊（分批 ≤20）...", flush=True)
+        extra_listed = _forward_overflow_groups(
+            page, fbid, item.item_name, overflow_groups, batch_min_sec, batch_max_sec)
+
+    return MarketplaceResult(success=True, status="成功", item_url=item_url,
+                             audience_selected=group_share_count, extra_listed=extra_listed)
+
+
+def _forward_overflow_groups(page: Page, fbid: str, item_title: str, groups: list[str],
+                             min_sec: float, max_sec: float) -> list[dict]:
+    """把超過對象頁 20 上限的社團，分批（每批 ≤20）用『在更多地方上架』補刊。批次間亂速等待。"""
+    import random
+    results = []
+    batches = [groups[i:i + 20] for i in range(0, len(groups), 20)]
+    for bi, batch in enumerate(batches):
+        print(f"[marketplace] 補刊第 {bi + 1}/{len(batches)} 批（{len(batch)} 個社團）...", flush=True)
+        r = list_in_more_places(page, fbid, item_title, batch)
+        results.append({"batch": bi + 1, "requested": len(batch),
+                        "selected": r.get("selected", 0), "errors": r.get("errors", [])})
+        if bi < len(batches) - 1:
+            wait = random.uniform(min_sec, max_sec)   # 亂速
+            print(f"[marketplace] 亂速等待 {wait:.0f}s 後發下一批...", flush=True)
+            time.sleep(wait)
+    return results
+
+
+# ── 社群分享商品 ────────────────────────────────────────────────────
+
+def share_item_to_group(
+    page: Page,
+    fbid: str,
+    item_url: str,
+    group_url: str,
+    share_text: str = "",
+    lang: str = "zh",
+) -> MarketplaceResult:
+    """
+    把 Marketplace 商品分享到指定社團。
+
+    若分享按鈕定位困難，降級為：到社團發一般貼文，內文含商品 URL + 描述。
+    """
+    print(f"[marketplace] Sharing {item_url} to {group_url}")
+
+    # 先佔用進入商品頁
+    if not enhanced_get(page, item_url):
+        return MarketplaceResult(success=False, status="失敗", error="Cannot open item page")
+
+    human_sleep(2, 4)
+
+    # 嘗試點擊分享按鈕
+    share_success = False
+    share_selectors = [
+        "div[aria-label='傳送給朋友或發佈到動態。']",
+        "div[aria-label='Send this to friends or post it on your timeline.']",
+        "text=分享",
+        "text=Share",
+    ]
+    for sel in share_selectors:
+        if enhanced_click(page, sel, timeout=5000, retries=1):
+            share_success = True
+            break
+
+    if share_success:
+        human_sleep(1, 3)
+        # 選擇「分享到社團」
+        group_selectors = [
+            "text=分享到社團",
+            "text=Share to a group",
+        ]
+        for sel in group_selectors:
+            if enhanced_click(page, sel, timeout=5000, retries=1):
+                # 在彈窗中輸入群組並點擊
+                human_sleep(1, 2)
+                # 嘗試輸入社團名稱
+                group_input_sel = "input[aria-label='搜尋社團'], input[placeholder*='社團']"
+                if not enhanced_click(page, group_input_sel, timeout=3000, retries=1):
+                    pass
+                # 輸入 group_url 不太好，需要從群組 URL 中取得群組名稱
+                human_sleep(1, 2)
+                # 點發佈
+                enhanced_click(page, "text=發佈, text=Post", timeout=5000)
+                _write_schedule_log("上架至社團", "成功", fbid, item_url[:30], url=group_url)
+                return MarketplaceResult(success=True, status="成功", item_url=item_url)
+        # 備案：分享流程失敗，降級
+
+    # ── 降級方案：以一般貼文方式發到社團，內文含商品連結 ──
+    print(f"[marketplace] Share button not found, using fallback: post link to group")
+    from src.generalpost_www import www_postclub_main
+
+    post_content = f"{share_text}\n\n{item_url}" if share_text else item_url
+    result = www_postclub_main(
+        page=page,
+        fbid=fbid,
+        group_url=group_url,
+        content=post_content,
+    )
+    if result.success:
+        _write_schedule_log("上架至社團", "成功", fbid, item_url[:30], url=group_url)
+        return MarketplaceResult(success=True, status="成功", item_url=item_url)
+    else:
+        _write_schedule_log("上架至社團", "失敗", fbid, item_url[:30], error=result.error or "")
+        return MarketplaceResult(success=False, status="失敗", error=result.error)
+
+
+# ── 內部輔助函式 ────────────────────────────────────────────────────
+
+def _fill_location(page: Page, city: str) -> bool:
+    """在 Marketplace 商品表單填入地點（縣市）。
+
+    ⚠️ best-effort：FB 地點是「搜尋建議」欄（點開→輸入→選建議），DOM 選擇器需在
+    直播瀏覽器上架時實測調整（見檔頭註解）。地點為選填，失敗只記錄、不阻擋上架。
+    """
+    if not city:
+        return False
+    try:
+        loc = None
+        for sel in ("label:has-text('地點') input", "input[placeholder*='地點']",
+                    "input[aria-label*='地點']", "label[aria-label*='地點']"):
+            cand = page.locator(sel)
+            if cand.count() > 0:
+                loc = cand.first
+                break
+        if loc is None:
+            print("[marketplace] ⚠️ 找不到地點欄位（選擇器需實測調整）", flush=True)
+            return False
+        loc.click()
+        human_sleep(0.4, 0.9)
+        with contextlib.suppress(Exception):
+            loc.fill("")
+        if not simulate_human_typing(page, loc, city):
+            with contextlib.suppress(Exception):
+                loc.fill(city)
+        human_sleep(1.0, 1.8)   # 等地點建議清單出現
+        for opt_sel in ("ul[role='listbox'] li[role='option']", "div[role='option']",
+                        "ul[role='listbox'] li"):
+            opts = page.locator(opt_sel)
+            if opts.count() > 0:
+                opts.first.click()
+                human_sleep(0.3, 0.8)
+                print(f"[marketplace] ✅ 已選地點建議（輸入「{city}」）", flush=True)
+                return True
+        print(f"[marketplace] ⚠️ 地點「{city}」無建議可選（選擇器需實測）", flush=True)
+        return False
+    except Exception as e:
+        print(f"[marketplace] ⚠️ 地點填寫例外（不阻擋上架）: {e}", flush=True)
+        return False
+
+
+def _select_combobox_option(page: Page, combo_locator, option_text: str, retries: int = 2) -> bool:
+    """開啟 combobox 並依文字選擇選項，選完驗證 combobox 顯示值。
+
+    FB 的 listbox 選項是 role='option'，內含選項文字。
+    以文字精確比對，找不到時退回部分比對。
+    """
+    for attempt in range(retries):
+        try:
+            simulate_human_click(page, combo_locator)
+            human_sleep(1, 2)
+
+            # 等 listbox 展開
+            opts = page.locator("[role='option']").all()
+            if not opts:
+                human_sleep(1, 1.5)
+                opts = page.locator("[role='option']").all()
+            if not opts:
+                continue
+
+            # 先精確比對，再部分比對
+            target = None
+            for opt in opts:
+                try:
+                    text = opt.inner_text().strip()
+                except Exception:
+                    continue
+                if text == option_text:
+                    target = opt
+                    break
+            if target is None:
+                for opt in opts:
+                    try:
+                        text = opt.inner_text().strip()
+                    except Exception:
+                        continue
+                    if option_text in text or text in option_text:
+                        target = opt
+                        break
+
+            if target is None:
+                # 收合 listbox 再重試
+                page.keyboard.press("Escape")
+                human_sleep(0.5, 1)
+                continue
+
+            simulate_human_click(page, target)
+            human_sleep(0.5, 1)
+
+            # 驗證：combobox 上的顯示文字應包含選項文字
+            try:
+                shown = combo_locator.inner_text().strip()
+                if option_text in shown:
+                    return True
+            except Exception:
+                return True  # 無法驗證時視為成功
+
+            print(f"[marketplace] combobox 顯示 '{shown}'，預期 '{option_text}'，重試...")
+        except Exception as e:
+            print(f"[marketplace] _select_combobox_option error: {e}")
+            human_sleep(1, 2)
+    return False
+
+
+def _fill_marketplace_field(page: Page, label_text: str, value: str) -> bool:
+    """依標籤文字找輸入框並填值。支援 label[for] 和父層/兄弟層三種關聯。"""
+    # 策略1：透過 label[for] 屬性
+    try:
+        label = page.locator(f"label:has-text('{label_text}')").first
+        if label.count() > 0:
+            for_id = label.get_attribute("for") or ""
+            if for_id:
+                inp = page.locator(f"#{for_id}").first
+                if inp.count() > 0:
+                    inp.fill(value)
+                    human_sleep(0.5, 1.5)
+                    return True
+    except Exception:
+        pass
+
+    # 策略2：找 label 兄弟節點中的 input
+    try:
+        for el in [page.locator(f"label:has-text('{label_text}')").first,
+                    page.locator(f"span:has-text('{label_text}')").first]:
+            if el.count() == 0:
+                continue
+            # 往上找共同父層，再往下找 input
+            parent = el.locator("..")
+            if parent.count() > 0:
+                inp = parent.locator("input, textarea, [role='textbox']").first
+                if inp.count() > 0:
+                    inp.fill(value)
+                    human_sleep(0.5, 1.5)
+                    return True
+                # 再往上一層
+                grandparent = parent.locator("..")
+                if grandparent.count() > 0:
+                    inp = grandparent.locator("input, textarea, [role='textbox']").first
+                    if inp.count() > 0:
+                        inp.fill(value)
+                        human_sleep(0.5, 1.5)
+                        return True
+    except Exception:
+        pass
+
+    # 策略3：直接用 aria-label
+    return _fill_by_aria(page, label_text, value)
+
+
+def _fill_by_aria(page: Page, keyword: str, value: str) -> bool:
+    """用 aria-label 關鍵字找輸入框。"""
+    try:
+        sel = f"input[aria-label*='{keyword}'], textarea[aria-label*='{keyword}']"
+        inp = page.locator(sel).first
+        if inp.count() > 0:
+            inp.fill(value)
+            human_sleep(0.5, 1.5)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _select_condition(page: Page, condition_label: str) -> bool:
+    """選擇商品狀況（全新/二手...）。"""
+    try:
+        # 點擊狀況選項
+        btn = page.locator(f"label:has-text('{condition_label}'), span:has-text('{condition_label}')").first
+        if btn.count() > 0:
+            btn.click()
+            human_sleep(0.5, 1.5)
+            return True
+        # 或 radio
+        radio = page.locator(f"text={condition_label}").first
+        if radio.count() > 0:
+            radio.click()
+            human_sleep(0.5, 1.5)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _upload_images(page: Page, image_paths: list[str]) -> bool:
+    """上傳圖片到 Marketplace 刊登表單（FB 要求至少 1 張才會啟用繼續）。"""
+    try:
+        # 先找「新增相片」區域點擊，確保 file input 可見
+        add_photo_selectors = [
+            "div[role='button']:has-text('新增相片')",
+            "div[role='button']:has-text('Add Photos')",
+            "div[aria-label*='相片']",
+            "div[aria-label*='photo']",
+        ]
+        for sel in add_photo_selectors:
+            try:
+                btn = page.locator(sel).first
+                if btn.count() > 0 and btn.is_visible():
+                    simulate_human_click(page, btn)
+                    human_sleep(0.5, 1)
+                    break
+            except Exception:
+                continue
+
+        # 找 file input
+        file_input = page.locator("input[type='file'][accept*='image']").first
+        if file_input.count() == 0:
+            file_input = page.locator("input[type='file']").first
+        if file_input.count() == 0:
+            print("[marketplace] ❌ 找不到圖片上傳 input")
+            return False
+
+        file_input.set_input_files(image_paths)
+        # 等待 FB 處理圖片（壓縮/上傳需要時間）
+        human_sleep(5, 10)
+        print(f"[marketplace] ✅ 已上傳 {len(image_paths)} 張圖片")
+        return True
+    except Exception as e:
+        print(f"[marketplace] Image upload failed: {e}")
+        return False
+
+
+_CONTINUE_SELECTORS_DEFAULT = [
+    "div[aria-label='繼續']",
+    "span:has-text('繼續')",
+    "text=繼續",
+    "div[aria-label='Next']",
+    "span:has-text('Next')",
+    "text=Next",
+    "text=發佈",      # 舊版備案
+    "text=Publish",   # 舊版備案
+]
+
+
+def _click_continue(page: Page) -> bool:
+    """點擊 Marketplace 的「繼續」按鈕（新版 FB）。選擇器可由雲端下發（FB 改版免更新客戶端）。"""
+    from src.served_config import get as cfg
+    selectors = cfg("selectors.mp_continue_selectors", _CONTINUE_SELECTORS_DEFAULT)
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0 and el.is_visible():
+                el.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _select_category(page: Page, item_type: str) -> bool:
+    """選擇 Marketplace 商品類別（FB 新版為下拉選單）。"""
+    try:
+        # 點擊類別標籤旁的選單
+        label = page.locator("label:has-text('類別')").first
+        if label.count() == 0:
+            return False
+
+        # 點擊對應的選單按鈕（通常是 label 旁邊的下拉箭頭）
+        parent = label.locator("..")
+        dropdown = parent.locator("[role='button'], div[aria-haspopup='listbox']").first
+        if dropdown.count() == 0:
+            # 備案：直接點 label 下一個可點擊元素
+            dropdown = parent.locator("div[role='button']").first
+        if dropdown.count() == 0:
+            return False
+
+        dropdown.click()
+        human_sleep(1, 2)
+
+        # 依 item_type 選擇對應選項
+        type_labels = {
+            "product": "商品/一般物品",
+            "house": "房屋出租",
+            "carTruck": "汽車/卡車",
+            "motorcycle": "摩托車",
+            "vehicleOthers": "車輛(其他)",
+        }
+        target = type_labels.get(item_type, "商品/一般物品")
+
+        # 點擊選項
+        option = page.locator(f"[role='option']:has-text('{target}')").first
+        if option.count() > 0:
+            option.click()
+            human_sleep(1, 2)
+            return True
+
+        # 備案：用文字匹配
+        option2 = page.locator(f"text={target}").first
+        if option2.count() > 0:
+            option2.click()
+            human_sleep(1, 2)
+            return True
+
+        return False
+    except Exception as e:
+        print(f"[marketplace] Category selection failed: {e}")
+        return False
+
+
+def _fill_description(page: Page, text: str) -> bool:
+    """填入商品說明/內文。說明欄是 textarea（標題/價格是 input）。填完驗證確認真的填進去。"""
+    def _verify(loc) -> bool:
+        val = ""
+        with contextlib.suppress(Exception):
+            val = loc.input_value() or ""
+        if not val:
+            with contextlib.suppress(Exception):
+                val = loc.inner_text() or ""
+        return bool(val) and text[:15] in val
+
+    selectors = ["textarea", "div[contenteditable='true']", "[role='textbox']"]
+    for attempt in range(2):
+        for sel in selectors:
+            loc = page.locator(sel).first
+            try:
+                if loc.count() == 0:
+                    continue
+                loc.scroll_into_view_if_needed(timeout=2000)
+                simulate_human_click(page, loc)
+                human_sleep(0.3, 0.6)
+                # 先試 fill（textarea 最可靠）
+                with contextlib.suppress(Exception):
+                    loc.fill(text)
+                human_sleep(0.3, 0.6)
+                page.mouse.click(10, 10)  # blur 觸發 React onChange
+                human_sleep(0.3, 0.6)
+                if _verify(loc):
+                    return True
+                # fill 無效（多為 contenteditable）→ 改逐字打字
+                simulate_human_click(page, loc)
+                page.keyboard.press("Meta+A" if page.evaluate("navigator.platform").startswith("Mac") else "Control+A")
+                page.keyboard.press("Backspace")
+                page.keyboard.type(text[:2000], delay=6)
+                page.mouse.click(10, 10)
+                human_sleep(0.3, 0.6)
+                if _verify(loc):
+                    return True
+            except Exception as e:
+                print(f"[marketplace] 說明填寫嘗試失敗({sel}): {e}", flush=True)
+                continue
+        # 第一輪都失敗 → 嘗試展開詳細區塊再試一輪
+        _expand_details_section(page)
+        human_sleep(1, 1.5)
+    return False
+
+
+def _expand_details_section(page: Page):
+    """展開「更多詳情」區塊（描述欄位藏在這裡）。"""
+    try:
+        expand_btn = page.locator("text=更多詳情").first
+        if expand_btn.count() > 0 and expand_btn.is_visible():
+            expand_btn.click()
+            return
+        # 備案
+        alt = page.locator("div[role='button']:has-text('更多詳情')").first
+        if alt.count() > 0:
+            alt.click()
+    except Exception:
+        pass
+
+
+def _click_publish(page: Page) -> bool:
+    """舊版相容 — 點擊發佈（現已改用 _click_continue）。"""
+    return _click_continue(page)
+
+
+# 對象頁 checkbox 沒有 aria-label，社團名稱在父層容器文字的第一行。
+# 先 scrollIntoView 確保座標在視野內（getBoundingClientRect 回傳 viewport 座標）。
+_JS_FIND_GROUP_CHECKBOX = """(targetName) => {
+    const boxes = document.querySelectorAll("[role='checkbox']");
+    for (const box of boxes) {
+        let node = box;
+        for (let i = 0; i < 8; i++) {
+            node = node.parentElement;
+            if (!node) break;
+            const text = (node.innerText || '').trim();
+            if (text && text.length > 1) {
+                if (text.split('\\n')[0].trim() === targetName) {
+                    box.scrollIntoView({block: 'center'});
+                    const r = box.getBoundingClientRect();
+                    return {found: true, x: r.x + r.width/2, y: r.y + r.height/2,
+                            checked: box.getAttribute('aria-checked')};
+                }
+                break;
+            }
+        }
+    }
+    return {found: false};
+}"""
+
+# 社團切換鈕：新版可能是 checkbox 或 switch
+_GROUP_TOGGLE_SEL = "[role='checkbox'],[role='switch']"
+
+_JS_LIST_GROUPS = """() => {
+    const results = [];
+    const seen = new Set();
+    document.querySelectorAll("[role='checkbox'],[role='switch']").forEach((box) => {
+        let node = box;
+        for (let i = 0; i < 8; i++) {
+            node = node.parentElement;
+            if (!node) break;
+            const text = (node.innerText || '').trim();
+            if (text && text.length > 1) {
+                const name = text.split('\\n')[0].trim();
+                if (name && !seen.has(name) && !name.includes('Marketplace')) {
+                    seen.add(name);
+                    results.push(name);
+                }
+                break;
+            }
+        }
+    });
+    return results;
+}"""
+
+# 找社團清單那個可捲動容器並捲到底（避免滾到右側預覽）
+_JS_SCROLL_LIST = """() => {
+    const t = document.querySelector("[role='checkbox'],[role='switch']");
+    if (!t) return -1;
+    let el = t.parentElement;
+    while (el && el !== document.body) {
+        const s = getComputedStyle(el);
+        if ((s.overflowY === 'auto' || s.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 20) {
+            el.scrollTop = el.scrollHeight;
+            return document.querySelectorAll("[role='checkbox'],[role='switch']").length;
+        }
+        el = el.parentElement;
+    }
+    const all = document.querySelectorAll("[role='checkbox'],[role='switch']");
+    if (all.length) all[all.length - 1].scrollIntoView();
+    return all.length;
+}"""
+
+# 抓到 0 時的診斷：各候選選擇器的數量，幫忙判斷 FB 現在的 DOM 用什麼
+_JS_DIAG = """() => ({
+    checkbox: document.querySelectorAll("[role='checkbox']").length,
+    switch: document.querySelectorAll("[role='switch']").length,
+    listitem: document.querySelectorAll("[role='listitem']").length,
+    groupLinks: document.querySelectorAll("a[href*='/groups/']").length,
+    dialogs: document.querySelectorAll("[role='dialog']").length,
+    url: location.href,
+})"""
+
+
+def _write_detect_progress(fbid: str, count: int, done: bool):
+    """把 detect 目前收集到的社團數寫進進度檔，供前端即時顯示。"""
+    if not fbid:
+        return
+    try:
+        p = DATA_DIR / f"detect_progress_{fbid}.json"
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"count": count, "done": done, "ts": time.time()}, f)
+    except Exception:
+        pass
+
+
+def get_audience_groups(page: Page, fbid: str = "") -> list[str]:
+    """在 step=audience 頁抓取所有可轉發的社團名稱，並存到 data/marketplace_groups_<fbid>.json。"""
+    _write_detect_progress(fbid, 0, done=False)
+    # 捲動「社團清單容器」載入完整 lazy list；數量穩定就停
+    prev = -1
+    for _ in range(20):
+        cur = page.evaluate(_JS_SCROLL_LIST)
+        if isinstance(cur, int) and cur > 0:
+            _write_detect_progress(fbid, cur, done=False)  # 即時回報目前收集數
+        human_sleep(0.6, 1.2)
+        if cur == prev and cur > 0:
+            break
+        prev = cur
+
+    groups = page.evaluate(_JS_LIST_GROUPS)
+    _write_detect_progress(fbid, len(groups), done=True)
+    print(f"[marketplace] 對象頁共 {len(groups)} 個社團", flush=True)
+
+    if not groups:
+        try:
+            diag = page.evaluate(_JS_DIAG)
+            print(f"[marketplace] ⚠️ 抓到 0 個。診斷選擇器數量: {diag}", flush=True)
+        except Exception:
+            pass
+        capture_screenshot(page, fbid or "unknown", "audience_zero_groups")
+
+    if fbid:
+        out = DATA_DIR / f"marketplace_groups_{fbid}.json"
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(groups, f, ensure_ascii=False, indent=2)
+        print(f"[marketplace] 社團清單已存: {out}", flush=True)
+
+    return groups
+
+
+def load_share_groups(fbid: str) -> list[str]:
+    """讀取使用者選擇要轉發的社團（data/marketplace_share_<fbid>.json）。
+
+    檔案格式: {"selected": ["社團名稱1", "社團名稱2", ...]}
+    """
+    p = DATA_DIR / f"marketplace_share_{fbid}.json"
+    if not p.exists():
+        return []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("selected", [])
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_share_groups(fbid: str, selected: list[str]):
+    """儲存使用者選擇的轉發社團。"""
+    p = DATA_DIR / f"marketplace_share_{fbid}.json"
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"selected": selected}, f, ensure_ascii=False, indent=2)
+
+
+def _select_groups_on_audience_page(page: Page, group_names: list[str], fbid: str) -> int:
+    """在 Marketplace step=audience 頁面勾選要轉發的社團（依名稱精確比對）。
+
+    checkbox 無 aria-label，用 JS 從父層文字比對名稱後以滑鼠座標點擊。
+    FB 限制最多 20 個社團。
+
+    Returns: 成功勾選的社團數量
+    """
+    print(f"[marketplace] 在對象頁勾選 {len(group_names)} 個社團...", flush=True)
+    human_sleep(2, 3)
+
+    # 先抓完整清單（會捲動載入 + 存檔供之後選擇用）
+    available = get_audience_groups(page, fbid)
+
+    count = 0
+    for name in group_names[:20]:  # FB 上限 20 個
+        if name not in available:
+            print(f"  [×] 找不到社團: {name[:40]}", flush=True)
+            continue
+
+        try:
+            # 第一次呼叫會 scrollIntoView，等捲動完成後再取一次正確座標
+            result = page.evaluate(_JS_FIND_GROUP_CHECKBOX, name)
+            if not result.get("found"):
+                print(f"  [×] 定位失敗: {name[:40]}", flush=True)
+                continue
+            human_sleep(0.5, 1)
+            result = page.evaluate(_JS_FIND_GROUP_CHECKBOX, name)
+
+            if result.get("checked") == "true":
+                print(f"  [✓] 已勾選（跳過）: {name[:40]}", flush=True)
+                count += 1
+                continue
+
+            page.mouse.click(result["x"], result["y"])
+            human_sleep(0.8, 1.5)
+
+            verify = page.evaluate(_JS_FIND_GROUP_CHECKBOX, name)
+            if verify.get("checked") == "true":
+                print(f"  [✓] 勾選成功: {name[:40]}", flush=True)
+                count += 1
+                continue
+
+            # 備援：座標點擊沒生效時，改用 Playwright locator 直接點 checkbox
+            idx = page.evaluate("""(targetName) => {
+                const boxes = document.querySelectorAll("[role='checkbox']");
+                for (let i = 0; i < boxes.length; i++) {
+                    let node = boxes[i];
+                    for (let j = 0; j < 8; j++) {
+                        node = node.parentElement;
+                        if (!node) break;
+                        const text = (node.innerText || '').trim();
+                        if (text && text.length > 1) {
+                            if (text.split('\\n')[0].trim() === targetName) return i;
+                            break;
+                        }
+                    }
+                }
+                return -1;
+            }""", name)
+            if idx >= 0:
+                cb = page.locator("[role='checkbox']").nth(idx)
+                cb.scroll_into_view_if_needed()
+                human_sleep(0.3, 0.6)
+                cb.click(force=True)
+                human_sleep(0.8, 1.5)
+                verify = page.evaluate(_JS_FIND_GROUP_CHECKBOX, name)
+                if verify.get("checked") == "true":
+                    print(f"  [✓] 勾選成功（備援）: {name[:40]}", flush=True)
+                    count += 1
+                    continue
+
+            print(f"  [!] 勾選未確認: {name[:40]}", flush=True)
+        except Exception as e:
+            print(f"  [×] 錯誤 ({name[:30]}): {e}", flush=True)
+
+    if count == 0 and group_names:
+        capture_screenshot(page, fbid, "audience_no_groups")
+
+    return count
+
+
+# ── 功能 A：用 selling 頁「在更多地方上架」把商品補刊到更多社團（每批 ≤ 20）──
+
+_JS_FIND_ITEM_MORE_BTN = """(title) => {
+    // 找含標題文字的元素（取 DOM 最先出現＝最上面那個商品），往上找商品卡片，
+    // 再找卡片內的「更多（...）」按鈕座標。
+    const els = [...document.querySelectorAll('span,div,a,h2,h3')];
+    const hit = els.find(el => {
+        const t = (el.innerText || '').trim();
+        return t === title || t.startsWith(title);
+    });
+    if (!hit) return null;
+    let node = hit;
+    for (let i = 0; i < 14; i++) {
+        node = node.parentElement;
+        if (!node) break;
+        const btns = node.querySelectorAll("[role='button'],[aria-haspopup='menu'],div[aria-label]");
+        for (const b of btns) {
+            const al = (b.getAttribute('aria-label') || '');
+            if (al.includes('更多') || al.toLowerCase().includes('more') || al.includes('選項')) {
+                const r = b.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) return {x: r.x + r.width/2, y: r.y + r.height/2, label: al};
+            }
+        }
+    }
+    return null;
+}"""
+
+_MENU_LIST_MORE_TEXTS = ["在更多地方上架", "List in more places"]
+
+
+def _click_menu_item(page: Page, texts: list[str]) -> bool:
+    """在剛開啟的下拉選單中，依文字點擊選項。"""
+    for t in texts:
+        loc = page.locator(f"[role='menuitem']:has-text('{t}'), [role='button']:has-text('{t}'), span:has-text('{t}')").first
+        try:
+            if loc.count() > 0 and loc.is_visible():
+                loc.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def list_in_more_places(page: Page, fbid: str, item_title: str, group_names_batch: list[str],
+                        list_only: bool = False, dry_run: bool = False) -> dict:
+    """在 selling 頁對指定商品點「在更多地方上架」，勾選本批社團（≤20）並發佈。
+    回傳 {selected, errors, available}。
+    - list_only=True：只開對話框、回傳可轉發社團清單、不勾選。
+    - dry_run=True：勾選但不點「發佈」（安全測試用）。
+    每一步拍截圖，方便對現行 FB 介面除錯。"""
+    errors: list[str] = []
+
+    if not enhanced_get(page, "https://www.facebook.com/marketplace/you/selling"):
+        return {"selected": 0, "errors": ["cannot open selling page"], "available": []}
+    human_sleep(3, 5)
+    capture_screenshot(page, fbid, "lmp_1_selling")
+
+    # 1. 定位商品的「...」按鈕
+    btn = page.evaluate(_JS_FIND_ITEM_MORE_BTN, item_title)
+    if not btn:
+        capture_screenshot(page, fbid, "lmp_item_not_found")
+        return {"selected": 0, "errors": [f"找不到商品或其更多按鈕: {item_title[:40]}"], "available": []}
+    print(f"[lmp] 點商品更多選單 (label={btn.get('label')})", flush=True)
+    page.mouse.click(btn["x"], btn["y"])
+    human_sleep(1, 2)
+    capture_screenshot(page, fbid, "lmp_2_menu")
+
+    # 2. 點「在更多地方上架」（選單文字可由雲端下發，FB 改版免更新客戶端）
+    from src.served_config import get as cfg
+    list_more_texts = cfg("selectors.mp_list_more_texts", _MENU_LIST_MORE_TEXTS)
+    if not _click_menu_item(page, list_more_texts):
+        capture_screenshot(page, fbid, "lmp_menu_no_option")
+        return {"selected": 0, "errors": ["選單找不到『在更多地方上架』"], "available": []}
+    human_sleep(2, 4)
+    capture_screenshot(page, fbid, "lmp_3_dialog")
+
+    human_idle(page)  # 選社團前隨機游移（反偵測）
+    # 對話框只列「可轉發 Marketplace」的社團 → 先抓實際可用清單
+    available = get_audience_groups(page, fbid)
+    print(f"[lmp] 對話框可轉發社團共 {len(available)} 個", flush=True)
+    if list_only:
+        return {"selected": 0, "errors": [], "available": available}
+
+    # 只勾「本批 ∩ 可用」的社團，避免要求不存在的社團
+    wanted = [g for g in group_names_batch if g in available]
+    missing = [g for g in group_names_batch if g not in available]
+    if missing:
+        print(f"[lmp] {len(missing)} 個社團不在可轉發清單、略過: {missing[:3]}...", flush=True)
+
+    # 3. 勾選本批社團（復用對象頁的捲動+勾選邏輯）
+    selected = _select_groups_on_audience_page(page, wanted, fbid) if wanted else 0
+    capture_screenshot(page, fbid, "lmp_4_selected")
+
+    # 4. 發佈（dry_run 時跳過，只驗證勾選）
+    if selected > 0 and not dry_run:
+        if not _click_publish_marketplace(page):
+            errors.append("發佈按鈕點擊失敗")
+        human_sleep(3, 5)
+        capture_screenshot(page, fbid, "lmp_5_published")
+    elif selected > 0 and dry_run:
+        print("[lmp] dry-run：已勾選但不發佈", flush=True)
+    else:
+        errors.append("本批 0 個社團勾選成功")
+
+    return {"selected": selected, "errors": errors, "available": available}
+
+
+def _click_publish_marketplace(page: Page) -> bool:
+    """在 Marketplace 建立頁點擊發布（step=audience 或最終步驟）。"""
+    selectors = [
+        "div[aria-label='發布']",
+        "div[role='button']:has-text('發布')",
+        "span:has-text('發布')",
+        "div[aria-label='發佈']",
+        "div[role='button']:has-text('發佈')",
+        "span:has-text('發佈')",
+        "div[aria-label='Publish']",
+        "div[role='button']:has-text('Publish')",
+    ]
+    human_sleep(1, 2)
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0 and el.is_visible():
+                simulate_human_click(page, el)
+                print(f"[marketplace] 已點擊: {sel}", flush=True)
+                return True
+        except Exception:
+            continue
+
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0:
+                el.click(force=True)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _confirm_listing_published(
+    page: Page,
+    fbid: str,
+    title: str,
+    timeout_sec: float = 45.0,
+) -> dict:
+    """發佈後輪詢確認刊登是否成功。
+
+    回傳 dict：
+      item_url / on_more_places / seen_in_selling
+    """
+    deadline = time.time() + timeout_sec
+    title_key = (title or "").strip()[:24]
+    seen_selling = False
+    checked_selling = False
+
+    while time.time() < deadline:
+        # 1) 直接拿到商品 URL
+        url = _extract_item_url(page)
+        if url:
+            return {"item_url": url, "on_more_places": False, "seen_in_selling": False}
+
+        # 2) 「在更多地方上架」= 已建立成功
+        if _on_list_in_more_places_page(page):
+            return {"item_url": None, "on_more_places": True, "seen_in_selling": False}
+
+        # 正文成功提示
+        try:
+            body = page.evaluate("() => (document.body && document.body.innerText) || ''") or ""
+            if re.search(r"已發佈|刊登成功|Your listing is now live|Listing is live", body, re.I):
+                url = _extract_item_url(page)
+                return {"item_url": url, "on_more_places": False, "seen_in_selling": True}
+        except Exception:
+            body = ""
+
+        # 3) 約一半超時後去「你的商品」查標題（等 loading 結束）
+        if not checked_selling and time.time() > deadline - timeout_sec * 0.45:
+            checked_selling = True
+            with contextlib.suppress(Exception):
+                page.goto(
+                    "https://www.facebook.com/marketplace/you/selling",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                human_sleep(2, 3.5)
+
+        if "marketplace/you/selling" in (page.url or ""):
+            # 等骨架屏／loading 消掉
+            for _ in range(8):
+                try:
+                    loading = page.evaluate(r"""() => {
+                      const t = (document.body && document.body.innerText) || '';
+                      return /載入中|Loading/i.test(t) && !/你的商品|Your listings/i.test(t);
+                    }""")
+                except Exception:
+                    loading = False
+                if not loading:
+                    break
+                human_sleep(0.8, 1.4)
+            try:
+                found = page.evaluate(
+                    """(key) => {
+                      if (!key) return false;
+                      const t = (document.body && document.body.innerText) || '';
+                      return t.includes(key);
+                    }""",
+                    title_key,
+                )
+                if found:
+                    seen_selling = True
+                    url = _extract_item_url(page)
+                    print(f"[marketplace] 在「你的商品」找到刊登：{title_key}…", flush=True)
+                    return {
+                        "item_url": url,
+                        "on_more_places": False,
+                        "seen_in_selling": True,
+                    }
+            except Exception:
+                pass
+
+        human_sleep(1.2, 2.0)
+
+    return {
+        "item_url": _extract_item_url(page),
+        "on_more_places": _on_list_in_more_places_page(page),
+        "seen_in_selling": seen_selling,
+    }
+
+
+def _on_list_in_more_places_page(page: Page) -> bool:
+    """判斷是否在發佈後的「在更多地方上架」頁 —— 這代表商品已建立成功（成功訊號）。
+    FB 發佈後常跳到此頁做社團擴散，而非跳到商品頁，導致抓不到 item URL。"""
+    try:
+        return bool(page.evaluate(r"""() => {
+            const body = document.body ? (document.body.innerText || '') : '';
+            // 標題出現「在更多地方上架」+ 預覽出現「上架」時間戳 = 已發佈
+            const hasHeading = /在更多地方上架|List in more places/i.test(body);
+            const hasListed = /上架|已在 Marketplace|Listed|posted/i.test(body);
+            return hasHeading && hasListed;
+        }"""))
+    except Exception:
+        return False
+
+
+def _extract_item_url(page: Page) -> str | None:
+    """從當前頁面 URL 或內容中擷取 Marketplace item URL。"""
+    current_url = page.url
+    if "marketplace/item/" in current_url:
+        return current_url
+
+    # 頁面上的連結
+    links = page.locator("a[href*='marketplace/item/']").all()
+    for link in links:
+        try:
+            href = link.get_attribute("href")
+            if href and "marketplace/item/" in href:
+                return href
+        except Exception:
+            continue
+
+    return None

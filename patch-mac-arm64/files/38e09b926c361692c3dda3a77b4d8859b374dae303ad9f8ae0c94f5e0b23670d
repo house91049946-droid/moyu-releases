@@ -1,0 +1,116 @@
+"""P14：刪除舊貼文改用 PostHistory 選取（超齡 + success + 未刪除 + 有 post_url）。
+
+執行：cd backend && python3 -m pytest tests/test_delete_posts.py -v
+"""
+import datetime
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+@pytest.fixture
+def db(tmp_path, monkeypatch):
+    import app.database as d
+    from sqlalchemy import create_engine
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+    from sqlalchemy.orm import sessionmaker
+
+    url = f"sqlite:///{tmp_path/'d.db'}"
+    aurl = f"sqlite+aiosqlite:///{tmp_path/'d.db'}"
+    d.sync_engine = create_engine(url)
+    d.async_engine = create_async_engine(aurl)
+    d.SyncSession = sessionmaker(d.sync_engine)
+    d.async_session_factory = async_sessionmaker(d.async_engine, class_=AsyncSession, expire_on_commit=False)
+    d.Base.metadata.create_all(d.sync_engine)
+    d._ensure_columns()
+    return d
+
+
+def _select_targets_sync(d, account_id, max_age_days):
+    """複製 delete-old 端點的選取條件（同步版，便於測試）。"""
+    from sqlalchemy import select
+    from app.database import PostHistory
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=max_age_days)
+    with d.SyncSession() as s:
+        rows = s.execute(
+            select(PostHistory.post_url).where(
+                PostHistory.account_id == account_id,
+                PostHistory.status == "success",
+                PostHistory.deleted == False,
+                PostHistory.post_time <= cutoff,
+                PostHistory.post_url != "",
+            )
+        ).all()
+    return [u for (u,) in rows if u]
+
+
+def test_selects_only_old_success_undeleted(db):
+    from app.database import PostHistory, Account
+    now = datetime.datetime.utcnow()
+    with db.SyncSession() as s:
+        s.add(Account(email="a@b.c", fb_user_id="111", status="active"))
+        s.flush()
+        s.add_all([
+            # 應選中：8 天前、success、未刪、有 url
+            PostHistory(account_id=1, status="success", post_url="https://m/groups/1/posts/A",
+                        post_time=now - datetime.timedelta(days=8)),
+            # 太新（1 天前）
+            PostHistory(account_id=1, status="success", post_url="https://m/groups/1/posts/B",
+                        post_time=now - datetime.timedelta(days=1)),
+            # 失敗
+            PostHistory(account_id=1, status="failed", post_url="https://m/groups/1/posts/C",
+                        post_time=now - datetime.timedelta(days=8)),
+            # 已刪除
+            PostHistory(account_id=1, status="success", post_url="https://m/groups/1/posts/D",
+                        deleted=True, post_time=now - datetime.timedelta(days=8)),
+            # 無 post_url
+            PostHistory(account_id=1, status="success", post_url="",
+                        post_time=now - datetime.timedelta(days=8)),
+            # 別的帳號
+            PostHistory(account_id=2, status="success", post_url="https://m/groups/1/posts/E",
+                        post_time=now - datetime.timedelta(days=8)),
+        ])
+        s.commit()
+
+    targets = _select_targets_sync(db, account_id=1, max_age_days=7)
+    assert targets == ["https://m/groups/1/posts/A"]
+
+
+def test_mark_deleted(db):
+    """模擬 jobs.py delete 成功回標 deleted。"""
+    from sqlalchemy import select
+    from app.database import PostHistory, Account
+    now = datetime.datetime.utcnow()
+    with db.SyncSession() as s:
+        s.add(Account(email="a@b.c", fb_user_id="111"))
+        s.flush()
+        s.add_all([
+            PostHistory(account_id=1, status="success", post_url="U1", post_time=now),
+            PostHistory(account_id=1, status="success", post_url="U2", post_time=now),
+        ])
+        s.commit()
+
+    deleted_urls = ["U1"]
+    with db.SyncSession() as s:
+        rows = s.execute(select(PostHistory).where(
+            PostHistory.account_id == 1, PostHistory.post_url.in_(deleted_urls))).scalars().all()
+        for h in rows:
+            h.deleted = True
+        s.commit()
+
+    with db.SyncSession() as s:
+        u1 = s.execute(select(PostHistory).where(PostHistory.post_url == "U1")).scalar_one()
+        u2 = s.execute(select(PostHistory).where(PostHistory.post_url == "U2")).scalar_one()
+        assert u1.deleted is True
+        assert u2.deleted is False
+
+
+def test_deleted_column_migrated(db):
+    """_ensure_columns 應已補上 post_history.deleted。"""
+    from sqlalchemy import text
+    with db.sync_engine.begin() as conn:
+        cols = {r[1] for r in conn.execute(text("PRAGMA table_info(post_history)"))}
+    assert "deleted" in cols

@@ -1,0 +1,140 @@
+"""Marketplace 上架 API"""
+import json
+import os
+import uuid
+import tempfile
+from pathlib import Path
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from pydantic import BaseModel
+
+from ..database import get_session, Account, LegalInfo
+from ..marketplace_content import legal_footer
+from ..config import DATA_DIR
+
+UPLOAD_DIR = DATA_DIR / "uploads"
+
+router = APIRouter(prefix="/api/marketplace", tags=["marketplace"], redirect_slashes=False)
+
+
+class MarketplacePostRequest(BaseModel):
+    account_id: int
+    item_name: str = ""
+    price: int = 0
+    condition: str = "new"
+    location: str = ""
+    description: str = ""
+    image_paths: list[str] = []
+    share_groups: list[str] = []
+    headless: bool = False
+
+
+@router.post("/upload-image")
+async def upload_marketplace_image(file: UploadFile = File(...)):
+    """上傳 Marketplace 商品圖片"""
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    ext = os.path.splitext(file.filename or "image.jpg")[1]
+    filename = f"mp_{uuid.uuid4().hex}{ext}"
+    filepath = UPLOAD_DIR / filename
+
+    content = await file.read()
+    with open(filepath, "wb") as f:
+        f.write(content)
+
+    return {"filename": filename, "path": f"/uploads/{filename}"}
+
+
+@router.post("/post")
+async def post_marketplace_item(data: MarketplacePostRequest, session: AsyncSession = Depends(get_session)):
+    """上架一個 Marketplace 商品，可選轉發到指定社團"""
+
+    # 驗證帳號存在且有 fbid
+    acc_result = await session.execute(select(Account).where(Account.id == data.account_id))
+    acc = acc_result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    if not acc.fb_user_id:
+        raise HTTPException(status_code=422, detail="此帳號尚未綁定 FB ID，請先到帳號設定頁面綁定")
+
+    from ..fbauto_bridge import start_long_op, cookie_exists
+
+    if not cookie_exists(acc.fb_user_id):
+        raise HTTPException(status_code=422, detail=f"cookie 不存在: {acc.fb_user_id}，請先用 CLI 登入")
+
+    # ── 動態產生商品 JSON ──
+    item_name = data.item_name or (data.description or "商品")[:30]
+
+    # 法定區塊（房仲法規強制）。排程上架與社團發文都會附，只有這條手動路徑漏了
+    # ——客戶回報「法定文案沒有 po 上去」就是走到這裡（2026-07-31）。
+    # 已經自己打進去的就不重複附。
+    description = data.description or ""
+    legal_row = (await session.execute(select(LegalInfo))).scalars().first()
+    if legal_row:
+        footer = legal_footer({
+            "footer_text": legal_row.footer_text, "agent_name": legal_row.agent_name,
+            "company": legal_row.company, "license_no": legal_row.license_no,
+            "agent_phone": legal_row.agent_phone, "extra": legal_row.extra,
+        })
+        if footer and footer not in description:
+            description = (description.rstrip() + "\n\n" + footer).strip()
+
+    # 將 uploads 路徑轉為絕對路徑給 CLI
+    absolute_images: list[str] = []
+    for p in data.image_paths:
+        # path like "/uploads/mp_xxx.jpg" → UPLOAD_DIR / mp_xxx.jpg
+        filename = p.rsplit("/", 1)[-1]
+        full = UPLOAD_DIR / filename
+        if full.exists():
+            absolute_images.append(str(full))
+        else:
+            absolute_images.append(str(full))
+
+    # 寫入 shop_article 目錄供 CLI 讀取。
+    # 位置一律問 FB_AUTO_DATA_DIR，不可自己用 parents[3] 湊——安裝版的資料根在
+    # %LOCALAPPDATA%\moyu，寫死相對路徑會落到程式目錄（唯讀／會被更新覆蓋）。
+    from ..fbauto_bridge import FB_AUTO_DATA_DIR
+    shop_dir = FB_AUTO_DATA_DIR / "shop_article"
+    shop_dir.mkdir(parents=True, exist_ok=True)
+
+    product_data = {
+        "content": {
+            "itemType": "product",
+            "item_name": data.item_name or item_name,
+            "item_price": data.price,
+            "condition": data.condition,
+            "item_location": data.location,
+            "word": description,
+        },
+        "images": [os.path.basename(p) for p in absolute_images],
+    }
+
+    # 把圖片也複製到 shop_article_images 目錄
+    images_dir = FB_AUTO_DATA_DIR / "shop_article_images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    for abs_path in absolute_images:
+        src = Path(abs_path)
+        if src.exists():
+            dst = images_dir / src.name
+            if not dst.exists():
+                import shutil
+                shutil.copy2(str(src), str(dst))
+
+    # 用 item_name 產生安全的檔名
+    safe_name = "".join(c for c in item_name if c.isalnum() or c in "_- ")[:40].strip()
+    if not safe_name:
+        safe_name = f"item_{uuid.uuid4().hex[:8]}"
+    json_path = shop_dir / f"{safe_name}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(product_data, f, ensure_ascii=False, indent=2)
+
+    # CLI 用 item 參數 = 文章名稱（不含 .json）；spawn 後回 job_id 供輪詢
+    args = ["--fbid", acc.fb_user_id, "--item", safe_name, "--skip-if-posted"]
+    if data.share_groups:
+        args.extend(["--share-groups", *data.share_groups])
+    if data.headless:
+        args.append("--headless")
+    job_id = start_long_op("marketplace", "src.run_p2", args,
+                           account_id=acc.id, fbid=acc.fb_user_id)
+    return {"job_id": job_id, "state": "pending"}

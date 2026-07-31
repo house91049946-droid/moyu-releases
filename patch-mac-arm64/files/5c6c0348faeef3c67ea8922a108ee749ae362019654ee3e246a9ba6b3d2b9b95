@@ -1,0 +1,134 @@
+"""P12：社團游標輪替、restore_jobs、cycle 觸發器型別。
+
+執行：cd backend && python3 -m pytest tests/test_scheduler.py -v
+"""
+import asyncio
+import datetime
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.date import DateTrigger
+
+from app.scheduler.task_runner import compute_batch, task_scheduler, restore_jobs
+
+
+# ── 游標輪替 ──────────────────────────────────────────
+
+def test_compute_batch_start():
+    assert compute_batch(list(range(12)), 0, 5) == ([0, 1, 2, 3, 4], 5)
+
+
+def test_compute_batch_middle():
+    assert compute_batch(list(range(12)), 5, 5) == ([5, 6, 7, 8, 9], 10)
+
+
+def test_compute_batch_wrap():
+    # 10 起跳只剩 2 個，游標歸零（一輪完成）
+    assert compute_batch(list(range(12)), 10, 5) == ([10, 11], 0)
+
+
+def test_compute_batch_per_run_ge_total():
+    assert compute_batch(list(range(5)), 0, 10) == ([0, 1, 2, 3, 4], 0)
+
+
+def test_compute_batch_exact_divide():
+    groups = list(range(10))
+    b1, c1 = compute_batch(groups, 0, 5)
+    b2, c2 = compute_batch(groups, c1, 5)
+    assert (b1, c1) == ([0, 1, 2, 3, 4], 5)
+    assert (b2, c2) == ([5, 6, 7, 8, 9], 0)  # 整除後歸零
+
+
+def test_compute_batch_empty():
+    assert compute_batch([], 3, 5) == ([], 0)
+
+
+def test_compute_batch_cursor_beyond_len():
+    # cursor 超過長度時取模
+    assert compute_batch(list(range(12)), 17, 5)[0] == [5, 6, 7, 8, 9]
+
+
+# ── add_task 觸發器型別 ───────────────────────────────
+
+class _FakeTask:
+    def __init__(self, **kw):
+        self.id = kw.get("id", 1)
+        self.schedule_type = kw["schedule_type"]
+        self.next_run = kw.get("next_run")
+        self.cycle_hours = kw.get("cycle_hours", 6)
+        self.time_of_day = kw.get("time_of_day", "02:00")
+        self.week_days = kw.get("week_days", [])
+
+
+@pytest.fixture
+def running_scheduler():
+    task_scheduler.start()
+    yield
+    for j in list(task_scheduler._scheduler.get_jobs()):
+        j.remove()
+
+
+def _trigger_of(job_id):
+    return task_scheduler._scheduler.get_job(job_id).trigger
+
+
+def test_cycle_uses_interval_trigger(running_scheduler):
+    task_scheduler.add_task(_FakeTask(id=101, schedule_type="cycle", cycle_hours=1,
+                                      next_run=datetime.datetime.now() + datetime.timedelta(hours=1)))
+    assert isinstance(_trigger_of("task_101"), IntervalTrigger)
+
+
+def test_once_uses_date_trigger(running_scheduler):
+    task_scheduler.add_task(_FakeTask(id=102, schedule_type="once",
+                                      next_run=datetime.datetime.now() + datetime.timedelta(days=1)))
+    assert isinstance(_trigger_of("task_102"), DateTrigger)
+
+
+# ── restore_jobs ─────────────────────────────────────
+
+def test_restore_jobs(running_scheduler, monkeypatch, tmp_path):
+    """以真 async_session_factory（改指向臨時 sqlite）驗證還原邏輯。"""
+    import app.database as db
+    from sqlalchemy import create_engine
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+    url = f"sqlite:///{tmp_path/'t.db'}"
+    aurl = f"sqlite+aiosqlite:///{tmp_path/'t.db'}"
+    db.sync_engine = create_engine(url)
+    db.async_engine = create_async_engine(aurl)
+    db.async_session_factory = async_sessionmaker(db.async_engine, class_=AsyncSession, expire_on_commit=False)
+    import app.scheduler.task_runner as tr
+    monkeypatch.setattr(tr, "async_session_factory", db.async_session_factory)
+    db.Base.metadata.create_all(db.sync_engine)
+    db._ensure_columns()
+
+    now = datetime.datetime.utcnow()
+
+    async def _seed_and_restore():
+        from app.database import PostTask, Account
+        async with db.async_session_factory() as s:
+            s.add(Account(email="a@b.c", fb_user_id="111", status="active"))
+            await s.flush()
+            s.add_all([
+                PostTask(account_id=1, schedule_type="cycle", status="pending",
+                         next_run=now + datetime.timedelta(hours=1), cycle_hours=1),   # 還原
+                PostTask(account_id=1, schedule_type="once", status="pending",
+                         next_run=now - datetime.timedelta(hours=1)),                  # 過期→missed
+                PostTask(account_id=1, schedule_type="once", status="pending",
+                         next_run=now + datetime.timedelta(days=1)),                   # 未來→還原
+                PostTask(account_id=1, schedule_type="immediate", status="running"),   # 不還原
+            ])
+            await s.commit()
+        return await restore_jobs()
+
+    restored = asyncio.get_event_loop().run_until_complete(_seed_and_restore())
+    assert restored == 2  # cycle + 未來 once
+    job_ids = {j.id for j in task_scheduler._scheduler.get_jobs()}
+    assert "task_1" in job_ids and "task_3" in job_ids
+    assert "task_2" not in job_ids  # 過期 once
+    assert "task_4" not in job_ids  # immediate

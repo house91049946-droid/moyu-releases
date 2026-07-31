@@ -1,0 +1,517 @@
+"""P16 物件案件 + 法定欄位 API。"""
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from pydantic import BaseModel
+from typing import Optional
+
+from ..database import (
+    get_session, Property, LegalInfo, Account, MarketplaceSchedule, GroupPreset,
+    get_daily_budget_sync, get_system_state_sync, set_system_pause_sync,
+    problem_property_count_sync,
+    MAX_LISTINGS_PER_DAY, MAX_POSTS_PER_DAY,
+)
+
+router = APIRouter(prefix="/api/marketplace", tags=["marketplace-properties"], redirect_slashes=False)
+
+
+# ─── 法定欄位（全域一份） ───────────────────────────────
+
+class LegalInfoData(BaseModel):
+    footer_text: str = ""
+    agent_name: str = ""
+    company: str = ""
+    license_no: str = ""
+    agent_phone: str = ""
+    extra: str = ""
+
+
+@router.get("/legal")
+async def get_legal(session: AsyncSession = Depends(get_session)):
+    row = (await session.execute(select(LegalInfo))).scalars().first()
+    if not row:
+        return LegalInfoData().model_dump()
+    return {"footer_text": row.footer_text, "agent_name": row.agent_name, "company": row.company,
+            "license_no": row.license_no, "agent_phone": row.agent_phone, "extra": row.extra}
+
+
+@router.put("/legal")
+async def put_legal(data: LegalInfoData, session: AsyncSession = Depends(get_session)):
+    row = (await session.execute(select(LegalInfo))).scalars().first()
+    if not row:
+        row = LegalInfo()
+        session.add(row)
+    for k, v in data.model_dump().items():
+        setattr(row, k, v)
+    await session.commit()
+    return {"message": "已儲存法定欄位"}
+
+
+# ─── Marketplace 類別清單（快取 + 從 FB 偵測） ──────────
+
+_CATEGORY_FALLBACK = ["其他商品", "家庭用品", "傢俱", "電子產品", "服飾", "運動用品", "玩具與遊戲"]
+
+
+@router.get("/categories")
+async def get_categories():
+    """回傳快取的 FB 類別清單（無快取則回退用建議清單）。"""
+    import json
+    from ..fbauto_bridge import FB_AUTO_DATA_DIR
+    p = FB_AUTO_DATA_DIR / "mp_categories.json"
+    try:
+        with open(p, encoding="utf-8") as f:
+            cats = json.load(f)
+        if isinstance(cats, list) and cats:
+            return {"categories": cats, "cached": True}
+    except (OSError, ValueError):
+        pass
+    return {"categories": _CATEGORY_FALLBACK, "cached": False}
+
+
+@router.post("/detect-categories")
+async def detect_categories(account_id: int, session: AsyncSession = Depends(get_session)):
+    """開瀏覽器（headless）抓 FB 建立商品頁的完整類別清單並快取。回 job_id 供輪詢。"""
+    acc = (await session.execute(select(Account).where(Account.id == account_id))).scalar_one_or_none()
+    if not acc or not acc.fb_user_id:
+        raise HTTPException(status_code=422, detail="帳號不存在或尚未綁定 FB ID")
+    from ..fbauto_bridge import start_long_op, cookie_exists
+    if not cookie_exists(acc.fb_user_id):
+        raise HTTPException(status_code=422, detail="cookie 已失效，請重新登入")
+    job_id = start_long_op("categories", "src.run_list_categories",
+                           ["--fbid", acc.fb_user_id, "--headless"],
+                           account_id=account_id, fbid=acc.fb_user_id)
+    return {"job_id": job_id, "state": "pending"}
+
+
+# ─── 社團群組預設 ──────────────────────────────────────
+
+class GroupPresetData(BaseModel):
+    name: str
+    group_names: list[str] = []
+
+
+@router.get("/group-presets")
+async def list_group_presets(session: AsyncSession = Depends(get_session)):
+    rows = (await session.execute(select(GroupPreset).order_by(GroupPreset.created_at.desc()))).scalars().all()
+    return [{"id": g.id, "name": g.name, "group_names": g.group_names, "count": len(g.group_names or [])} for g in rows]
+
+
+@router.post("/group-presets")
+async def create_group_preset(data: GroupPresetData, session: AsyncSession = Depends(get_session)):
+    if not data.name.strip():
+        raise HTTPException(status_code=422, detail="群組名稱不得為空")
+    g = GroupPreset(name=data.name.strip(), group_names=data.group_names)
+    session.add(g)
+    await session.commit()
+    await session.refresh(g)
+    return {"id": g.id, "name": g.name, "count": len(g.group_names or [])}
+
+
+@router.delete("/group-presets/{preset_id}")
+async def delete_group_preset(preset_id: int, session: AsyncSession = Depends(get_session)):
+    g = (await session.execute(select(GroupPreset).where(GroupPreset.id == preset_id))).scalar_one_or_none()
+    if not g:
+        raise HTTPException(status_code=404, detail="群組不存在")
+    await session.delete(g)
+    await session.commit()
+    return {"message": "已刪除群組"}
+
+
+# ─── 物件案件 CRUD ─────────────────────────────────────
+
+class PropertyData(BaseModel):
+    account_id: int
+    name: str = ""
+    category: str = "其他商品"
+    city: str = ""
+    condition: str = "new"
+    price: int = 0
+    base_content: str = ""
+    title_facts: dict = {}
+    titles: list[str] = []
+    bodies: list[str] = []
+    image_pool: list[str] = []
+    cover_ids: list[str] = []
+    qr_image: str = ""
+    target_groups: list[str] = []
+    groups_per_listing: int = 20
+
+
+def _prop_out(p: Property) -> dict:
+    return {
+        "id": p.id, "account_id": p.account_id, "name": p.name, "category": p.category,
+        "city": p.city or "",
+        "condition": p.condition, "price": p.price, "base_content": p.base_content,
+        "title_facts": p.title_facts, "titles": p.titles, "bodies": p.bodies,
+        "image_pool": p.image_pool, "cover_ids": p.cover_ids, "qr_image": p.qr_image,
+        "target_groups": p.target_groups, "groups_per_listing": p.groups_per_listing,
+        "live_listings": p.live_listings, "post_count_total": p.post_count_total,
+        "last_posted_at": p.last_posted_at.isoformat() if p.last_posted_at else None,
+        "health_status": p.health_status or "ok",
+        "success_count": p.success_count or 0, "review_count": p.review_count or 0,
+        "reject_count": p.reject_count or 0, "consecutive_review": p.consecutive_review or 0,
+        "last_status": p.last_status or "",
+        "last_status_at": p.last_status_at.isoformat() if p.last_status_at else None,
+    }
+
+
+@router.get("/properties")
+async def list_properties(session: AsyncSession = Depends(get_session)):
+    rows = (await session.execute(select(Property).order_by(Property.created_at.desc()))).scalars().all()
+    return [_prop_out(p) for p in rows]
+
+
+@router.post("/properties")
+async def create_property(data: PropertyData, session: AsyncSession = Depends(get_session)):
+    acc = (await session.execute(select(Account).where(Account.id == data.account_id))).scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    p = Property(**data.model_dump())
+    session.add(p)
+    await session.commit()
+    await session.refresh(p)
+    return _prop_out(p)
+
+
+@router.get("/properties/{prop_id}")
+async def get_property(prop_id: int, session: AsyncSession = Depends(get_session)):
+    p = (await session.execute(select(Property).where(Property.id == prop_id))).scalar_one_or_none()
+    if not p:
+        raise HTTPException(status_code=404, detail="物件不存在")
+    return _prop_out(p)
+
+
+@router.put("/properties/{prop_id}")
+async def update_property(prop_id: int, data: PropertyData, session: AsyncSession = Depends(get_session)):
+    p = (await session.execute(select(Property).where(Property.id == prop_id))).scalar_one_or_none()
+    if not p:
+        raise HTTPException(status_code=404, detail="物件不存在")
+    for k, v in data.model_dump().items():
+        setattr(p, k, v)
+    await session.commit()
+    await session.refresh(p)
+    return _prop_out(p)
+
+
+@router.post("/properties/{prop_id}/reset-health")
+async def reset_property_health(prop_id: int, session: AsyncSession = Depends(get_session)):
+    """P18：手動重新啟用問題物件（清健康度計數、回 ok）。"""
+    p = (await session.execute(select(Property).where(Property.id == prop_id))).scalar_one_or_none()
+    if not p:
+        raise HTTPException(status_code=404, detail="物件不存在")
+    p.success_count = p.review_count = p.reject_count = p.consecutive_review = 0
+    p.health_status = "ok"
+    p.last_status = ""
+    await session.commit()
+    await session.refresh(p)
+    return _prop_out(p)
+
+
+@router.delete("/properties/{prop_id}")
+async def delete_property(prop_id: int, session: AsyncSession = Depends(get_session)):
+    p = (await session.execute(select(Property).where(Property.id == prop_id))).scalar_one_or_none()
+    if not p:
+        raise HTTPException(status_code=404, detail="物件不存在")
+    await session.delete(p)
+    await session.commit()
+    return {"message": "已刪除物件"}
+
+
+# ─── AI 文案生成（建立/編輯時呼叫，不落庫；前端可改後再存） ──
+
+class GenerateReq(BaseModel):
+    base_content: str
+    n_versions: int = 5
+
+
+@router.post("/generate-copy")
+async def generate_copy(req: GenerateReq):
+    """依基底文案生成 N 個變體版本（各含 title/body，數字/事實鎖定）。"""
+    import asyncio
+    from ..deepseek_client import generate_from_base, has_key, DeepSeekError
+    from ..cloud_client import cloud_enabled
+    if not (cloud_enabled() or has_key()):
+        raise HTTPException(status_code=422, detail="尚未設定雲端授權或 DeepSeek 金鑰")
+    try:
+        versions = await asyncio.to_thread(generate_from_base, req.base_content, req.n_versions)
+        return {"versions": versions}
+    except DeepSeekError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+# ─── 排程 CRUD + 啟動/暫停 ─────────────────────────────
+
+class ScheduleData(BaseModel):
+    account_id: int
+    property_ids: list[int] = []
+    time_mode: str = "points"          # points / window
+    time_points: list[str] = []
+    window_start: str = "09:00"
+    window_end: str = "21:00"
+    daily_count: int = 3
+    daily_count_min: int = 0
+    daily_count_max: int = 0
+    random_delay: bool = True
+    batch_min_sec: int = 45
+    batch_max_sec: int = 120
+    cooldown_min_sec: int = 300
+    cooldown_max_sec: int = 600
+    headless: bool = True
+    dry_run: bool = False
+    auto_delete_days: int = 7          # N 天後自動刪除 Marketplace 刊登（0=關閉）
+
+
+def _sch_out(s: MarketplaceSchedule) -> dict:
+    return {
+        "id": s.id, "account_id": s.account_id, "property_ids": s.property_ids,
+        "time_mode": s.time_mode, "time_points": s.time_points,
+        "window_start": s.window_start, "window_end": s.window_end,
+        "daily_count": s.daily_count, "daily_count_min": s.daily_count_min,
+        "daily_count_max": s.daily_count_max, "random_delay": s.random_delay,
+        "batch_min_sec": s.batch_min_sec, "batch_max_sec": s.batch_max_sec,
+        "cooldown_min_sec": s.cooldown_min_sec, "cooldown_max_sec": s.cooldown_max_sec,
+        "headless": s.headless, "dry_run": s.dry_run,
+        "auto_delete_days": s.auto_delete_days if s.auto_delete_days is not None else 7,
+        "status": s.status,
+        "next_run": s.next_run.isoformat() if s.next_run else None,
+    }
+
+
+@router.get("/schedules")
+async def list_schedules(session: AsyncSession = Depends(get_session)):
+    rows = (await session.execute(select(MarketplaceSchedule))).scalars().all()
+    return [_sch_out(s) for s in rows]
+
+
+@router.post("/schedules")
+async def create_schedule(data: ScheduleData, session: AsyncSession = Depends(get_session)):
+    s = MarketplaceSchedule(**data.model_dump(), status="stopped")
+    session.add(s)
+    await session.commit()
+    await session.refresh(s)
+    return _sch_out(s)
+
+
+@router.put("/schedules/{sch_id}")
+async def update_schedule(sch_id: int, data: ScheduleData, session: AsyncSession = Depends(get_session)):
+    s = (await session.execute(select(MarketplaceSchedule).where(MarketplaceSchedule.id == sch_id))).scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="排程不存在")
+    for k, v in data.model_dump().items():
+        setattr(s, k, v)
+    await session.commit()
+    return _sch_out(s)
+
+
+@router.put("/schedules/{sch_id}/start")
+async def start_schedule(sch_id: int, session: AsyncSession = Depends(get_session)):
+    s = (await session.execute(select(MarketplaceSchedule).where(MarketplaceSchedule.id == sch_id))).scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="排程不存在")
+    if not s.property_ids:
+        raise HTTPException(status_code=422, detail="排程未綁定任何物件")
+    s.status = "running"
+    await session.commit()
+    from ..scheduler.marketplace_runner import plan_and_schedule
+    added, times = plan_and_schedule(s)
+    return {"message": "排程已啟動", "today_planned": added,
+            "times": [t.strftime("%H:%M") for t in times]}
+
+
+@router.put("/schedules/{sch_id}/pause")
+async def pause_schedule(sch_id: int, session: AsyncSession = Depends(get_session)):
+    s = (await session.execute(select(MarketplaceSchedule).where(MarketplaceSchedule.id == sch_id))).scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="排程不存在")
+    s.status = "stopped"
+    await session.commit()
+    from ..scheduler.marketplace_runner import remove_schedule_jobs
+    remove_schedule_jobs(sch_id)
+    return {"message": "排程已停止"}
+
+
+@router.post("/schedules/{sch_id}/test-run")
+async def test_run_schedule(sch_id: int, session: AsyncSession = Depends(get_session)):
+    """立即測試跑一次（不等排程時間；尊重 dry_run 設定與預算/暫停）。"""
+    s = (await session.execute(select(MarketplaceSchedule).where(MarketplaceSchedule.id == sch_id))).scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="排程不存在")
+    if not s.property_ids:
+        raise HTTPException(status_code=422, detail="排程未綁定任何物件")
+    import asyncio
+    from ..scheduler.marketplace_runner import run_marketplace_job
+    asyncio.create_task(run_marketplace_job(sch_id, force=True))
+    return {"message": f"已觸發測試執行（dry_run={s.dry_run}）；結果請看執行紀錄"}
+
+
+@router.post("/schedules/{sch_id}/cleanup")
+async def cleanup_schedule(sch_id: int, dry_run: bool = True, days: int | None = None,
+                           session: AsyncSession = Depends(get_session)):
+    """立即執行過期刊登清理（P17）。預設 dry_run=True 只掃描列出候選、不實刪。
+    days 可覆寫天數門檻：傳 0 = 不看天數、視所有現有刊登為候選（供「建立→立即刪除」測試）。
+    第一次務必用 dry_run 確認候選與刪除連帶下架行為，再真刪。"""
+    s = (await session.execute(select(MarketplaceSchedule).where(MarketplaceSchedule.id == sch_id))).scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="排程不存在")
+    effective_days = s.auto_delete_days if days is None else days
+    if days is None and (s.auto_delete_days or 0) <= 0:
+        raise HTTPException(status_code=422, detail="此排程未開啟自動刪除（auto_delete_days=0）；測試可傳 days 覆寫")
+    if effective_days is None or effective_days < 0:
+        raise HTTPException(status_code=422, detail="days 需 >= 0")
+    import asyncio
+    from ..scheduler.marketplace_runner import run_marketplace_cleanup_job
+    asyncio.create_task(run_marketplace_cleanup_job(sch_id, force=True, dry_run_override=dry_run,
+                                                    days_override=effective_days))
+    mode = "掃描（dry-run）" if dry_run else "實際刪除"
+    scope = "全部現有刊登（不看天數）" if effective_days == 0 else f"門檻 {effective_days} 天"
+    return {"message": f"已觸發過期清理｜{mode}｜{scope}；結果請看執行紀錄"}
+
+
+class CleanupListingsReq(BaseModel):
+    account_id: int
+    days: int = 7          # 0 = 不看天數、刪全部現有刊登
+    dry_run: bool = True
+    headless: bool = True
+
+
+@router.post("/cleanup-listings")
+async def cleanup_listings(data: CleanupListingsReq, session: AsyncSession = Depends(get_session)):
+    """獨立的 Marketplace 刊登清理（以帳號為單位，不需發文排程；供系統維護頁使用）。
+    回傳 job_id 供輪詢；dry_run=True 只掃描列出候選，days=0 = 不看天數刪全部。"""
+    acc = (await session.execute(select(Account).where(Account.id == data.account_id))).scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    if not acc.fb_user_id:
+        raise HTTPException(status_code=422, detail="此帳號尚未綁定 FB ID")
+    if data.days < 0:
+        raise HTTPException(status_code=422, detail="days 需 >= 0")
+    from ..fbauto_bridge import start_long_op, cookie_exists
+    if not cookie_exists(acc.fb_user_id):
+        raise HTTPException(status_code=422, detail=f"cookie 不存在: {acc.fb_user_id}，請先用 CLI 登入")
+    args = ["--fbid", acc.fb_user_id, "--max-age-days", str(data.days)]
+    if data.dry_run:
+        args.append("--dry-run")
+    if data.headless:
+        args.append("--headless")
+    job_id = start_long_op("mp_cleanup", "src.run_delete_marketplace", args,
+                           account_id=acc.id, fbid=acc.fb_user_id)
+    return {"job_id": job_id, "state": "pending"}
+
+
+@router.get("/calendar")
+async def marketplace_calendar(year: Optional[int] = None, month: Optional[int] = None,
+                               session: AsyncSession = Depends(get_session)):
+    """月成功率行事曆：以台北日期彙總該月 Marketplace 發文成功/失敗數，供方塊行事曆用。"""
+    import datetime as _dt
+    import calendar as _cal
+    from ..database import RunLog, TAIPEI
+
+    now = _dt.datetime.now(TAIPEI)
+    y = year or now.year
+    m = month or now.month
+    # created_at 存 UTC；台北 = UTC+8。查詢範圍抓寬一天避免邊界漏。
+    start_utc = _dt.datetime(y, m, 1) - _dt.timedelta(hours=8, days=1)
+    last_day = _cal.monthrange(y, m)[1]
+    end_utc = _dt.datetime(y, m, last_day, 23, 59, 59) - _dt.timedelta(hours=8) + _dt.timedelta(days=1)
+
+    rows = (await session.execute(
+        select(RunLog).where(
+            RunLog.task_type == "marketplace",
+            RunLog.created_at >= start_utc,
+            RunLog.created_at <= end_utc,
+        )
+    )).scalars().all()
+
+    days: dict[str, dict] = {}
+    tot_s = tot_f = 0
+    for r in rows:
+        taipei_dt = (r.created_at or now.replace(tzinfo=None)) + _dt.timedelta(hours=8)
+        if taipei_dt.year != y or taipei_dt.month != m:
+            continue
+        key = taipei_dt.date().isoformat()
+        d = days.setdefault(key, {"success": 0, "failed": 0})
+        if r.status == "success":
+            d["success"] += 1; tot_s += 1
+        elif r.status in ("failed", "needs_manual"):
+            d["failed"] += 1; tot_f += 1
+    total = tot_s + tot_f
+
+    # 月總則（含刊登+轉發）與月刊登件數：從每日額度彙總（date 為台北 YYYY-MM-DD）
+    from ..database import DailyBudget
+    prefix = f"{y}-{m:02d}"
+    bud_rows = (await session.execute(
+        select(DailyBudget).where(DailyBudget.date.like(f"{prefix}%"))
+    )).scalars().all()
+    month_posts = sum(b.posts_used or 0 for b in bud_rows)
+    month_listings = sum(b.listings_used or 0 for b in bud_rows)
+
+    return {
+        "year": y, "month": m, "days_in_month": last_day,
+        "first_weekday": _dt.date(y, m, 1).weekday(),   # 0=週一
+        "summary": {"success": tot_s, "failed": tot_f, "total": total,
+                    "success_rate": round(tot_s / total, 3) if total else None,
+                    "posts": month_posts, "listings": month_listings},
+        "days": days,
+    }
+
+
+@router.delete("/schedules/{sch_id}")
+async def delete_schedule(sch_id: int, session: AsyncSession = Depends(get_session)):
+    s = (await session.execute(select(MarketplaceSchedule).where(MarketplaceSchedule.id == sch_id))).scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="排程不存在")
+    from ..scheduler.marketplace_runner import remove_schedule_jobs
+    remove_schedule_jobs(sch_id)
+    await session.delete(s)
+    await session.commit()
+    return {"message": "已刪除排程"}
+
+
+# ─── 首頁狀態（每日預算 + 全域暫停） ────────────────────
+
+@router.get("/status")
+async def marketplace_status(session: AsyncSession = Depends(get_session)):
+    from ..database import ramp_state_sync
+    lu, pu = get_daily_budget_sync()
+    ramp = ramp_state_sync()
+    lm, pm = ramp["listings_max"], ramp["posts_max"]
+    st = get_system_state_sync()
+    schedules = (await session.execute(select(MarketplaceSchedule))).scalars().all()
+    return {
+        "budget": {"listings_used": lu, "listings_max": lm,
+                   "posts_used": pu, "posts_max": pm},
+        "ramp": ramp,
+        "paused": st["paused"], "pause_reason": st["pause_reason"], "pause_detail": st["pause_detail"],
+        "schedules_running": sum(1 for s in schedules if s.status == "running"),
+        "schedules_total": len(schedules),
+        "problem_properties": problem_property_count_sync(),
+    }
+
+
+@router.post("/stop-all")
+async def stop_all(session: AsyncSession = Depends(get_session)):
+    """緊急停止：暫停整個系統 + 移除所有 marketplace 排程 + 中止進行中的發送。"""
+    set_system_pause_sync(True, "manual", "使用者手動緊急停止")
+    from ..scheduler.marketplace_runner import _pause_all_marketplace
+    from ..fbauto_bridge import _RUNNING, kill_job
+    _pause_all_marketplace()
+    for key in list(_RUNNING.keys()):
+        kill_job(key)
+    # 排程狀態設回 stopped
+    rows = (await session.execute(select(MarketplaceSchedule))).scalars().all()
+    for s in rows:
+        if s.status == "running":
+            s.status = "stopped"
+    await session.commit()
+    return {"message": "已緊急停止全部"}
+
+
+@router.post("/resume")
+async def resume_system(session: AsyncSession = Depends(get_session)):
+    """使用者處理完 cookie/保護問題後，解除全域暫停並重排 running 排程。"""
+    set_system_pause_sync(False)
+    from ..scheduler.marketplace_runner import plan_and_schedule
+    rows = (await session.execute(select(MarketplaceSchedule).where(MarketplaceSchedule.status == "running"))).scalars().all()
+    for s in rows:
+        plan_and_schedule(s)
+    return {"message": "已恢復"}

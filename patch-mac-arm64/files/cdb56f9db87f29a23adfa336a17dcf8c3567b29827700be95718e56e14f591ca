@@ -1,0 +1,392 @@
+"""補丁更新的下載端（SPEC-P23 §4 步驟 2）。
+
+重點在「不可信的 manifest」：它來自網路，決定要覆蓋哪些會被執行的檔案。
+所以雜湊不符、路徑逃逸、超出輕層一律要擋下來，而且擋下來之後不能留半套
+staging——留著會在下次啟動被 apply 套成混版。
+
+執行：cd backend && python3 -m pytest tests/test_update_downloader.py -v
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import httpx
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import app.update_downloader as ud
+from app.updater import PENDING_NAME
+
+MANIFEST_URL = "https://example.com/patch-win64/manifest.json"
+FILES_BASE = "https://example.com/patch-win64/files"
+
+
+def sha(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    """假的包根 + 假的資料目錄，完全不碰真實環境。"""
+    base = tmp_path / "pkg"
+    (base / "backend/app").mkdir(parents=True)
+    (base / "backend/app/old.py").write_bytes(b"print('old')\n")
+    local = {
+        "version": "1.0.4",
+        "platform": "win64",
+        "min_runtime": "3.12.11",
+        "deps_hash": "deps-A",
+        "files": [{"path": "backend/app/old.py", "sha256": sha(b"print('old')\n"), "size": 13}],
+    }
+    (base / "manifest.json").write_text(json.dumps(local), encoding="utf-8")
+
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setattr(ud, "DATA_DIR", data)
+    monkeypatch.setattr(ud, "STAGING", data / ".update_staging")
+    monkeypatch.setattr(ud, "STATE_FILE", data / ".update_download.json")
+    monkeypatch.setattr(ud, "package_root", lambda: base)
+    monkeypatch.setattr(ud, "_endpoints", lambda _p: (MANIFEST_URL, FILES_BASE))
+    return base
+
+
+def serve(monkeypatch, remote: dict, blobs: dict[str, bytes], status: int = 200,
+          sign_with=None, sig_override=None):
+    """把 httpx 換成 MockTransport：remote manifest + 內容定址的檔案倉庫。
+
+    sign_with 給私鑰就順便供應 manifest.json.sig（簽的是實際回傳的位元組）。
+    """
+    body = json.dumps(remote).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == MANIFEST_URL:
+            return httpx.Response(200, content=body,
+                                  headers={"content-type": "application/json"})
+        if url == MANIFEST_URL + ".sig":
+            if sig_override is not None:
+                return httpx.Response(200, content=sig_override.encode())
+            if sign_with is None:
+                return httpx.Response(404)
+            import base64
+            return httpx.Response(200, content=base64.b64encode(sign_with.sign(body)))
+        digest = url.rsplit("/", 1)[-1]
+        if digest in blobs:
+            return httpx.Response(status, content=blobs[digest])
+        return httpx.Response(404)
+
+    monkeypatch.setattr(ud, "_client",
+                        lambda _t: httpx.Client(transport=httpx.MockTransport(handler)))
+
+
+def remote_manifest(files, version="1.0.5", **over):
+    m = {"version": version, "platform": "win64", "min_runtime": "3.12.11",
+         "deps_hash": "deps-A", "files": files}
+    m.update(over)
+    return m
+
+
+def test_patch_staged(env, monkeypatch):
+    """正常情況：只抓變動的檔案，驗過雜湊，寫出待套用清單。"""
+    new = b"print('new')\n"
+    add = b"print('added')\n"
+    files = [
+        {"path": "backend/app/old.py", "sha256": sha(new), "size": len(new)},
+        {"path": "backend/app/added.py", "sha256": sha(add), "size": len(add)},
+    ]
+    serve(monkeypatch, remote_manifest(files), {sha(new): new, sha(add): add})
+
+    r = ud.check_and_stage()
+
+    assert r["status"] == "staged", r
+    assert r["version"] == "1.0.5"
+    assert (ud.STAGING / "backend/app/old.py").read_bytes() == new
+    assert (ud.STAGING / "backend/app/added.py").read_bytes() == add
+    pending = json.loads((ud.STAGING / PENDING_NAME).read_text(encoding="utf-8"))
+    assert pending["version"] == "1.0.5"
+    assert {f["path"] for f in pending["files"]} == {"backend/app/old.py", "backend/app/added.py"}
+    # 本機檔案在這個階段絕不能被動到——換檔是下次啟動才做的事
+    assert (env / "backend/app/old.py").read_bytes() == b"print('old')\n"
+
+
+def test_unchanged_file_not_downloaded(env, monkeypatch):
+    """雜湊相同的檔案不重抓（補丁的意義就在這）。"""
+    same = b"print('old')\n"
+    new = b"print('new')\n"
+    files = [
+        {"path": "backend/app/old.py", "sha256": sha(same), "size": len(same)},
+        {"path": "backend/app/x.py", "sha256": sha(new), "size": len(new)},
+    ]
+    # 只提供 x.py 的內容；若它去抓 old.py 就會 404 而失敗
+    serve(monkeypatch, remote_manifest(files), {sha(new): new})
+
+    r = ud.check_and_stage()
+
+    assert r["status"] == "staged"
+    assert r["files"] == 1
+    assert not (ud.STAGING / "backend/app/old.py").exists()
+
+
+def test_tampered_content_rejected(env, monkeypatch):
+    """伺服器給的內容與 manifest 的雜湊不符 → 整批放棄，不留 staging。"""
+    new = b"print('new')\n"
+    files = [{"path": "backend/app/old.py", "sha256": sha(new), "size": len(new)}]
+    serve(monkeypatch, remote_manifest(files), {sha(new): b"print('evil')\n"})
+
+    r = ud.check_and_stage()
+
+    assert r["status"] == "error"
+    assert "雜湊不符" in r["reason"]
+    assert not ud.STAGING.exists()
+
+
+def test_path_traversal_rejected(env, monkeypatch):
+    """manifest 想寫到輕層外面（../ 或 python/）→ 擋下，不留 staging。"""
+    evil = b"pwned"
+    for bad in ("../../evil.py", "python/python.exe", "/etc/passwd"):
+        files = [{"path": bad, "sha256": sha(evil), "size": len(evil)}]
+        serve(monkeypatch, remote_manifest(files), {sha(evil): evil})
+
+        r = ud.check_and_stage()
+
+        assert r["status"] == "error", bad
+        assert not ud.STAGING.exists(), bad
+        assert not (env.parent / "evil.py").exists()
+
+
+def test_bad_sha_in_manifest_rejected(env, monkeypatch):
+    """manifest 的 sha256 欄位不是 64 位十六進位 → 連抓都不抓。"""
+    files = [{"path": "backend/app/old.py", "sha256": "../../etc/passwd", "size": 5}]
+    serve(monkeypatch, remote_manifest(files), {})
+
+    r = ud.check_and_stage()
+
+    assert r["status"] == "error"
+    assert "sha256 不合法" in r["reason"]
+
+
+def test_deps_change_forces_full(env, monkeypatch):
+    """依賴變動（site-packages 在重層）→ 走整包，不做增量（§6）。"""
+    new = b"print('new')\n"
+    files = [{"path": "backend/app/old.py", "sha256": sha(new), "size": len(new)}]
+    serve(monkeypatch, remote_manifest(files, deps_hash="deps-B"), {sha(new): new})
+
+    r = ud.check_and_stage()
+
+    assert r["status"] == "full"
+    assert not ud.STAGING.exists()
+
+
+def test_oversized_patch_forces_full(env, monkeypatch):
+    """算出來的體積大得離譜 → 當成不對勁，退回整包（保險絲）。"""
+    new = b"print('new')\n"
+    files = [{"path": "backend/app/old.py", "sha256": sha(new),
+              "size": ud.MAX_PATCH_BYTES + 1}]
+    serve(monkeypatch, remote_manifest(files), {sha(new): new})
+
+    r = ud.check_and_stage()
+
+    assert r["status"] == "full"
+    assert "整包下載" in r["reason"]
+
+
+def test_same_version_not_restaged(env, monkeypatch):
+    """已排好隊的版本不重抓（背景每 6 小時查一次，不能每次都重下載）。"""
+    new = b"print('new')\n"
+    files = [{"path": "backend/app/old.py", "sha256": sha(new), "size": len(new)}]
+    serve(monkeypatch, remote_manifest(files), {sha(new): new})
+    assert ud.check_and_stage()["status"] == "staged"
+    mtime = (ud.STAGING / "backend/app/old.py").stat().st_mtime_ns
+
+    serve(monkeypatch, remote_manifest(files), {})      # 這次不提供檔案內容
+    r = ud.check_and_stage()
+
+    assert r["status"] == "staged"
+    assert (ud.STAGING / "backend/app/old.py").stat().st_mtime_ns == mtime
+
+
+def test_up_to_date(env, monkeypatch):
+    """雲端版本沒比較新 → 什麼都不做。"""
+    serve(monkeypatch, remote_manifest([], version="1.0.4"), {})
+    assert ud.check_and_stage()["status"] == "none"
+
+
+def test_disabled_without_endpoints(env, monkeypatch):
+    """後台沒設網址（或不是 https）→ 靜默停用，不是錯誤。"""
+    monkeypatch.setattr(ud, "_endpoints", lambda _p: ("", ""))
+    assert ud.check_and_stage()["status"] == "disabled"
+
+
+def test_downloaded_patch_is_appliable(env, monkeypatch, tmp_path):
+    """下載端與套用端要真的接得上：staging 排好隊 → apply_staged 換檔成功。
+
+    這兩半分別寫在不同時間、跑在不同進程（服務中 vs 啟動前），最容易出現的
+    問題就是 pending_update.json 的欄位對不上而整條鏈默默不動。
+    """
+    from app.updater import apply_staged
+
+    new = b"print('new')\n"
+    add = b"print('added')\n"
+    files = [
+        {"path": "backend/app/old.py", "sha256": sha(new), "size": len(new)},
+        {"path": "backend/app/added.py", "sha256": sha(add), "size": len(add)},
+    ]
+    serve(monkeypatch, remote_manifest(files), {sha(new): new, sha(add): add})
+    assert ud.check_and_stage()["status"] == "staged"
+
+    r = apply_staged(env, ud.STAGING, tmp_path / "backup")
+
+    assert r["ok"] and r["error"] is None, r
+    assert r["applied"] == 2
+    assert (env / "backend/app/old.py").read_bytes() == new
+    assert (env / "backend/app/added.py").read_bytes() == add
+    assert r["version"] == "1.0.5"
+
+
+def test_local_manifest_advances_after_apply(env, monkeypatch, tmp_path):
+    """套用完本機 manifest 要跟著前進，否則會無限重抓重套同一包。
+
+    這是 mac 實機驗收才發現的：補丁只換輕層檔案，而 manifest.json 列的是輕層、
+    自己不在清單裡，所以不會被換到——客戶端就永遠認為自己還是舊版。
+    """
+    from app.updater import apply_staged
+
+    new = b"print('new')\n"
+    files = [{"path": "backend/app/old.py", "sha256": sha(new), "size": len(new)}]
+    serve(monkeypatch, remote_manifest(files), {sha(new): new})
+    assert ud.check_and_stage()["status"] == "staged"
+    assert apply_staged(env, ud.STAGING, tmp_path / "backup")["ok"]
+
+    assert json.loads((env / "manifest.json").read_text())["version"] == "1.0.5"
+
+    # 再查一次：這回應該是「已是最新」，不能又排一次隊
+    import shutil as _sh
+    _sh.rmtree(ud.STAGING, ignore_errors=True)
+    serve(monkeypatch, remote_manifest(files), {sha(new): new})
+    assert ud.check_and_stage()["status"] == "none"
+
+
+def test_rollback_restores_manifest_too(env, monkeypatch, tmp_path):
+    """回滾後本機版本也要退回去，否則會以為自己是新版而不再更新。"""
+    from app.updater import apply_staged, rollback
+
+    new = b"print('new')\n"
+    files = [{"path": "backend/app/old.py", "sha256": sha(new), "size": len(new)}]
+    serve(monkeypatch, remote_manifest(files), {sha(new): new})
+    ud.check_and_stage()
+    backup = tmp_path / "backup"
+    apply_staged(env, ud.STAGING, backup)
+
+    r = rollback(env, backup)
+
+    assert r["ok"], r
+    assert json.loads((env / "manifest.json").read_text())["version"] == "1.0.4"
+    assert (env / "backend/app/old.py").read_bytes() == b"print('old')\n"
+
+
+def test_removed_files_flow_through(env, monkeypatch, tmp_path):
+    """新版刪掉的檔案要一路帶到 apply（不然舊模組留著會被 import 到）。"""
+    from app.updater import apply_staged
+
+    keep = b"print('keep')\n"
+    serve(monkeypatch, remote_manifest(
+        [{"path": "backend/app/keep.py", "sha256": sha(keep), "size": len(keep)}]),
+        {sha(keep): keep})
+    assert ud.check_and_stage()["status"] == "staged"
+    pending = json.loads((ud.STAGING / PENDING_NAME).read_text(encoding="utf-8"))
+    assert pending["remove"] == ["backend/app/old.py"]
+
+    r = apply_staged(env, ud.STAGING, tmp_path / "backup")
+
+    assert r["ok"] and r["removed"] == 1, r
+    assert not (env / "backend/app/old.py").exists()
+
+
+# ── 簽章（SPEC-P23 §7）──────────────────────────────────
+#
+# 這裡防的不是「檔案傳壞了」（SHA256 已經涵蓋），而是「manifest 整份是假的」：
+# 倉庫被入侵或後台網址被換掉時，攻擊者可以連 manifest 帶檔案一起改，雜湊全對。
+
+@pytest.fixture
+def signed(monkeypatch):
+    """啟用簽章，回傳廠商私鑰。"""
+    import base64
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    import app.update_signing as us
+
+    key = Ed25519PrivateKey.generate()
+    raw = key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    monkeypatch.setattr(us, "PUBLIC_KEY_B64", base64.b64encode(raw).decode())
+    return key
+
+
+def test_valid_signature_accepted(env, monkeypatch, signed):
+    new = b"print('new')\n"
+    files = [{"path": "backend/app/old.py", "sha256": sha(new), "size": len(new)}]
+    serve(monkeypatch, remote_manifest(files), {sha(new): new}, sign_with=signed)
+
+    assert ud.check_and_stage()["status"] == "staged"
+
+
+def test_forged_manifest_rejected(env, monkeypatch, signed):
+    """攻擊者換掉 manifest 並附上自己算好的雜湊 → 沒有廠商私鑰就簽不出來。"""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    evil = b"import os; os.system('rm -rf /')\n"
+    files = [{"path": "backend/app/old.py", "sha256": sha(evil), "size": len(evil)}]
+    # 用「別人的」私鑰簽——雜湊完全自洽，只有簽章對不上
+    serve(monkeypatch, remote_manifest(files), {sha(evil): evil},
+          sign_with=Ed25519PrivateKey.generate())
+
+    r = ud.check_and_stage()
+
+    assert r["status"] == "error"
+    assert "簽章驗證失敗" in r["reason"]
+    assert not ud.STAGING.exists()
+    assert (env / "backend/app/old.py").read_bytes() == b"print('old')\n"
+
+
+def test_missing_signature_rejected(env, monkeypatch, signed):
+    """啟用簽章後，沒有 .sig 就不能更新（否則把簽章拿掉即可繞過）。"""
+    new = b"print('new')\n"
+    files = [{"path": "backend/app/old.py", "sha256": sha(new), "size": len(new)}]
+    serve(monkeypatch, remote_manifest(files), {sha(new): new})   # 不供應 .sig
+
+    r = ud.check_and_stage()
+
+    assert r["status"] == "error"
+    assert not ud.STAGING.exists()
+
+
+def test_garbage_signature_rejected(env, monkeypatch, signed):
+    new = b"print('new')\n"
+    files = [{"path": "backend/app/old.py", "sha256": sha(new), "size": len(new)}]
+    serve(monkeypatch, remote_manifest(files), {sha(new): new},
+          sig_override="這不是簽章")
+
+    assert ud.check_and_stage()["status"] == "error"
+
+
+def test_signature_ignored_when_disabled(env, monkeypatch):
+    """還沒內建公鑰的客戶端照舊運作（導入簽章不能讓舊流程停擺）。"""
+    new = b"print('new')\n"
+    files = [{"path": "backend/app/old.py", "sha256": sha(new), "size": len(new)}]
+    serve(monkeypatch, remote_manifest(files), {sha(new): new})
+
+    assert ud.check_and_stage()["status"] == "staged"
+
+
+def test_manifest_fetch_failure_is_error(env, monkeypatch):
+    """雲端掛了 → 記一筆錯誤就好，現行版本完全不受影響。"""
+    def handler(_request):
+        raise httpx.ConnectError("no network")
+    monkeypatch.setattr(ud, "_client",
+                        lambda _t: httpx.Client(transport=httpx.MockTransport(handler)))
+
+    r = ud.check_and_stage()
+
+    assert r["status"] == "error"
+    assert not ud.STAGING.exists()

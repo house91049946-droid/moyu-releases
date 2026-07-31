@@ -1,0 +1,500 @@
+"""社團發文 API（與 Marketplace 完全分開；只共用帳號／社團資料）。"""
+from __future__ import annotations
+
+import os
+import uuid
+from datetime import datetime
+from typing import Optional
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from pydantic import BaseModel
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..config import DATA_DIR
+from ..database import (
+    Account,
+    GpGroupPreset,
+    GpListing,
+    GpSchedule,
+    RunLog,
+    get_session,
+    get_system_state_sync,
+    set_system_pause_sync,
+)
+
+router = APIRouter(prefix="/api/group-post", tags=["group-post"], redirect_slashes=False)
+UPLOAD_DIR = DATA_DIR / "uploads" / "group_post"
+
+
+# ── helpers ──────────────────────────────────────────
+
+def _listing_out(row: GpListing) -> dict:
+    return {
+        "id": row.id,
+        "account_id": row.account_id,
+        "name": row.name,
+        "base_content": row.base_content or "",
+        "titles": row.titles or [],
+        "bodies": row.bodies or [],
+        "image_pool": row.image_pool or [],
+        "target_groups": row.target_groups or [],
+        "sleep_min_sec": row.sleep_min_sec,
+        "sleep_max_sec": row.sleep_max_sec,
+        "success_count": row.success_count or 0,
+        "review_count": row.review_count or 0,
+        "reject_count": row.reject_count or 0,
+        "consecutive_review": row.consecutive_review or 0,
+        "health_status": row.health_status or "ok",
+        "last_status": row.last_status or "",
+        "last_status_at": row.last_status_at.isoformat() if row.last_status_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def _sch_out(s: GpSchedule) -> dict:
+    return {
+        "id": s.id,
+        "account_id": s.account_id,
+        "listing_ids": s.listing_ids or [],
+        "time_mode": s.time_mode,
+        "time_points": s.time_points or [],
+        "window_start": s.window_start,
+        "window_end": s.window_end,
+        "daily_count": s.daily_count,
+        "daily_count_min": s.daily_count_min or 0,
+        "daily_count_max": s.daily_count_max or 0,
+        "random_delay": bool(s.random_delay),
+        "cooldown_min_sec": s.cooldown_min_sec,
+        "cooldown_max_sec": s.cooldown_max_sec,
+        "headless": bool(s.headless),
+        "dry_run": bool(s.dry_run),
+        "auto_delete_days": s.auto_delete_days or 0,
+        "groups_per_run": s.groups_per_run or 0,
+        "status": s.status,
+        "next_run": s.next_run.isoformat() if s.next_run else None,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+    }
+
+
+# ── status / dashboard ───────────────────────────────
+
+@router.get("/status")
+async def gp_status(session: AsyncSession = Depends(get_session)):
+    st = get_system_state_sync()
+    listings = (await session.execute(select(func.count(GpListing.id)))).scalar() or 0
+    running = (await session.execute(
+        select(func.count(GpSchedule.id)).where(GpSchedule.status == "running")
+    )).scalar() or 0
+    # 社團發文只寫 RunLog(task_type=group_post)，不寫 PostHistory
+    today = datetime.utcnow().date()
+    today_posts = (await session.execute(
+        select(func.count(RunLog.id)).where(
+            RunLog.task_type == "group_post",
+            func.date(RunLog.created_at) == today,
+            RunLog.status.in_(("success", "needs_manual")),
+        )
+    )).scalar() or 0
+    return {
+        "paused": st.get("paused", False),
+        "pause_reason": st.get("pause_reason", ""),
+        "pause_detail": st.get("pause_detail", ""),
+        "listings": listings,
+        "running_schedules": running,
+        "today_posts": today_posts,
+    }
+
+
+@router.post("/resume")
+async def gp_resume():
+    set_system_pause_sync(False)
+    return {"message": "已恢復"}
+
+
+@router.post("/stop-all")
+async def gp_stop_all(session: AsyncSession = Depends(get_session)):
+    set_system_pause_sync(True, reason="manual", detail="社團發文緊急停止")
+    rows = (await session.execute(select(GpSchedule).where(GpSchedule.status == "running"))).scalars().all()
+    from ..scheduler.group_post_runner import remove_schedule_jobs
+    for s in rows:
+        s.status = "stopped"
+        remove_schedule_jobs(s.id)
+    # 中止進行中的社團發文子進程（連同瀏覽器）——比照 marketplace stop-all
+    from ..fbauto_bridge import _RUNNING, kill_job
+    for key in list(_RUNNING.keys()):
+        if key.startswith("gp_"):
+            kill_job(key)
+    await session.commit()
+    return {"message": "已緊急停止全部社團發文排程"}
+
+
+@router.get("/calendar")
+async def gp_calendar(year: int | None = None, month: int | None = None,
+                      session: AsyncSession = Depends(get_session)):
+    """簡易行事曆：依 RunLog(task_type=group_post) 統計。"""
+    now = datetime.utcnow()
+    y = year or now.year
+    m = month or now.month
+    import calendar as cal
+    days_in_month = cal.monthrange(y, m)[1]
+    first_weekday = datetime(y, m, 1).weekday()  # Mon=0
+    rows = (await session.execute(
+        select(RunLog).where(
+            RunLog.task_type == "group_post",
+            func.strftime("%Y", RunLog.created_at) == f"{y:04d}",
+            func.strftime("%m", RunLog.created_at) == f"{m:02d}",
+        )
+    )).scalars().all()
+    by_day: dict[int, dict] = {}
+    success = failed = 0
+    for r in rows:
+        if not r.created_at:
+            continue
+        d = r.created_at.day
+        slot = by_day.setdefault(d, {"success": 0, "failed": 0, "total": 0})
+        ok = (r.status or "") in ("success", "needs_manual")
+        if ok:
+            slot["success"] += 1
+            success += 1
+        else:
+            slot["failed"] += 1
+            failed += 1
+        slot["total"] += 1
+    total = success + failed
+    return {
+        "year": y, "month": m, "days_in_month": days_in_month, "first_weekday": first_weekday,
+        "days": by_day,
+        "summary": {
+            "success": success, "failed": failed, "total": total,
+            "success_rate": round(100 * success / total, 1) if total else None,
+            "posts": total, "listings": 0,
+        },
+    }
+
+
+# ── presets ──────────────────────────────────────────
+
+class PresetData(BaseModel):
+    name: str
+    group_names: list[str] = []
+
+
+@router.get("/group-presets")
+async def list_presets(session: AsyncSession = Depends(get_session)):
+    rows = (await session.execute(
+        select(GpGroupPreset).order_by(GpGroupPreset.created_at.desc())
+    )).scalars().all()
+    return [{"id": g.id, "name": g.name, "group_names": g.group_names or [],
+             "count": len(g.group_names or [])} for g in rows]
+
+
+@router.post("/group-presets")
+async def create_preset(data: PresetData, session: AsyncSession = Depends(get_session)):
+    row = GpGroupPreset(name=data.name.strip(), group_names=data.group_names)
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return {"id": row.id, "name": row.name, "group_names": row.group_names,
+            "count": len(row.group_names or [])}
+
+
+@router.delete("/group-presets/{preset_id}")
+async def delete_preset(preset_id: int, session: AsyncSession = Depends(get_session)):
+    row = (await session.execute(
+        select(GpGroupPreset).where(GpGroupPreset.id == preset_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "群組不存在")
+    await session.delete(row)
+    await session.commit()
+    return {"message": "已刪除"}
+
+
+# ── listings ─────────────────────────────────────────
+
+class ListingData(BaseModel):
+    account_id: int
+    name: str = ""
+    base_content: str = ""
+    titles: list[str] = []
+    bodies: list[str] = []
+    image_pool: list[str] = []
+    target_groups: list[str] = []
+    sleep_min_sec: int = 45
+    sleep_max_sec: int = 120
+
+
+@router.get("/listings")
+async def list_listings(session: AsyncSession = Depends(get_session)):
+    rows = (await session.execute(
+        select(GpListing).order_by(GpListing.created_at.desc())
+    )).scalars().all()
+    return [_listing_out(r) for r in rows]
+
+
+@router.get("/listings/{listing_id}")
+async def get_listing(listing_id: int, session: AsyncSession = Depends(get_session)):
+    row = (await session.execute(
+        select(GpListing).where(GpListing.id == listing_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "物件不存在")
+    return _listing_out(row)
+
+
+@router.post("/listings")
+async def create_listing(data: ListingData, session: AsyncSession = Depends(get_session)):
+    acc = (await session.execute(
+        select(Account).where(Account.id == data.account_id)
+    )).scalar_one_or_none()
+    if not acc:
+        raise HTTPException(422, "帳號不存在")
+    row = GpListing(**data.model_dump())
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return _listing_out(row)
+
+
+@router.put("/listings/{listing_id}")
+async def update_listing(listing_id: int, data: ListingData,
+                         session: AsyncSession = Depends(get_session)):
+    row = (await session.execute(
+        select(GpListing).where(GpListing.id == listing_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "物件不存在")
+    for k, v in data.model_dump().items():
+        setattr(row, k, v)
+    await session.commit()
+    await session.refresh(row)
+    return _listing_out(row)
+
+
+@router.delete("/listings/{listing_id}")
+async def delete_listing(listing_id: int, session: AsyncSession = Depends(get_session)):
+    row = (await session.execute(
+        select(GpListing).where(GpListing.id == listing_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "物件不存在")
+    await session.delete(row)
+    await session.commit()
+    return {"message": "已刪除"}
+
+
+@router.post("/listings/{listing_id}/reset-health")
+async def reset_listing_health(listing_id: int, session: AsyncSession = Depends(get_session)):
+    row = (await session.execute(
+        select(GpListing).where(GpListing.id == listing_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "物件不存在")
+    row.health_status = "ok"
+    row.consecutive_review = 0
+    row.review_count = 0
+    row.reject_count = 0
+    await session.commit()
+    await session.refresh(row)
+    return _listing_out(row)
+
+
+class GenerateReq(BaseModel):
+    base_content: str
+    n_versions: int = 5
+
+
+@router.post("/generate-copy")
+async def generate_copy(req: GenerateReq):
+    """與 MP 共用 DeepSeek／雲端文案引擎（generate_from_base），端點獨立。"""
+    import asyncio
+    from ..deepseek_client import DeepSeekError, generate_from_base, has_key
+    from ..cloud_client import cloud_enabled
+    if not (cloud_enabled() or has_key()):
+        raise HTTPException(422, "尚未設定雲端授權或 DeepSeek 金鑰")
+    n = max(1, min(10, int(req.n_versions or 5)))
+    try:
+        versions = await asyncio.to_thread(generate_from_base, req.base_content, n)
+        return {"versions": versions}
+    except DeepSeekError as e:
+        raise HTTPException(422, str(e))
+
+
+_ALLOWED_MEDIA_EXT = {
+    # images
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".bmp",
+    # videos
+    ".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv",
+}
+_MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200MB（影片）
+
+
+@router.post("/upload-image")
+@router.post("/upload-media")
+async def upload_media(file: UploadFile = File(...)):
+    """上傳社團發文用圖片或影片（路徑寫入 listing.image_pool）。"""
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    ext = os.path.splitext(file.filename or "media.bin")[1].lower() or ".bin"
+    if ext not in _ALLOWED_MEDIA_EXT:
+        raise HTTPException(422, f"不支援的檔案格式：{ext}（請上傳圖片或影片）")
+    data = await file.read()
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(422, f"檔案過大（上限 {_MAX_UPLOAD_BYTES // (1024*1024)}MB）")
+    filename = f"gp_{uuid.uuid4().hex}{ext}"
+    path = UPLOAD_DIR / filename
+    path.write_bytes(data)
+    kind = "video" if ext in {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"} else "image"
+    return {
+        "filename": filename,
+        "path": f"/uploads/group_post/{filename}",
+        "kind": kind,
+        "size": len(data),
+    }
+
+
+# ── schedules ────────────────────────────────────────
+
+class ScheduleData(BaseModel):
+    account_id: int
+    listing_ids: list[int] = []
+    time_mode: str = "points"
+    time_points: list[str] = []
+    window_start: str = "09:00"
+    window_end: str = "21:00"
+    daily_count: int = 3
+    daily_count_min: int = 0
+    daily_count_max: int = 0
+    random_delay: bool = True
+    cooldown_min_sec: int = 300
+    cooldown_max_sec: int = 600
+    headless: bool = True
+    dry_run: bool = False
+    auto_delete_days: int = 0
+    groups_per_run: int = 0
+
+
+@router.get("/schedules")
+async def list_schedules(session: AsyncSession = Depends(get_session)):
+    rows = (await session.execute(
+        select(GpSchedule).order_by(GpSchedule.created_at.desc())
+    )).scalars().all()
+    return [_sch_out(s) for s in rows]
+
+
+@router.post("/schedules")
+async def create_schedule(data: ScheduleData, session: AsyncSession = Depends(get_session)):
+    row = GpSchedule(**data.model_dump())
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return _sch_out(row)
+
+
+@router.put("/schedules/{sch_id}")
+async def update_schedule(sch_id: int, data: ScheduleData,
+                          session: AsyncSession = Depends(get_session)):
+    row = (await session.execute(
+        select(GpSchedule).where(GpSchedule.id == sch_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "排程不存在")
+    for k, v in data.model_dump().items():
+        setattr(row, k, v)
+    await session.commit()
+    await session.refresh(row)
+    return _sch_out(row)
+
+
+@router.delete("/schedules/{sch_id}")
+async def delete_schedule(sch_id: int, session: AsyncSession = Depends(get_session)):
+    row = (await session.execute(
+        select(GpSchedule).where(GpSchedule.id == sch_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "排程不存在")
+    from ..scheduler.group_post_runner import remove_schedule_jobs
+    remove_schedule_jobs(sch_id)
+    await session.delete(row)
+    await session.commit()
+    return {"message": "已刪除"}
+
+
+@router.put("/schedules/{sch_id}/start")
+async def start_schedule(sch_id: int, session: AsyncSession = Depends(get_session)):
+    row = (await session.execute(
+        select(GpSchedule).where(GpSchedule.id == sch_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "排程不存在")
+    if not row.listing_ids:
+        raise HTTPException(422, "排程未綁定任何物件")
+    row.status = "running"
+    await session.commit()
+    from ..scheduler.group_post_runner import plan_and_schedule
+    added, times = plan_and_schedule(row)
+    return {"message": "排程已啟動", "today_planned": added,
+            "times": [t.strftime("%H:%M") for t in times]}
+
+
+@router.put("/schedules/{sch_id}/pause")
+async def pause_schedule(sch_id: int, session: AsyncSession = Depends(get_session)):
+    row = (await session.execute(
+        select(GpSchedule).where(GpSchedule.id == sch_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "排程不存在")
+    row.status = "stopped"
+    await session.commit()
+    from ..scheduler.group_post_runner import remove_schedule_jobs
+    remove_schedule_jobs(sch_id)
+    return {"message": "排程已停止"}
+
+
+@router.post("/schedules/{sch_id}/test-run")
+async def test_run(sch_id: int, session: AsyncSession = Depends(get_session)):
+    row = (await session.execute(
+        select(GpSchedule).where(GpSchedule.id == sch_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "排程不存在")
+    if not row.listing_ids:
+        raise HTTPException(422, "排程未綁定任何物件")
+    import asyncio
+    from ..scheduler.group_post_runner import run_group_post_job
+    asyncio.create_task(run_group_post_job(sch_id, force=True))
+    return {"message": f"已觸發測試執行（dry_run={row.dry_run}）；結果請看執行紀錄"}
+
+
+# ── one-shot post ────────────────────────────────────
+
+class PostNowReq(BaseModel):
+    account_id: int
+    listing_id: int
+    headless: bool = False
+    dry_run: bool = False
+    max_groups: Optional[int] = None  # 測試時可限制社團數
+
+
+@router.post("/post")
+async def post_now(data: PostNowReq, session: AsyncSession = Depends(get_session)):
+    """立即對物件的目標社團逐一發文（非轉發）。"""
+    listing = (await session.execute(
+        select(GpListing).where(GpListing.id == data.listing_id)
+    )).scalar_one_or_none()
+    if not listing:
+        raise HTTPException(404, "物件不存在")
+    acc = (await session.execute(
+        select(Account).where(Account.id == data.account_id)
+    )).scalar_one_or_none()
+    if not acc or not acc.fb_user_id:
+        raise HTTPException(422, "帳號不存在或尚未綁定 FB")
+    import asyncio
+    from ..scheduler.group_post_runner import run_listing_once
+    asyncio.create_task(run_listing_once(
+        account_id=data.account_id,
+        listing_id=data.listing_id,
+        headless=data.headless,
+        dry_run=data.dry_run,
+        max_groups=data.max_groups,
+    ))
+    return {"message": "已開始社團發文，請看執行紀錄"}

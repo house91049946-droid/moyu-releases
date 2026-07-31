@@ -1,0 +1,259 @@
+"""補丁式增量更新（SPEC-P23 §4~§7）。
+
+比對與驗證：
+  - diff_manifests()：比對本地與雲端 manifest，決定 patch / full / none
+  - safe_target()：把 manifest 的相對路徑轉成安全的落地路徑（防目錄逃逸）
+  - verify_sha256()：下載後校驗
+
+套用與回滾（由啟動器在「啟動主程式之前」呼叫）：
+  - apply_staged()：驗證 staging 全部檔案 → 備份 → 換檔
+  - rollback()：從備份還原
+
+⚠️ 套用的時機是關鍵：必須在 backend/frontend 都還沒啟動時做。
+   那時 python.exe / node.exe 尚未載入，檔案沒被鎖，才能安全覆蓋
+   （Windows 不允許覆蓋執行中的檔案）。啟動器的「服務已在跑就只開儀表板」
+   那條分支剛好保證了這點——服務在跑時根本不會走到套用流程。
+
+⚠️ 這裡處理的是「會被執行的程式碼」。任何放寬檢查的修改都要當成安全性變更看待。
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+from pathlib import Path
+from typing import Iterable
+
+
+def _vtuple(v: str) -> tuple:
+    """"1.0.10" → (1,0,10)。無法解析回空 tuple（比較時視為最小）。"""
+    try:
+        return tuple(int(x) for x in str(v).strip().split("."))
+    except (ValueError, AttributeError):
+        return ()
+
+
+def safe_target(base: Path, rel_path: str, allowed_tops: Iterable[str]) -> Path:
+    """把 manifest 裡的相對路徑轉成落地路徑；不安全就丟 ValueError。
+
+    manifest 可能來自網路，必須假設它可能是惡意或損壞的：
+      - 絕對路徑（/etc/passwd、C:\\Windows\\...）
+      - 目錄逃逸（../../.ssh/authorized_keys）
+      - 逃出輕層（python/、browsers/ 屬重層，補丁不該碰）
+      - Windows 磁碟機代號、UNC 路徑
+    """
+    if not rel_path or rel_path.strip() != rel_path:
+        raise ValueError(f"路徑空白或含前後空格：{rel_path!r}")
+    # 統一分隔符後再判斷，避免 "backend\\..\\x" 這種混用繞過
+    norm = rel_path.replace("\\", "/")
+    if norm.startswith("/") or norm.startswith("//"):
+        raise ValueError(f"不接受絕對路徑：{rel_path}")
+    if ":" in norm.split("/")[0]:
+        raise ValueError(f"不接受磁碟機代號／UNC：{rel_path}")
+    parts = [p for p in norm.split("/") if p]
+    if not parts:
+        raise ValueError(f"路徑無效：{rel_path}")
+    if any(p == ".." for p in parts):
+        raise ValueError(f"不接受目錄逃逸：{rel_path}")
+    if parts[0] not in set(allowed_tops):
+        raise ValueError(f"不在輕層允許範圍內（{parts[0]}）：{rel_path}")
+
+    target = (base / Path(*parts)).resolve()
+    root = base.resolve()
+    # 最後一道：解析後必須仍在 base 底下（擋 symlink 之類的意外）
+    if root != target and root not in target.parents:
+        raise ValueError(f"解析後逃出安裝目錄：{rel_path}")
+    return target
+
+
+def diff_manifests(local: dict, remote: dict) -> dict:
+    """比對兩份 manifest，決定這次要怎麼更新。
+
+    回傳 {"mode", "reason", "download", "remove", "bytes"}
+      mode: "none"（已是最新／不需動作）
+            "patch"（可走輕層增量）
+            "full"（必須整包重載，見 §6）
+    """
+    lv, rv = local.get("version", ""), remote.get("version", "")
+    if not rv:
+        return {"mode": "none", "reason": "雲端未提供版本", "download": [], "remove": [], "bytes": 0}
+    if _vtuple(rv) <= _vtuple(lv):
+        return {"mode": "none", "reason": f"已是最新（本機 {lv}）", "download": [], "remove": [], "bytes": 0}
+
+    # 以下情況輕層補不齊，必須全量（§6）
+    if remote.get("platform") and local.get("platform") and remote["platform"] != local["platform"]:
+        return {"mode": "full", "reason": "平台不同", "download": [], "remove": [], "bytes": 0}
+    if remote.get("deps_hash") and remote.get("deps_hash") != local.get("deps_hash"):
+        return {"mode": "full", "reason": "依賴套件有變動（site-packages 在重層）",
+                "download": [], "remove": [], "bytes": 0}
+    if _vtuple(remote.get("min_runtime", "")) > _vtuple(local.get("min_runtime", "")):
+        return {"mode": "full", "reason": "需要更新版的 Python runtime",
+                "download": [], "remove": [], "bytes": 0}
+
+    lmap = {f["path"]: f for f in local.get("files", [])}
+    rmap = {f["path"]: f for f in remote.get("files", [])}
+    download = [f for p, f in rmap.items()
+                if p not in lmap or lmap[p].get("sha256") != f.get("sha256")]
+    remove = sorted(set(lmap) - set(rmap))
+    if not download and not remove:
+        return {"mode": "none", "reason": f"版本號較新但檔案內容相同（{rv}）",
+                "download": [], "remove": [], "bytes": 0}
+    return {
+        "mode": "patch",
+        "reason": f"{lv} → {rv}",
+        "download": sorted(download, key=lambda f: f["path"]),
+        "remove": remove,
+        "bytes": sum(int(f.get("size") or 0) for f in download),
+    }
+
+
+def verify_sha256(path: Path, expected: str) -> bool:
+    """校驗下載檔。SPEC-P23 §7：套用前一律驗，這是最低防線。"""
+    if not expected or not path.is_file():
+        return False
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    # 長度先比，避免不同長度的雜湊字串進到比較
+    got = h.hexdigest()
+    return len(got) == len(expected.strip().lower()) and got == expected.strip().lower()
+
+
+# ── 套用與回滾（SPEC-P23 §5）─────────────────────────────
+#
+# 呼叫時機：啟動器在起 backend/frontend 之前。服務沒在跑 → 檔案沒被鎖。
+#
+# 啟動器自身（啟動.bat / 摸魚.vbs / 摸魚.app）不在輕層內，所以永遠不會被
+# 補丁覆蓋——執行中的腳本覆蓋自己在 Windows 上會出各種怪事。它們要改就得
+# 走全量更新。
+
+PENDING_NAME = "pending_update.json"
+LIGHT_TOPS = ("backend", "FB_Auto", "frontend")
+# 包根的 manifest.json 代表「本機目前是哪一版」。它列的是輕層檔案、自己不在清單裡，
+# 所以不會被一般的換檔流程碰到——但套用完一定要跟著換掉，否則本機版本永遠停在舊值，
+# 客戶端會每次檢查都算出同一份差異、無限重抓重套（實測時就是這樣發現的）。
+MANIFEST_NAME = "manifest.json"
+
+
+def read_pending(staging: Path) -> dict | None:
+    """讀待套用的更新描述；不存在或壞掉都回 None（當作沒更新，不是錯誤）。"""
+    p = staging / PENDING_NAME
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data if (data.get("files") or data.get("remove")) else None
+
+
+def apply_staged(base: Path, staging: Path, backup: Path,
+                 allowed_tops: Iterable[str] = LIGHT_TOPS) -> dict:
+    """把 staging 的檔案套用到 base。回傳 {"ok","applied","removed","error"}。
+
+    順序刻意如此：**全部驗完才動任何一個檔案**。換到一半才發現雜湊不符，
+    會留下混版的安裝目錄——那比不更新糟得多。
+    """
+    pending = read_pending(staging)
+    if not pending:
+        return {"ok": True, "applied": 0, "removed": 0, "error": None,
+                "skipped": "沒有待套用的更新"}
+
+    # 第一階段：只驗證，不動檔案
+    plan = []
+    for f in pending.get("files") or []:
+        rel, sha = f.get("path", ""), f.get("sha256", "")
+        try:
+            target = safe_target(base, rel, allowed_tops)
+            src = safe_target(staging, rel, allowed_tops)
+        except ValueError as e:
+            return {"ok": False, "applied": 0, "removed": 0, "error": f"路徑不安全：{e}"}
+        if not src.is_file():
+            return {"ok": False, "applied": 0, "removed": 0, "error": f"staging 缺檔：{rel}"}
+        if not verify_sha256(src, sha):
+            return {"ok": False, "applied": 0, "removed": 0, "error": f"雜湊不符，拒絕套用：{rel}"}
+        plan.append((rel, src, target))
+
+    remove_plan = []
+    for rel in pending.get("remove") or []:
+        try:
+            remove_plan.append((rel, safe_target(base, rel, allowed_tops)))
+        except ValueError as e:
+            return {"ok": False, "applied": 0, "removed": 0, "error": f"路徑不安全：{e}"}
+
+    # 第二階段：備份現況（有東西可還原才敢往下走）
+    staged_manifest = staging / MANIFEST_NAME
+    if backup.exists():
+        shutil.rmtree(backup, ignore_errors=True)
+    backup.mkdir(parents=True, exist_ok=True)
+    try:
+        for rel, _src, target in plan + [(r, None, t) for r, t in remove_plan]:
+            if target.exists():
+                b = backup / rel
+                b.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, b)
+        if staged_manifest.is_file() and (base / MANIFEST_NAME).is_file():
+            shutil.copy2(base / MANIFEST_NAME, backup / MANIFEST_NAME)
+    except OSError as e:
+        return {"ok": False, "applied": 0, "removed": 0,
+                "error": f"備份失敗，未動任何檔案：{e}"}
+
+    # 第三階段：換檔。先寫同目錄的 .new 再 os.replace——同分割區上是原子操作，
+    # 中途斷電不會留下半個檔案，且 Windows 上 os.replace 可覆蓋既有檔案。
+    applied = removed = 0
+    try:
+        for rel, src, target in plan:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(target.name + ".new")
+            shutil.copy2(src, tmp)
+            os.replace(tmp, target)
+            applied += 1
+        for rel, target in remove_plan:
+            if target.exists():
+                target.unlink()
+                removed += 1
+        # 最後才換 manifest：前面任何一步失敗都還沒動到它，本機版本就仍然誠實
+        if staged_manifest.is_file():
+            tmp = base / (MANIFEST_NAME + ".new")
+            shutil.copy2(staged_manifest, tmp)
+            os.replace(tmp, base / MANIFEST_NAME)
+    except OSError as e:
+        return {"ok": False, "applied": applied, "removed": removed,
+                "error": f"換檔失敗（已套用 {applied} 個，需回滾）：{e}"}
+
+    return {"ok": True, "applied": applied, "removed": removed, "error": None,
+            "version": pending.get("version")}
+
+
+def rollback(base: Path, backup: Path,
+             allowed_tops: Iterable[str] = LIGHT_TOPS) -> dict:
+    """從備份還原。啟動後健康檢查失敗時呼叫（§5 步驟 2）。"""
+    if not backup.is_dir():
+        return {"ok": False, "restored": 0, "error": "沒有備份可還原"}
+    restored, errors = 0, []
+    for src in sorted(backup.rglob("*")):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(backup).as_posix()
+        if rel == MANIFEST_NAME:
+            target = base / MANIFEST_NAME     # 不走 safe_target：它只放行輕層底下的路徑
+        else:
+            try:
+                target = safe_target(base, rel, allowed_tops)
+            except ValueError as e:
+                errors.append(f"{rel}: {e}")
+                continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(target.name + ".restore")
+            shutil.copy2(src, tmp)
+            os.replace(tmp, target)
+            restored += 1
+        except OSError as e:
+            errors.append(f"{rel}: {e}")
+    return {"ok": not errors, "restored": restored,
+            "error": "；".join(errors) if errors else None}

@@ -1,0 +1,160 @@
+"""P4 — 帳號養號模組（模擬真人瀏覽行為）。"""
+import random
+import time
+from dataclasses import dataclass
+from enum import Enum
+
+from playwright.sync_api import Page
+
+from src.config_loader import T
+from src.utils import enhanced_get, human_sleep, perform_checks, CheckResult, capture_screenshot
+
+
+class NurtureAction(Enum):
+    SCROLL_FEED = "scroll_feed"
+    BROWSE_GROUP = "browse_group"
+    LIKE_POST = "like_post"
+    STAY = "stay"
+    SCROLL_GROUP = "scroll_group"
+    CLICK_COMMENT = "click_comment"
+
+
+# 行為池（機率分配）
+ACTION_POOL = [
+    (NurtureAction.SCROLL_FEED, 0.30),
+    (NurtureAction.BROWSE_GROUP, 0.20),
+    (NurtureAction.LIKE_POST, 0.15),
+    (NurtureAction.STAY, 0.20),
+    (NurtureAction.SCROLL_GROUP, 0.10),
+    (NurtureAction.CLICK_COMMENT, 0.05),
+]
+
+
+@dataclass
+class NurtureResult:
+    success: bool
+    duration_sec: int
+    actions_performed: int
+    aborted_reason: str = ""
+
+
+def _pick_action() -> NurtureAction:
+    """依機率隨機選一個養號行為。"""
+    r = random.random()
+    cumulative = 0.0
+    for action, prob in ACTION_POOL:
+        cumulative += prob
+        if r <= cumulative:
+            return action
+    return NurtureAction.STAY
+
+
+def raiseaccount_www(
+    page: Page,
+    fbid: str,
+    groups: list[str],
+    duration_sec: int = 300,
+    lang: str = "zh",
+) -> NurtureResult:
+    """
+    模擬真人瀏覽行為（mbasic 版）。
+
+    Args:
+        page: Playwright Page
+        fbid: FB numeric ID
+        groups: 養號用的社團 mbasic 網址列表
+        duration_sec: 總養號時長（秒）
+        lang: 語言
+
+    Returns:
+        NurtureResult
+    """
+    print(f"[nurture] Starting for {fbid}, duration: {duration_sec}s, groups: {len(groups)}")
+    start_time = time.time()
+    actions_done = 0
+
+    while (time.time() - start_time) < duration_sec:
+        # 健康檢查
+        check = perform_checks(page, fbid)
+        if check != CheckResult.OK:
+            capture_screenshot(page, fbid, f"nurture_{check.value}")
+            return NurtureResult(
+                success=False,
+                duration_sec=int(time.time() - start_time),
+                actions_performed=actions_done,
+                aborted_reason=check.value,
+            )
+
+        action = _pick_action()
+        actions_done += 1
+        print(f"[nurture] Action {actions_done}: {action.value}")
+
+        try:
+            if action == NurtureAction.SCROLL_FEED:
+                # 捲動動態消息
+                enhanced_get(page, "https://mbasic.facebook.com/")
+                human_sleep(1, 3)
+                for _ in range(random.randint(3, 8)):
+                    page.mouse.wheel(0, random.randint(200, 800))
+                    human_sleep(2, 6)
+
+            elif action == NurtureAction.BROWSE_GROUP and groups:
+                # 隨機點入一個社團
+                group_url = random.choice(groups)
+                enhanced_get(page, group_url)
+                human_sleep(3, 8)
+                for _ in range(random.randint(2, 5)):
+                    page.mouse.wheel(0, random.randint(200, 600))
+                    human_sleep(2, 5)
+
+            elif action == NurtureAction.LIKE_POST:
+                # 按讚（找 mbasic 上的讚按鈕）
+                try:
+                    like_btn = page.locator("text=讚").first
+                    if like_btn.count() > 0:
+                        like_btn.click(timeout=5000)
+                        human_sleep(1, 3)
+                except Exception:
+                    pass
+
+            elif action == NurtureAction.STAY:
+                # 只停留
+                human_sleep(5, 15)
+
+            elif action == NurtureAction.SCROLL_GROUP and groups:
+                group_url = random.choice(groups)
+                enhanced_get(page, group_url)
+                for _ in range(random.randint(3, 6)):
+                    page.mouse.wheel(0, random.randint(200, 500))
+                    human_sleep(1, 4)
+
+            elif action == NurtureAction.CLICK_COMMENT:
+                # 點開留言但不留言
+                try:
+                    comment_link = page.locator("text=/留言|comment/i").first
+                    if comment_link.count() > 0:
+                        comment_link.click(timeout=5000)
+                        human_sleep(2, 5)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print(f"[nurture] Action failed: {action.value} — {e}")
+            # 不中斷，繼續下一個行為
+
+    elapsed = int(time.time() - start_time)
+    print(f"[nurture] Completed: {actions_done} actions in {elapsed}s")
+    return NurtureResult(success=True, duration_sec=elapsed, actions_performed=actions_done)
+
+
+def success_log(fbid: str):
+    """寫一筆養號成功記錄到 schedule.log。"""
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    job_id = str(int(time.time() * 10000))
+    line = f"{ts};自動養號;成功;{fbid};;;{job_id}\n"
+    from src.paths import DATA_DIR
+    log_path = DATA_DIR / "schedule.log"
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(line)
+    print(f"[log] {line.strip()}")

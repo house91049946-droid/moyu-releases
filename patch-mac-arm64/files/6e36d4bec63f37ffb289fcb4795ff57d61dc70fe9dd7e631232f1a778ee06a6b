@@ -1,0 +1,354 @@
+"""Playwright 自動化底層。"""
+import contextlib
+import os
+import random
+import time
+from enum import Enum
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+from src.config_loader import T
+from src.paths import SCREENSHOT_DIR, USER_DATA_DIR
+
+
+class CheckResult(Enum):
+    OK = "ok"
+    LOCKED = "locked"
+    BLOCKED = "blocked"
+    RESTRICTED = "restricted"
+    GROUP_BLOCKED = "group_blocked"
+    CAPTCHA = "captcha"
+    NEED_2FA = "needs_2fa"
+    LOGGED_OUT = "logged_out"
+    IDENTITY_VERIFY = "identity_verify"
+
+
+def human_sleep(a, b):
+    time.sleep(random.uniform(a, b))
+
+
+def human_idle(page, min_moves=2, max_moves=5):
+    """動作之間插入隨機滑鼠游移 / 小幅捲動 / 停留，模擬真人瀏覽（反偵測）。
+    任何錯誤都吞掉，不影響主流程。"""
+    try:
+        n = random.randint(min_moves, max_moves)
+        for _ in range(n):
+            x = random.randint(60, 1220)
+            y = random.randint(120, 700)
+            page.mouse.move(x, y, steps=random.randint(3, 12))
+            human_sleep(0.1, 0.5)
+            if random.random() < 0.4:
+                page.mouse.wheel(0, random.randint(-200, 350))
+                human_sleep(0.2, 0.6)
+    except Exception:
+        pass
+
+
+def warm_up_browse(page, min_sec=60, max_sec=180, home_url="https://www.facebook.com/"):
+    """發文前先到 FB 首頁動態瀏覽 1-3 分鐘，模擬真人（反偵測）。
+
+    行為：載入首頁 → 隨機向下捲動閱讀、偶爾往回捲、滑鼠游移、隨機停留，
+    直到達到隨機決定的瀏覽時長。任何錯誤都吞掉，不影響後續發文。
+    """
+    duration = random.uniform(min_sec, max_sec)
+    print(f"[warm_up] 發文前暖身瀏覽首頁約 {duration:.0f} 秒（模擬真人）", flush=True)
+    start = time.time()
+    try:
+        try:
+            page.goto(home_url, wait_until="domcontentloaded", timeout=45000)
+        except Exception:
+            pass
+        human_sleep(2, 4)
+        while time.time() - start < duration:
+            # 一次「閱讀」動作：向下捲一段 + 停留閱讀
+            page.mouse.wheel(0, random.randint(300, 900))
+            human_sleep(1.5, 4.5)  # 停下來「看內容」
+            # 滑鼠隨機游移，像在移動視線 / 準備互動
+            if random.random() < 0.6:
+                page.mouse.move(random.randint(200, 1100), random.randint(150, 650),
+                                steps=random.randint(4, 15))
+                human_sleep(0.3, 1.2)
+            # 偶爾往回捲一點（重看剛剛滑過的內容）
+            if random.random() < 0.25:
+                page.mouse.wheel(0, -random.randint(150, 400))
+                human_sleep(0.8, 2.0)
+            # 偶爾停久一點（像在細看某篇貼文 / 圖片）
+            if random.random() < 0.15:
+                human_sleep(3, 8)
+    except Exception as e:
+        print(f"[warm_up] 暖身瀏覽中止（忽略）：{e}", flush=True)
+    print(f"[warm_up] 暖身完成，實際 {time.time() - start:.0f} 秒", flush=True)
+
+
+def simulate_human_click(page, locator):
+    """模擬真人游標移動並點擊"""
+    try:
+        locator.hover()
+        human_sleep(0.1, 0.3)
+        locator.click(delay=random.randint(50, 150))
+        return True
+    except Exception:
+        return False
+
+
+def simulate_human_typing(page, locator, text: str):
+    """模擬真人打字，以點擊頁面空白處觸發 blur 確保 React 更新"""
+    try:
+        simulate_human_click(page, locator)
+        human_sleep(0.1, 0.3)
+        # 全選並刪除可能存在的舊內容
+        page.keyboard.press("Meta+A" if page.evaluate("navigator.platform").startswith("Mac") else "Control+A")
+        page.keyboard.press("Backspace")
+        human_sleep(0.1, 0.3)
+        
+        # 逐字輸入
+        for char in text:
+            page.keyboard.type(char, delay=random.randint(30, 120))
+        
+        human_sleep(0.2, 0.5)
+        # 點擊頁面空白處觸發 blur（比 Tab/Shift+Tab 更自然，React 能正確收到 onChange）
+        page.mouse.click(10, 10)
+        human_sleep(0.1, 0.3)
+        # 再點回輸入框確認 focus
+        page.mouse.click(10, 10)
+        simulate_human_click(page, locator)
+        human_sleep(0.2, 0.4)
+        # 再次點擊空白處，最終狀態為 blurred
+        page.mouse.click(10, 10)
+        return True
+    except Exception as e:
+        print(f"[utils] simulate_human_typing failed: {e}")
+        return False
+
+
+def _chrome_lock_pid_alive(profile_dir: Path) -> int | None:
+    """若 SingletonLock 指向仍在跑的 Chrome PID，回傳該 PID；否則 None。"""
+    lock = profile_dir / "SingletonLock"
+    if not lock.exists():
+        return None
+    target = ""
+    try:
+        if lock.is_symlink():
+            target = os.readlink(lock)
+        else:
+            target = lock.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return None
+    # 常見格式：hostname-pid 或 純 pid
+    pid_s = target.rsplit("-", 1)[-1].strip()
+    if not pid_s.isdigit():
+        return None
+    pid = int(pid_s)
+    try:
+        os.kill(pid, 0)
+        return pid
+    except OSError:
+        return None
+
+
+def _clear_stale_chrome_locks(profile_dir: Path) -> None:
+    """只清「僵死」的 Chrome profile 鎖；若 Chrome 仍活著則保留，避免互搶。"""
+    alive = _chrome_lock_pid_alive(profile_dir)
+    if alive is not None:
+        raise RuntimeError(
+            f"Chrome profile 使用中（pid={alive}）：{profile_dir}。"
+            "請先關閉該帳號其他瀏覽器任務後再試。"
+        )
+    for name in (".lock", "SingletonLock", "SingletonSocket", "SingletonCookie"):
+        lp = profile_dir / name
+        if lp.exists() or lp.is_symlink():
+            with contextlib.suppress(OSError):
+                lp.unlink()
+
+
+def launch_browser(fbid, headless=False, proxy=None, user_data_dir=None):
+    if user_data_dir is None:
+        profile_dir = str(USER_DATA_DIR / fbid)
+        Path(profile_dir).mkdir(parents=True, exist_ok=True)
+    else:
+        profile_dir = user_data_dir
+
+    _clear_stale_chrome_locks(Path(profile_dir))
+
+    # FB_USE_CHROMIUM=1 → 用 Playwright 內建 Chromium（不做系統 App 註冊，避免在
+    # Electron/沙盒等巢狀環境下 Chrome 於 NSApplication 初始化時 abort）。預設仍用系統 Chrome。
+    channel = None if os.environ.get("FB_USE_CHROMIUM") == "1" else "chrome"
+    launch_kwargs = dict(
+        user_data_dir=profile_dir,
+        headless=headless,
+        proxy=proxy,
+        viewport={"width": 1280, "height": 800},
+        locale="zh-TW",
+        timezone_id="Asia/Taipei",
+    )
+    if channel:
+        launch_kwargs["channel"] = channel
+
+    playwright = sync_playwright().start()
+    context = playwright.chromium.launch_persistent_context(**launch_kwargs)
+    page = context.new_page()
+
+    try:
+        from playwright_stealth import Stealth
+        Stealth().apply_stealth_sync(page)
+    except (ImportError, Exception):
+        pass
+
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => false});
+    """)
+
+    return context, context, page  # persistent: browser = context
+
+
+def enhanced_get(page, url, retries=3, wait=(2, 5), wait_until="domcontentloaded"):
+    for attempt in range(retries):
+        try:
+            human_sleep(wait[0], wait[1])
+            page.goto(url, wait_until=wait_until, timeout=30000)
+            human_sleep(1, 2)
+            return True
+        except (PwTimeout, Exception):
+            if attempt == retries - 1:
+                return False
+            human_sleep(2, 4)
+    return False
+
+
+def enhanced_click(page, selector, timeout=15000, retries=3, human_delay=(0.4, 1.6)):
+    for attempt in range(retries):
+        try:
+            loc = page.locator(selector).first
+            loc.wait_for(state="visible", timeout=timeout)
+            human_sleep(human_delay[0], human_delay[1])
+            loc.click(timeout=timeout)
+            return True
+        except Exception:
+            if attempt == retries - 1:
+                return False
+            human_sleep(1, 3)
+    return False
+
+
+def _get_body_text(page):
+    try:
+        return page.locator("body").inner_text(timeout=3000)
+    except Exception:
+        return ""
+
+
+def _contains_any(text, values):
+    if isinstance(values, str):
+        return values in text
+    return any(v in text for v in values)
+
+
+def perform_checks(page, fbid):
+    body = _get_body_text(page)
+
+    login_text = T("login")
+    if isinstance(login_text, list):
+        login_text = login_text[0]
+    if login_text in body and "密碼" in body:
+        return CheckResult.LOGGED_OUT
+
+    if _contains_any(body, T("locked")):
+        return CheckResult.LOCKED
+    if _contains_any(body, T("temporarily_blocked")):
+        return CheckResult.BLOCKED
+    if _contains_any(body, T("account_restricted")):
+        return CheckResult.RESTRICTED
+    if "recaptcha" in body.lower():
+        return CheckResult.CAPTCHA
+
+    for k in ("confirm_your_identity", "verify_application", "2fa_choice"):
+        try:
+            if _contains_any(body, T(k)):
+                return CheckResult.NEED_2FA
+        except KeyError:
+            pass
+
+    # 身份驗證（如 Marketplace 上架後觸發的 identity confirmation）
+    identity_keywords = [
+        "確認你的身分", "確認身分", "verify your identity", "identity confirmation",
+        "上傳證件", "upload id", "confirm identity", "身份確認",
+    ]
+    if _contains_any(body.lower(), [k.lower() for k in identity_keywords]):
+        return CheckResult.IDENTITY_VERIFY
+
+    # 文字關鍵字沒認出、但 URL 是 FB 檢查點/二段驗證頁（reCAPTCHA 在 iframe 裡時 body 抓不到字）
+    try:
+        url = page.url or ""
+    except Exception:
+        url = ""
+    if any(k in url for k in ("/checkpoint", "two_step_verification", "auth_platform")):
+        return CheckResult.NEED_2FA
+
+    return CheckResult.OK
+
+
+def find_and_hover_post_time(page):
+    try:
+        loc = page.locator("text=/分鐘前|小時前|剛剛|秒前|min|hour|sec|ago|now/").first
+        if loc.count() > 0:
+            link = loc.locator("xpath=ancestor-or-self::a").first
+            if link.count() > 0:
+                href = link.get_attribute("href")
+                if href:
+                    if href.startswith("/"):
+                        return f"https://mbasic.facebook.com{href}"
+                    return href
+        cand = page.locator("a[href*='/permalink/'], a[href*='story.php']").first
+        if cand.count() > 0:
+            href = cand.get_attribute("href")
+            if href:
+                return href if href.startswith("http") else f"https://mbasic.facebook.com{href}"
+    except Exception:
+        pass
+    return None
+
+
+# 本次 CLI 執行期間產生的截圖相對路徑（{fbid}/{name}），供 result JSON 收集給 RunLog。
+_SESSION_SCREENSHOTS: list[str] = []
+
+
+def collect_screenshots() -> list[str]:
+    """回傳本次執行累積的截圖相對路徑（複本）。"""
+    return list(_SESSION_SCREENSHOTS)
+
+
+def capture_screenshot(page, fbid, step_name=""):
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"{ts}_{step_name}.png" if step_name else f"{ts}.png"
+    d = Path(SCREENSHOT_DIR) / fbid
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / name
+    page.screenshot(path=str(p))
+    _SESSION_SCREENSHOTS.append(f"{fbid}/{name}")  # 相對 SCREENSHOT_DIR，供 logs 頁服務
+    return str(p)
+
+
+def wait_if_verification_needed(check_result, page, fbid) -> bool:
+    """如果偵測到驗證，截圖並等待使用者手動處理。回傳 True 表示需要等待。"""
+    manual_checks = {
+        CheckResult.CAPTCHA: "CAPTCHA 驗證",
+        CheckResult.NEED_2FA: "2FA 雙重驗證",
+        CheckResult.IDENTITY_VERIFY: "身份驗證",
+        CheckResult.BLOCKED: "帳號被暫時封鎖",
+        CheckResult.LOCKED: "帳號被鎖定",
+    }
+    if check_result in manual_checks:
+        label = manual_checks[check_result]
+        capture_screenshot(page, fbid, f"verify_{check_result.value}")
+        print(f"\n{'=' * 60}")
+        print(f"⚠  偵測到驗證：{label}")
+        print(f"   瀏覽器視窗保持開啟，請手動完成驗證。")
+        print(f"   完成後回到此終端機按 Enter 繼續...")
+        print(f"{'=' * 60}")
+        try:
+            input()
+        except (EOFError, KeyboardInterrupt):
+            print("中斷")
+        return True
+    return False

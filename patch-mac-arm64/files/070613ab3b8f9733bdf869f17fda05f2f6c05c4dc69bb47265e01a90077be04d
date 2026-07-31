@@ -1,0 +1,412 @@
+"""FB 登入模組：cookie 優先登入、語言切換、取得 fbid。"""
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+from playwright.sync_api import Page, BrowserContext
+
+from src.config_loader import T
+from src.paths import COOKIES_DIR
+from src.utils import (
+    CheckResult,
+    enhanced_get,
+    enhanced_click,
+    human_sleep,
+    perform_checks,
+    capture_screenshot,
+)
+
+
+@dataclass
+class LoginResult:
+    status: str  # 'ok' | 'bad_credential' | 'need_human' | 'locked' | 'logged_out'
+    fbid: str | None = None
+    message: str = ""
+
+
+def _get_fbid_from_cookies(context: BrowserContext) -> str | None:
+    """從 Playwright context 的 cookies 中取得 c_user（FB numeric ID）。"""
+    cookies = context.cookies()
+    for cookie in cookies:
+        if cookie["name"] == "c_user":
+            return cookie["value"]
+    return None
+
+
+def _save_cookies_to_file(context: BrowserContext, fbid: str):
+    """將當前 context 的 cookies 序列化存到 data/cookies/<fbid>.json。"""
+    cookies = context.cookies()
+    cookie_path = COOKIES_DIR / f"{fbid}.json"
+    with open(cookie_path, "w", encoding="utf-8") as f:
+        json.dump(cookies, f, ensure_ascii=False)
+    print(f"[login] Cookies saved: {cookie_path}")
+
+
+def _load_cookies_from_file(fbid: str) -> list[dict] | None:
+    """從 data/cookies/<fbid>.json 讀取 cookies。"""
+    cookie_path = COOKIES_DIR / f"{fbid}.json"
+    if not cookie_path.exists():
+        return None
+    with open(cookie_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _has_required_cookies(fbid: str) -> bool:
+    """檢查是否有已儲存的 cookies。"""
+    return (COOKIES_DIR / f"{fbid}.json").exists()
+
+
+def _click_continue_if_present(page: Page, rounds: int = 3) -> bool:
+    """FB 登入後常出現「繼續 / Continue / 繼續以 X 身分 / 儲存登入資訊」確認頁，
+    需點掉才能往下（否則後續流程卡住）。最多處理 rounds 個連續確認頁。"""
+    selectors = [
+        "div[aria-label='繼續']",
+        "div[aria-label='Continue']",
+        "div[role='button']:has-text('繼續')",
+        "div[role='button']:has-text('Continue')",
+        "[aria-label='儲存']",
+        "[aria-label='Save']",
+    ]
+    clicked_any = False
+    for _ in range(rounds):
+        clicked = False
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() > 0 and loc.is_visible():
+                    loc.click(timeout=3000)
+                    print(f"[login] 點掉確認頁按鈕: {sel}")
+                    human_sleep(1.5, 2.5)
+                    clicked = True
+                    clicked_any = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            break
+    return clicked_any
+
+
+def _try_cookie_login(page: Page, context: BrowserContext, fbid: str) -> bool:
+    """嘗試用已儲存的 cookie 登入。回傳是否成功。"""
+    cookies = _load_cookies_from_file(fbid)
+    if not cookies:
+        return False
+
+    context.add_cookies(cookies)
+    # 用 domcontentloaded 而非 networkidle：FB 主頁有持續背景請求，networkidle 會一直 timeout
+    try:
+        page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=20000)
+    except Exception:
+        return False
+    human_sleep(1, 2)
+
+    # 點掉「繼續／確認」頁（否則會停在確認頁導致後續卡住）
+    _click_continue_if_present(page)
+
+    # 驗證：如果頁面沒有登入提示（密碼欄位），表示已登入
+    body_text = page.locator("body").inner_text()
+    if "登入" in body_text and "密碼" in body_text:
+        return False
+
+    # 檢查 c_user cookie 是否存在
+    current_fbid = _get_fbid_from_cookies(context)
+    if current_fbid:
+        print(f"[login] Cookie login successful — fbid: {current_fbid}")
+        return True
+
+    return False
+
+
+def _disable_popup_messages(page: Page):
+    """關掉通知、新功能導覽等可能干擾自動化的彈窗。"""
+    # 常見的彈窗關閉方式
+    close_selectors = [
+        "text=稍後再說",
+        "text=Not Now",
+        "[aria-label='關閉']",
+        "[aria-label='Close']",
+    ]
+    for sel in close_selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                loc.click(timeout=3000)
+                human_sleep(0.5, 1)
+        except Exception:
+            pass
+
+
+def login_facebook(
+    page: Page,
+    context: BrowserContext,
+    email_or_phone: str,
+    password: str,
+) -> LoginResult:
+    """
+    FB 登入主函式。
+    Args:
+        page: Playwright Page 物件
+        context: Playwright BrowserContext 物件（用於 cookie 操作）
+        email_or_phone: 登入用的 email 或手機號碼
+        password: 密碼
+    Returns:
+        LoginResult(status='ok', fbid='...') 如果成功
+    """
+
+    # Step 1: 嘗試 cookie 登入（需要先有 fbid）
+    # 嘗試從 cookies/ 目錄找已有的 cookie 檔案
+    existing_fbids = []
+    for f in Path(COOKIES_DIR).glob("*.json"):
+        existing_fbids.append(f.stem)
+
+    for fbid_guess in existing_fbids:
+        if _try_cookie_login(page, context, fbid_guess):
+            current_fbid = _get_fbid_from_cookies(context)
+            if current_fbid:
+                # cookie 登入成功，跳過密碼流程
+                _disable_popup_messages(page)
+                return LoginResult(status="ok", fbid=current_fbid)
+
+    # Step 2: cookie 無效或不存在 → 用帳密登入
+    print(f"[login] Attempting password login: {email_or_phone}")
+
+    # FB 登入頁有多種可能 URL，逐一嘗試
+    login_urls = [
+        "https://www.facebook.com/login/",
+        "https://www.facebook.com/",
+        "https://mbasic.facebook.com/login/",
+    ]
+    reached = False
+    for url in login_urls:
+        if enhanced_get(page, url, retries=1):
+            human_sleep(3, 5)
+            # 確認頁面上有類似登入表單的內容
+            body = page.locator("body").inner_text()
+            if "電子郵件" in body or "email" in body.lower() or "密碼" in body or "password" in body.lower() or "登入" in body:
+                print(f"[login] 成功載入登入頁: {url}")
+                reached = True
+                break
+            else:
+                print(f"[login] {url} 似乎不是登入頁（body 前100字: {body[:100]}），嘗試下一個...")
+
+    if not reached:
+        return LoginResult(status="logged_out", message="Cannot reach login page")
+
+    # ── 處理「選擇帳號」頁面 ─────────────────────────
+    # FB 有時會顯示「以 xxx 身分繼續」而非登入表單，需先點「使用其他個人檔案」
+    body = page.locator("body").inner_text()
+    switch_keywords = [
+        "使用其他個人檔案",
+        "使用其他帳號",
+        "切換帳號",
+        "登入其他帳號",
+        "Switch account",
+        "Log into another account",
+    ]
+
+    # 先檢查是否有 password 欄位可直接輸入
+    has_pass_input = page.locator("input[type='password']").first
+    has_email_input = page.locator("input[name='email'], input#email, input[autocomplete='username']").first
+
+    if (has_pass_input.count() == 0 or has_email_input.count() == 0):
+        # 可能在「選擇帳號」頁面 — 找「登入其他帳號」按鈕
+        for kw in switch_keywords:
+            try:
+                label = kw if isinstance(kw, str) else kw[0] if isinstance(kw, list) else ""
+                btn = page.locator(f"text={label}").first
+                if btn.count() > 0 and btn.is_visible():
+                    print(f"[login] 偵測到「選擇帳號」頁面，點擊「{label}」...")
+                    btn.click()
+                    human_sleep(3, 5)
+                    break
+            except Exception:
+                continue
+
+        # 再檢查一次，還是沒輸入框 → 嘗試其他方式
+        has_pass_input = page.locator("input[type='password']").first
+        if has_pass_input.count() == 0:
+            # 試著用「切換為…」或找「新增帳號」連結
+            more_btns = page.locator("text=新增帳號, text=Add account, text=Not you").first
+            if more_btns.count() > 0:
+                try:
+                    more_btns.click()
+                    human_sleep(2, 4)
+                except Exception:
+                    pass
+
+    # 除錯：截圖跟印出所有 input
+    capture_screenshot(page, "unknown", "login_page")
+    _debug_inputs = page.locator("input:not([type='hidden']):not([type='submit']):not([type='button'])")
+    print(f"[login] 頁面上找到 {_debug_inputs.count()} 個輸入框:")
+    for di in range(min(_debug_inputs.count(), 5)):
+        try:
+            _inp = _debug_inputs.nth(di)
+            _tp = _inp.get_attribute("type") or ""
+            _nm = _inp.get_attribute("name") or ""
+            _ph = _inp.get_attribute("placeholder") or ""
+            _ar = _inp.get_attribute("aria-label") or ""
+            print(f"[login]   input[{di}]: type={_tp} name={_nm} placeholder={_ph[:30]} aria={_ar[:30]}")
+        except Exception:
+            pass
+
+    # 填寫 email — 多種選擇器策略
+    email_sel_candidates = [
+        "input[name='email']",
+        "input#email",
+        "input[type='text'][aria-label*='電子郵件' i]",
+        "input[aria-label*='電子郵件' i]",
+        "input[aria-label*='email' i]",
+        "input[placeholder*='電子郵件' i]",
+        "input[placeholder*='email' i]",
+        "input[autocomplete='username']",
+        "input[data-testid='royal_email']",
+        "#email",
+    ]
+    email_input = None
+    for sel in email_sel_candidates:
+        loc = page.locator(sel).first
+        if loc.count() > 0:
+            try:
+                if loc.is_visible():
+                    email_input = loc
+                    break
+            except Exception:
+                continue
+
+    if email_input is None:
+        # 最終備案：上面已印過所有 input 的 debug 資訊
+        capture_screenshot(page, "unknown", "no_email_input")
+        return LoginResult(status="logged_out", message="Cannot find email input")
+
+    email_input.fill(email_or_phone)
+    human_sleep(1, 2)
+
+    # ── FB 分兩步：輸入 email 後可能要按「下一步」 ──
+    next_keywords = ["下一步", "繼續", "Next", "Continue"]
+    for nk in next_keywords:
+        next_btn = page.locator(f"button:has-text('{nk}'), div[role='button']:has-text('{nk}')").first
+        if next_btn.count() > 0:
+            try:
+                if next_btn.is_visible():
+                    print(f"[login] 偵測到兩步登入，點擊「{nk}」...")
+                    next_btn.click()
+                    human_sleep(3, 5)
+                    break
+            except Exception:
+                continue
+
+    # 填寫 password — 多種選擇器策略
+    pass_sel_candidates = [
+        "input[name='pass']",
+        "input#pass",
+        "input[type='password']",
+        "input[aria-label*='密碼' i]",
+        "input[aria-label*='password' i]",
+        "input[placeholder*='密碼' i]",
+        "input[placeholder*='password' i]",
+        "input[autocomplete='current-password']",
+        "#pass",
+    ]
+    pass_input = None
+    for sel in pass_sel_candidates:
+        loc = page.locator(sel).first
+        if loc.count() > 0:
+            try:
+                if loc.is_visible():
+                    pass_input = loc
+                    break
+            except Exception:
+                continue
+
+    if pass_input is None:
+        capture_screenshot(page, "unknown", "no_pass_input")
+        return LoginResult(status="logged_out", message="Cannot find password input")
+
+    pass_input.fill(password)
+    human_sleep(1, 2)
+
+    # ── 送出登入表單 ─────────────────────────────────
+    # 策略 1：先點密碼欄位確保焦點正確 → 按 Enter（最自然）
+    pass_input.click()
+    human_sleep(0.3, 0.6)
+    print(f"[login] 按 Enter 送出登入表單...")
+    page.keyboard.press("Enter")
+    human_sleep(3, 6)
+
+    # 策略 2：檢查是否還在登入頁，補點按鈕
+    current_body = page.locator("body").inner_text()
+    still_has_login = "密碼" in current_body or "password" in current_body.lower()
+    if still_has_login:
+        print(f"[login] Enter 後仍在登入頁，嘗試點擊登入按鈕...")
+        login_btn_candidates = [
+            "div[role='button']:has-text('登入')",
+            "button:has-text('登入')",
+            "div[role='button']:has-text('Log in')",
+            "button:has-text('Log in')",
+            "button[name='login']",
+            "input[value='登入']",
+            "button[type='submit']",
+            "#loginbutton",
+        ]
+        for sel in login_btn_candidates:
+            if enhanced_click(page, sel):
+                print(f"[login] 登入按鈕點擊成功: {sel}")
+                human_sleep(2, 4)
+                break
+        else:
+            # 策略 3：全都失敗 → Tab + Enter
+            print(f"[login] 按鈕點擊全失敗，嘗試 Tab + Enter...")
+            page.keyboard.press("Tab")
+            human_sleep(0.3, 0.5)
+            page.keyboard.press("Enter")
+            human_sleep(2, 4)
+
+    # 等待登入結果
+    human_sleep(3, 6)
+
+    # Step 3: 檢查登入後的狀態
+    check = perform_checks(page, "unknown")
+
+    if check == CheckResult.LOCKED:
+        capture_screenshot(page, "unknown", "account_locked")
+        return LoginResult(status="locked", message="Account is locked")
+
+    if check == CheckResult.NEED_2FA:
+        capture_screenshot(page, "unknown", "need_2fa")
+        return LoginResult(status="need_human", message="2FA required — screenshot saved")
+
+    if check == CheckResult.CAPTCHA:
+        capture_screenshot(page, "unknown", "captcha")
+        return LoginResult(status="need_human", message="Captcha required — screenshot saved")
+
+    # 檢查帳密錯誤
+    body_text = page.locator("body").inner_text()
+    for key in ("incorrect_account", "incorrect_password"):
+        try:
+            vals = T(key)
+            if isinstance(vals, str):
+                vals = [vals]
+            for v in vals:
+                if v in body_text:
+                    return LoginResult(status="bad_credential", message=v)
+        except KeyError:
+            pass
+
+    # Step 4: 取得 fbid
+    fbid = _get_fbid_from_cookies(context)
+    if not fbid:
+        # 登入成功必有 c_user cookie；走到這裡幾乎必是 perform_checks 沒認出的驗證變體。
+        # 絕不能在此導航（會毀掉使用者驗證到一半的頁面），交回人工等待。
+        capture_screenshot(page, "unknown", "login_unrecognized")
+        return LoginResult(status="need_human", message="疑似驗證頁（未分類）— 請在瀏覽器完成驗證")
+
+    print(f"[login] Login successful — fbid: {fbid}")
+
+    # Step 5: 關閉彈窗干擾
+    _disable_popup_messages(page)
+
+    # Step 6: 儲存 cookie 供下次使用
+    _save_cookies_to_file(context, fbid)
+
+    return LoginResult(status="ok", fbid=fbid)
