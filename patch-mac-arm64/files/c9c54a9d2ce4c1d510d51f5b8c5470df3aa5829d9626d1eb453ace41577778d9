@@ -1,0 +1,192 @@
+"""舊便攜包 → 新包的一次性資料遷移（僅限 MOYU_MIGRATE_FROM 手動指定）。
+
+最不能出錯的三件事：
+  1. 沒有指定來源時**絕不能自己去搬**——自動搜尋已於 2026-08-01 停用：
+     機器上留有多份解壓資料夾時，新包會無聲吸進「別份」的帳號與 cookie。
+  2. 有指定時，該搬的四處都要到（DB／上傳圖、cookie、截圖存證、Chrome 個人檔案）。
+  3. 絕不能覆蓋新資料。客戶已經在新版建過東西還被舊資料蓋掉，那是不可逆的。
+
+執行：cd backend && python3 -m pytest tests/test_data_migration.py -v
+"""
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import app.data_migration as dm
+
+
+def make_old_pkg(root: Path, name: str = "moyu-1.0.3-win64") -> Path:
+    """做一個像樣的舊便攜包：四處資料都有東西。"""
+    pkg = root / name
+    files = {
+        "backend/data/fb_poster.db": b"SQLite format 3\x00fake",
+        "backend/data/.license_key": b"LIC-OLD-123",
+        "backend/data/uploads/group_post/a.jpg": b"jpeg",
+        "backend/data/logs/run.log": b"should not be copied",
+        "backend/data/__pycache__/x.pyc": b"junk",
+        "FB_Auto/data/cookies/acc1.json": b"{\"cookie\": 1}",
+        "FB_Auto/data/served_config.json": b"{}",
+        "FB_Auto/screenshot/post1.png": b"png",
+        "FB_Auto/user_data/acc1/Default/Cookies": b"chrome-profile",
+        "FB_Auto/user_data/acc1/Default/Cache/data_0": b"x" * 100,        # 瀏覽器自己會重建
+        "FB_Auto/user_data/acc1/Default/Code Cache/js/1": b"x" * 100,
+    }
+    for rel, content in files.items():
+        p = pkg / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content)
+    return pkg
+
+
+@pytest.fixture
+def installed(tmp_path, monkeypatch):
+    """假裝是安裝版：資料根在別的地方，且還沒有任何資料。"""
+    root = tmp_path / "localappdata/moyu"
+    (root / "backend").mkdir(parents=True)
+    monkeypatch.setattr(dm, "DATA_ROOT", root)
+    monkeypatch.setattr(dm, "DATA_DIR", root / "backend")
+    monkeypatch.delenv("MOYU_MIGRATE_FROM", raising=False)
+    return root, tmp_path
+
+
+def use_source(monkeypatch, pkg: Path) -> None:
+    monkeypatch.setenv("MOYU_MIGRATE_FROM", str(pkg))
+
+
+def test_no_env_means_no_migration(installed, monkeypatch):
+    """核心保證：沒指定來源就什麼都不搬——旁邊擺著一個舊包也一樣。"""
+    root, tmp = installed
+    make_old_pkg(tmp / "Desktop")
+
+    r = dm.migrate_if_needed()
+
+    assert r["status"] == "disabled"
+    assert not (root / "backend/fb_poster.db").exists()
+    assert not (root / "fb_auto/data/cookies/acc1.json").exists()
+    assert not (root / "backend/.migration.json").exists()      # 也不該留狀態檔
+
+
+def test_migrates_all_four_locations(installed, monkeypatch):
+    root, tmp = installed
+    use_source(monkeypatch, make_old_pkg(tmp / "Desktop"))
+
+    r = dm.migrate_if_needed()
+
+    assert r["status"] == "migrated", r
+    assert (root / "backend/fb_poster.db").read_bytes().startswith(b"SQLite")
+    assert (root / "backend/.license_key").read_bytes() == b"LIC-OLD-123"
+    assert (root / "backend/uploads/group_post/a.jpg").is_file()
+    assert (root / "fb_auto/data/cookies/acc1.json").is_file()      # 不搬就要重登每個帳號
+    assert (root / "fb_auto/screenshot/post1.png").is_file()
+    assert (root / "fb_auto/user_data/acc1/Default/Cookies").is_file()
+    assert not r["errors"]
+
+
+def test_skips_logs_and_pycache(installed, monkeypatch):
+    root, tmp = installed
+    use_source(monkeypatch, make_old_pkg(tmp / "Desktop"))
+
+    dm.migrate_if_needed()
+
+    assert not (root / "backend/logs/run.log").exists()
+    assert not (root / "backend/__pycache__/x.pyc").exists()
+
+
+def test_old_package_left_intact(installed, monkeypatch):
+    """搬 = 複製，不是移動。客戶想反悔要回得去。"""
+    root, tmp = installed
+    old = make_old_pkg(tmp / "Desktop")
+    use_source(monkeypatch, old)
+
+    dm.migrate_if_needed()
+
+    assert (old / "backend/data/fb_poster.db").is_file()
+    assert (old / "FB_Auto/data/cookies/acc1.json").is_file()
+
+
+def test_never_overwrites_existing_data(installed, monkeypatch):
+    """已經有資料就整個跳過——這是最不可逆的失誤。指定了來源也一樣。"""
+    root, tmp = installed
+    use_source(monkeypatch, make_old_pkg(tmp / "Desktop"))
+    (root / "backend/fb_poster.db").write_bytes(b"NEW DATA")
+
+    r = dm.migrate_if_needed()
+
+    assert r["status"] == "skipped"
+    assert (root / "backend/fb_poster.db").read_bytes() == b"NEW DATA"
+    assert not (root / "fb_auto/data/cookies/acc1.json").exists()
+
+
+def test_skips_chrome_cache(installed, monkeypatch):
+    """Chrome 快取佔了 profile 大半體積又會自己重建，搬它只會拖慢第一次啟動。"""
+    root, tmp = installed
+    use_source(monkeypatch, make_old_pkg(tmp / "Desktop"))
+
+    dm.migrate_if_needed()
+
+    assert (root / "fb_auto/user_data/acc1/Default/Cookies").is_file()   # 登入狀態要在
+    assert not (root / "fb_auto/user_data/acc1/Default/Cache/data_0").exists()
+    assert not (root / "fb_auto/user_data/acc1/Default/Code Cache/js/1").exists()
+
+
+def test_portable_copies_into_package_layout(tmp_path, monkeypatch):
+    """便攜包（沒有 MOYU_DATA_ROOT）：資料要落在新包自己的目錄結構裡。"""
+    pkg = tmp_path / "解壓區/moyu-1.0.11-mac-arm64"
+    (pkg / "backend/data").mkdir(parents=True)
+    monkeypatch.setattr(dm, "DATA_ROOT", None)
+    monkeypatch.setattr(dm, "DATA_DIR", pkg / "backend/data")
+    monkeypatch.setattr(dm, "PKG_ROOT", pkg)
+    old = make_old_pkg(pkg.parent, "moyu-1.0.3-mac-arm64")
+    use_source(monkeypatch, old)
+
+    r = dm.migrate_if_needed()
+
+    assert r["status"] == "migrated", r
+    assert r["source"] == str(old)
+    assert (pkg / "backend/data/fb_poster.db").is_file()
+    assert (pkg / "backend/data/.license_key").read_bytes() == b"LIC-OLD-123"
+    assert (pkg / "FB_Auto/data/cookies/acc1.json").is_file()
+    assert (pkg / "FB_Auto/user_data/acc1/Default/Cookies").is_file()
+
+
+def test_env_pointing_at_non_package(installed, monkeypatch, tmp_path):
+    """指到一個不含舊資料的資料夾 → 回報 not_found，不要瞎搬。"""
+    monkeypatch.setenv("MOYU_MIGRATE_FROM", str(tmp_path / "nothing_here"))
+    r = dm.migrate_if_needed()
+    assert r["status"] == "not_found"
+    assert not (installed[0] / "backend/fb_poster.db").exists()
+
+
+def test_state_file_written_for_dashboard(installed, monkeypatch):
+    root, tmp = installed
+    use_source(monkeypatch, make_old_pkg(tmp / "Desktop"))
+
+    dm.migrate_if_needed()
+    state = json.loads((root / "backend/.migration.json").read_text(encoding="utf-8"))
+
+    assert state["status"] == "migrated"
+    assert state["files"] > 0
+    assert dm.read_state()["source"] == state["source"]
+
+
+def test_unreadable_file_does_not_abort_everything(installed, monkeypatch):
+    """一個檔案複製失敗（被鎖／權限）不該讓其他資料也搬不過來。"""
+    root, tmp = installed
+    use_source(monkeypatch, make_old_pkg(tmp / "Desktop"))
+    real_copy = dm.shutil.copy2
+
+    def flaky(src, dst, *a, **kw):
+        if str(src).endswith("acc1.json"):
+            raise OSError("被鎖住了")
+        return real_copy(src, dst, *a, **kw)
+
+    monkeypatch.setattr(dm.shutil, "copy2", flaky)
+    r = dm.migrate_if_needed()
+
+    assert r["status"] == "migrated"
+    assert r["errors"] and "acc1.json" in r["errors"][0]
+    assert (root / "backend/fb_poster.db").is_file()        # 其他的照樣搬到
