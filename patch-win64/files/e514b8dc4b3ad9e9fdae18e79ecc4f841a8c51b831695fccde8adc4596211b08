@@ -1,0 +1,67 @@
+"""P16：FB 保護機制偵測（關鍵字 → needs_manual）+ 全域暫停狀態流轉。
+
+執行：cd backend && python3 -m pytest tests/test_protection_detect.py -v
+"""
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.fbauto_bridge import _detect_manual_action
+
+
+@pytest.mark.parametrize("line,expect_kw", [
+    ("[ERROR] CHECKPOINT detected, please verify", "CHECKPOINT"),
+    ("FB 說：發文太頻繁，請稍後再試", "發文太頻繁"),
+    ("your account is temporarily blocked", "temporarily blocked"),
+    ("Action Blocked: you're going too fast", "action blocked"),   # 大小寫不敏感
+    ("需要 captcha 驗證", "captcha"),
+    ("此帳號受限（帳號受限）", "帳號受限"),
+    ("你目前無法使用這項功能", "你目前無法使用這項功能"),
+])
+def test_detects_protection_signals(line, expect_kw):
+    hit, reason = _detect_manual_action(line)
+    assert hit is True
+    assert reason == expect_kw
+
+
+@pytest.mark.parametrize("line", [
+    "上架成功 item_url=https://fb.com/marketplace/item/123",
+    "[INFO] 已張貼到 5 個社團",
+    "",
+    "blocked driveway near the park",   # 內容像但非訊號字串（不含完整關鍵字組）—— 仍會誤中 'blocked'? 不會：關鍵字是完整片語
+])
+def test_normal_output_not_flagged(line):
+    hit, _ = _detect_manual_action(line)
+    assert hit is False
+
+
+def test_pause_state_roundtrip(tmp_path):
+    """set_system_pause_sync → get_system_state_sync 流轉：暫停帶原因、恢復即清空。"""
+    import app.database as db
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    db.sync_engine = create_engine(f"sqlite:///{tmp_path/'p.db'}")
+    db.SyncSession = sessionmaker(db.sync_engine)
+    db.Base.metadata.create_all(db.sync_engine)
+
+    from app.database import get_system_state_sync, set_system_pause_sync
+
+    st = get_system_state_sync()
+    assert st["paused"] is False                     # 初始未暫停
+
+    set_system_pause_sync(True, "fb_protection", "偵測到 CHECKPOINT")
+    st = get_system_state_sync()
+    assert st["paused"] is True
+    assert st["pause_reason"] == "fb_protection"
+    assert "CHECKPOINT" in st["pause_detail"]
+    assert st["paused_at"]                           # 有時間戳
+
+    set_system_pause_sync(False)                     # 恢復 → 原因/時間清空
+    st = get_system_state_sync()
+    assert st["paused"] is False
+    assert st["pause_reason"] == "" and st["pause_detail"] == ""
+    assert st["paused_at"] is None

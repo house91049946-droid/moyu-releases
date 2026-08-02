@@ -1,0 +1,101 @@
+"""P11：_result_from_raw（envelope v2 / 舊格式 fallback）與 MP group_id 正規化。
+
+執行：cd backend && python3 -m pytest tests/ -v
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.fbauto_bridge import _result_from_raw
+from app.api.accounts import _normalize_mp_ids, _unresolved_names
+
+
+# ── _result_from_raw ──────────────────────────────────────
+
+def test_v2_envelope():
+    raw = {
+        "schema": 2,
+        "success": True,
+        "fbid": "111",
+        "error": "",
+        "data": {
+            "results": [{"group_url": "g", "status": "成功", "permalink": "p", "error": ""}],
+            "item_url": "https://fb.com/item/1",
+            "status": "成功",
+        },
+    }
+    r = _result_from_raw(raw)
+    assert r.success is True
+    assert r.fbid == "111"
+    assert r.results[0]["permalink"] == "p"
+    assert r.item_url == "https://fb.com/item/1"
+    assert r.data["status"] == "成功"
+
+
+def test_v2_groups_and_total():
+    raw = {
+        "schema": 2, "success": True, "fbid": "111", "error": "",
+        "data": {"groups": [{"name": "A", "url": "u", "group_id": "1"}], "total_groups": 1},
+    }
+    r = _result_from_raw(raw)
+    assert r.groups[0]["group_id"] == "1"
+    assert r.total_groups == 1
+
+
+def test_v2_mp_groups_mapped_to_groups():
+    raw = {
+        "schema": 2, "success": True, "fbid": "111", "error": "",
+        "data": {"mp_groups": [{"name": "A", "url": "", "group_id": ""}]},
+    }
+    r = _result_from_raw(raw)
+    assert r.groups == [{"name": "A", "url": "", "group_id": ""}]
+    assert r.total_groups == 1
+
+
+def test_legacy_flat_format_no_longer_supported():
+    """舊格式相容層已依 P14 承諾移除：頂層任務欄位不再被撈取（頂層只認 success/fbid/error）。"""
+    raw = {
+        "success": True, "fbid": "222", "error": "",
+        "results": [{"deleted_count": 3}],
+        "groups": [{"name": "B", "url": "u2"}],
+        "total_groups": 1,
+    }
+    r = _result_from_raw(raw)
+    assert r.success is True and r.fbid == "222"    # 頂層共通欄位照常
+    assert r.results == [] and r.groups == []       # 任務欄位只認 data 區塊
+    assert r.total_groups == 0
+
+
+def test_empty_and_failure():
+    r = _result_from_raw({"schema": 2, "success": False, "fbid": "", "error": "boom", "data": {}})
+    assert r.success is False
+    assert r.error == "boom"
+    assert r.results == []
+    assert r.groups == []
+    assert r.total_groups == 0
+
+
+# ── MP group_id 正規化 ────────────────────────────────────
+
+def test_normalize_mp_ids_mixed():
+    entries = [
+        {"name": "A", "url": "https://mbasic.facebook.com/groups/111/", "group_id": "111"},
+        {"name": "B", "url": "https://www.facebook.com/groups/222/", "group_id": ""},  # 從 url 補
+        {"name": "C", "url": "", "group_id": ""},                                       # 解析不到
+        "https://mbasic.facebook.com/groups/333/",                                       # 舊格式 URL
+        "444",                                                                            # 純數字 id
+        "純名稱社團",                                                                      # 舊格式名稱
+    ]
+    assert _normalize_mp_ids(entries) == {"111", "222", "333", "444"}
+
+
+def test_unresolved_names_only_idless():
+    entries = [
+        {"name": "A", "url": "https://mbasic.facebook.com/groups/111/", "group_id": "111"},
+        {"name": "C", "url": "", "group_id": ""},
+        "純名稱社團",
+        "https://mbasic.facebook.com/groups/333/",
+    ]
+    # 只有解析不出 id 的條目才允許名稱 fallback；A（有 id）與 URL 不在其中
+    assert _unresolved_names(entries) == {"C", "純名稱社團"}

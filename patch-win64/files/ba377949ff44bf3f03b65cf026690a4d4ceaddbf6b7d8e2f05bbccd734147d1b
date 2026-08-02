@@ -1,0 +1,107 @@
+"""P12：長時操作任務三態 + kill_job 登記/移除。
+
+執行：cd backend && python3 -m pytest tests/test_bridge_jobs.py -v
+"""
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app import fbauto_bridge
+from app.fbauto_bridge import (
+    _BRIDGE_JOBS, _RUNNING, BridgeJob, poll_long_op, kill_job, _register,
+)
+
+
+class StubProc:
+    def __init__(self, returncode=None, pid=999999):
+        self.returncode = returncode
+        self.pid = pid
+
+    def poll(self):
+        return self.returncode
+
+
+@pytest.fixture(autouse=True)
+def clean():
+    _BRIDGE_JOBS.clear()
+    _RUNNING.clear()
+    yield
+    _BRIDGE_JOBS.clear()
+    _RUNNING.clear()
+
+
+def _seed_job(job_id, proc, result_data):
+    fd, result_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    if result_data is not None:
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(result_data, f)
+    else:
+        os.unlink(result_path)
+    _BRIDGE_JOBS[job_id] = BridgeJob(
+        job_id=job_id, op="nurture", proc=proc, result_path=result_path,
+        started_at=time.time(), account_id=1, fbid="111",
+    )
+    _register(job_id, proc)
+
+
+def test_poll_none():
+    assert poll_long_op("nope") == {"state": "none"}
+
+
+def test_poll_pending():
+    _seed_job("j1", StubProc(returncode=None), {"schema": 2, "success": True, "fbid": "1", "data": {}})
+    out = poll_long_op("j1")
+    assert out["state"] == "pending"
+    assert "j1" in _BRIDGE_JOBS  # 未結束不移除
+
+
+def test_poll_success_and_cleanup():
+    _seed_job("j2", StubProc(returncode=0), {
+        "schema": 2, "success": True, "fbid": "111", "error": "",
+        "data": {"actions_performed": 7},
+    })
+    out = poll_long_op("j2")
+    assert out["state"] == "success"
+    assert out["result"].data["actions_performed"] == 7
+    assert "j2" not in _BRIDGE_JOBS
+    assert "j2" not in _RUNNING  # 結束後解除登記
+    assert poll_long_op("j2") == {"state": "none"}  # 冪等
+
+
+def test_poll_failed():
+    _seed_job("j3", StubProc(returncode=1), {
+        "schema": 2, "success": False, "fbid": "111", "error": "boom", "data": {},
+    })
+    out = poll_long_op("j3")
+    assert out["state"] == "failed"
+    assert out["result"].error == "boom"
+
+
+def test_poll_missing_result_json():
+    _seed_job("j4", StubProc(returncode=2), None)
+    out = poll_long_op("j4")
+    assert out["state"] == "failed"
+    assert "exited 2" in out["result"].error
+
+
+def test_kill_job_unregisters(monkeypatch):
+    # P19 後 kill 統一走 kill_tree（psutil 優先）；mock kill_tree 本身，
+    # 不能只 mock os.killpg 退路——psutil 路徑會真的殺系統上同 PID 的無辜進程。
+    killed = {}
+    monkeypatch.setattr(fbauto_bridge, "kill_tree",
+                        lambda proc, *a, **k: killed.setdefault("pid", proc.pid))
+
+    _register("k1", StubProc(pid=4242))
+    assert kill_job("k1") is True
+    assert killed["pid"] == 4242
+    assert "k1" not in _RUNNING
+    # 再 kill 不存在的 → False
+    assert kill_job("k1") is False

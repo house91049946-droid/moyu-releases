@@ -1,0 +1,172 @@
+"""P10 onboarding 閉環：poll_first_login 三態 + start_first_login 防重 + _import_groups 邏輯。
+
+執行：cd backend && python3 -m pytest tests/test_first_login.py -v
+"""
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app import fbauto_bridge
+from app.fbauto_bridge import LoginJob, _LOGIN_JOBS, poll_first_login, start_first_login
+
+
+class StubProc:
+    """模擬 subprocess.Popen 物件。"""
+    def __init__(self, returncode=None):
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+
+def _make_job(account_id: int, proc: StubProc, result_data: dict | None, log_text: str = "") -> LoginJob:
+    fd, result_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    if result_data is not None:
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(result_data, f)
+    else:
+        os.unlink(result_path)  # 模擬 result JSON 未寫出
+
+    fd, log_path = tempfile.mkstemp(suffix=".log")
+    os.close(fd)
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(log_text)
+
+    job = LoginJob(
+        account_id=account_id,
+        proc=proc,
+        result_path=result_path,
+        log_path=log_path,
+        started_at=time.time(),
+    )
+    _LOGIN_JOBS[account_id] = job
+    return job
+
+
+@pytest.fixture(autouse=True)
+def clean_jobs():
+    _LOGIN_JOBS.clear()
+    yield
+    _LOGIN_JOBS.clear()
+
+
+def test_poll_none():
+    assert poll_first_login(1) == {"state": "none"}
+
+
+def test_poll_pending():
+    _make_job(1, StubProc(returncode=None), None)
+    # result_path 已被刪，但 pending 不會去讀
+    _LOGIN_JOBS[1].result_path = "/nonexistent"
+    out = poll_first_login(1)
+    assert out["state"] == "pending"
+    assert "elapsed_sec" in out
+    assert 1 in _LOGIN_JOBS  # pending 不移除工作
+
+
+def test_poll_success_and_cleanup():
+    """envelope v2 result 檔。"""
+    job = _make_job(1, StubProc(returncode=0), {
+        "schema": 2,
+        "success": True,
+        "fbid": "1133957806",
+        "error": "",
+        "data": {
+            "groups": [{"name": "社團A", "url": "https://mbasic.facebook.com/groups/123/",
+                        "group_id": "123", "can_marketplace": True}],
+            "mp_group_ids": ["123"],
+        },
+    })
+    out = poll_first_login(1)
+    assert out["state"] == "success"
+    assert out["fbid"] == "1133957806"
+    assert len(out["groups"]) == 1
+    assert out["mp_group_ids"] == ["123"]
+    assert 1 not in _LOGIN_JOBS          # 工作已回收
+    assert not os.path.exists(job.result_path)  # result 檔已清理
+
+    # 回收後再問 → none（冪等交由 API 層以 DB 狀態回答）
+    assert poll_first_login(1) == {"state": "none"}
+
+
+def test_poll_success_legacy_format():
+    """舊格式 result 檔（無 schema 鍵、mp_groups 是 URL 清單）→ fallback 讀取。"""
+    _make_job(1, StubProc(returncode=0), {
+        "success": True,
+        "fbid": "1133957806",
+        "groups": [{"name": "社團A", "url": "https://mbasic.facebook.com/groups/123/", "can_marketplace": True}],
+        "mp_groups": ["https://mbasic.facebook.com/groups/123/"],
+    })
+    out = poll_first_login(1)
+    assert out["state"] == "success"
+    assert out["mp_group_ids"] == ["https://mbasic.facebook.com/groups/123/"]  # 呼叫端正規化成 id
+
+
+def test_poll_failed_with_error():
+    _make_job(1, StubProc(returncode=1), {"success": False, "fbid": "", "error": "登入失敗: wrong_password"})
+    out = poll_first_login(1)
+    assert out["state"] == "failed"
+    assert "wrong_password" in out["error"]
+
+
+def test_poll_failed_no_result_json_falls_back_to_log():
+    _make_job(1, StubProc(returncode=1), None, log_text="Traceback: boom")
+    out = poll_first_login(1)
+    assert out["state"] == "failed"
+    assert "boom" in out["error"]
+
+
+def test_start_rejects_duplicate(monkeypatch):
+    spawned = []
+
+    def fake_popen(args, **kwargs):
+        spawned.append(args)
+        return StubProc(returncode=None)
+
+    monkeypatch.setattr(fbauto_bridge.subprocess, "Popen", fake_popen)
+
+    start_first_login(1, "a@b.c", "pw")
+    assert len(spawned) == 1
+    with pytest.raises(RuntimeError):
+        start_first_login(1, "a@b.c", "pw")
+
+    # 前一個工作結束後可再啟動
+    _LOGIN_JOBS[1].proc.returncode = 0
+    start_first_login(1, "a@b.c", "pw")
+    assert len(spawned) == 2
+
+
+def test_import_groups_can_post_marking():
+    from app.api.accounts import _import_groups
+
+    rows = _import_groups(7, [
+        {"name": "A", "url": "https://mbasic.facebook.com/groups/111/", "group_id": "111", "can_marketplace": True},
+        {"name": "B", "url": "https://mbasic.facebook.com/groups/222/", "can_marketplace": None},  # id 從 url 補
+        {"name": "C", "url": "https://mbasic.facebook.com/groups/333/", "can_marketplace": None},
+    ], mp_group_ids=["222"])
+
+    by_name = {r.group_name: r for r in rows}
+    assert by_name["A"].can_post is True          # can_marketplace 直標
+    assert by_name["B"].can_post is True          # group_id 命中
+    assert by_name["C"].can_post is False
+    assert by_name["A"].group_id == "111"
+    assert by_name["B"].group_id == "222"
+    assert all(r.account_id == 7 for r in rows)
+
+
+def test_import_groups_legacy_mp_urls():
+    """舊格式 mp 清單（URL 字串）也能正規化為 id 後命中。"""
+    from app.api.accounts import _import_groups
+
+    rows = _import_groups(7, [
+        {"name": "B", "url": "https://mbasic.facebook.com/groups/222/"},
+    ], mp_group_ids=["https://mbasic.facebook.com/groups/222/"])
+    assert rows[0].can_post is True

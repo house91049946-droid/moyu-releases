@@ -1,0 +1,221 @@
+"""CLI — 檢測哪些已加入的社團可以轉發 Marketplace 商品。
+
+利用 Marketplace 上架流程的「對象頁」來抓取 Facebook 列出的可轉發社團清單，
+與已同步的社團比對，輸出可轉發的社團名稱列表。
+"""
+import argparse
+import atexit
+import json
+import sys
+from pathlib import Path
+
+from src.utils import launch_browser, capture_screenshot
+from src.login import _try_cookie_login
+from src.marketplacePost import get_audience_groups
+
+_JSON_PATH: str | None = None
+_RESULT: dict | None = None
+
+
+def _write_result_json():
+    if _JSON_PATH and _RESULT is not None:
+        try:
+            with open(_JSON_PATH, "w", encoding="utf-8") as f:
+                try:
+                    from src.utils import collect_screenshots
+                    _RESULT.setdefault("data", {})["screenshots"] = collect_screenshots()
+                except Exception:
+                    pass
+                json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[result-json] 寫檔失敗: {e}", file=sys.stderr)
+
+
+def _enrich_with_group_ids(fbid: str, names: list[str]) -> list[dict]:
+    """把對象頁抓到的社團名稱對照已同步的社團檔，補上 url 與 group_id（對不到的留空）。"""
+    import re
+    from src.paths import DATA_DIR
+
+    name_to_url: dict[str, str] = {}
+    groups_file = DATA_DIR / f"{fbid}.json"
+    if groups_file.exists():
+        try:
+            with open(groups_file, encoding="utf-8") as f:
+                name_to_url = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    enriched = []
+    for name in names:
+        url = name_to_url.get(name, "")
+        m = re.search(r"/groups/(\d+)/?", url)
+        enriched.append({"name": name, "url": url, "group_id": m.group(1) if m else ""})
+    return enriched
+
+
+def main():
+    parser = argparse.ArgumentParser(description="檢測可轉發 Marketplace 的社團")
+    parser.add_argument("--fbid", required=True, help="FB numeric ID（需已有 cookie）")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--result-json", help="結果 JSON 輸出路徑")
+
+    args = parser.parse_args()
+
+    global _JSON_PATH, _RESULT
+    fbid = args.fbid
+    _JSON_PATH = args.result_json
+    _RESULT = {
+        "schema": 2,
+        "success": False,
+        "fbid": fbid,
+        "error": "",
+        "data": {"mp_groups": []},
+    }
+    if _JSON_PATH:
+        atexit.register(_write_result_json)
+
+    print(f"[detect-mp] 啟動檢測: fbid={fbid}", flush=True)
+
+    browser, context, page = launch_browser(fbid=fbid, headless=args.headless)
+
+    try:
+        # Cookie 登入
+        if not _try_cookie_login(page, context, fbid):
+            msg = "Cookie 登入失敗"
+            print(f"❌ {msg}", flush=True)
+            _RESULT["error"] = msg
+            return
+
+        # 進入 Marketplace 建立頁 → 到對象頁
+        print("[detect-mp] 進入 Marketplace 建立頁...", flush=True)
+        page.goto("https://www.facebook.com/marketplace/create/item/", wait_until="domcontentloaded")
+        page.wait_for_timeout(5000)
+
+        # ── 填必填欄位以啟用「繼續」：類別 + 標題 + 價格 + 狀況 + 圖片 ──
+        # FB 新版 Marketplace 要求「類別」和「狀況」都選了「繼續」才會啟用；
+        # 缺任一個按鈕維持灰色 → 進不了對象頁 → 抓到 0 個社團。
+        from src.marketplacePost import _upload_images, _select_combobox_option
+        from src.utils import simulate_human_click, human_sleep
+        from src.paths import DATA_DIR
+
+        text_inputs = page.locator("input[type='text']").all()
+        combos = page.locator("label[role='combobox']").all()
+
+        # 1. 類別（隨便選第一個，只為進到對象頁）
+        if len(combos) >= 1:
+            print("[detect-mp] 選擇類別...", flush=True)
+            simulate_human_click(page, combos[0])
+            human_sleep(1, 2)
+            opts = page.locator("[role='option']").all()
+            if opts:
+                simulate_human_click(page, opts[0])
+            else:
+                page.keyboard.press("ArrowDown")
+                page.keyboard.press("Enter")
+            human_sleep(0.5, 1)
+        else:
+            print("[detect-mp] ⚠️ 找不到類別 combobox", flush=True)
+
+        # 2/3. 標題 + 價格
+        if len(text_inputs) >= 2:
+            text_inputs[0].fill("test")
+            human_sleep(0.3, 0.6)
+            text_inputs[1].fill("100")
+            human_sleep(0.3, 0.6)
+        else:
+            print("[detect-mp] ⚠️ 找不到標題/價格輸入框", flush=True)
+
+        # 4. 狀況（選「全新」）
+        if len(combos) >= 2:
+            print("[detect-mp] 選擇狀況...", flush=True)
+            _select_combobox_option(page, combos[1], "全新")
+            human_sleep(0.5, 1)
+        else:
+            print("[detect-mp] ⚠️ 找不到狀況 combobox", flush=True)
+
+        # 5. 上傳測試圖片（必填——沒有圖 FB 不會啟用「繼續」，偵測必定失敗）
+        # 優先用隨程式發行的 assets（客戶包沒有執行期資料）；相容舊的 data 路徑
+        test_img = Path(__file__).resolve().parents[1] / "assets" / "test_product.jpg"
+        if not test_img.exists():
+            test_img = DATA_DIR / "shop_article_images" / "test_product_1.jpg"
+        if not test_img.exists():
+            raise RuntimeError("找不到測試圖片（FB_Auto/assets/test_product.jpg）——無法填表進入對象頁")
+        print("[detect-mp] 上傳測試圖片...", flush=True)
+        _upload_images(page, [str(test_img)])
+
+        # 觸發 blur / dispatch 讓 React 啟用繼續按鈕
+        page.mouse.click(10, 10)
+        page.wait_for_timeout(1000)
+
+        disabled = page.evaluate("""() => {
+            const btn = document.querySelector('div[aria-label="繼續"]');
+            return btn ? btn.getAttribute('aria-disabled') : 'not found';
+        }""")
+
+        if disabled == "true":
+            # JS 端派發事件
+            page.evaluate("""() => {
+                document.querySelectorAll('input[type="text"]').forEach((el) => {
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                });
+            }""")
+            page.wait_for_timeout(1500)
+            page.mouse.click(10, 10)
+            page.wait_for_timeout(1000)
+
+        # 點擊繼續進入對象頁
+        from src.marketplacePost import _click_continue
+        _click_continue(page)
+        page.wait_for_timeout(5000)
+
+        # 如果還沒進對象頁，試試 force click
+        if "step=audience" not in page.url:
+            print("[detect-mp] 繼續按鈕可能未啟用，嘗試 force click...", flush=True)
+            try:
+                btn = page.locator("div[aria-label='繼續']").first
+                if btn.count() > 0 and btn.is_visible():
+                    btn.click(force=True)
+                    page.wait_for_timeout(5000)
+            except Exception:
+                pass
+
+        # 診斷截圖：不論成功與否都拍一張，方便從執行紀錄看卡在哪一頁
+        try:
+            capture_screenshot(page, fbid, "detect_after_continue")
+        except Exception:
+            pass
+
+        # 確認是否到了對象頁——沒進去就明確失敗（在建立頁硬抓只會存下邊欄雜訊）
+        if "step=audience" not in page.url:
+            raise RuntimeError(
+                f"未進入對象頁（卡在 {page.url}）——表單可能未填完整或 FB 改版，請看截圖")
+
+        # 抓取對象頁社團清單（對象頁 DOM 只有名稱，無連結）
+        print("[detect-mp] 抓取對象頁社團...", flush=True)
+        mp_names = get_audience_groups(page, fbid)
+
+        # 用已同步的社團檔（data/{fbid}.json: name → url）把名稱 join 成 {name, url, group_id}
+        mp_groups = _enrich_with_group_ids(fbid, mp_names)
+        resolved = sum(1 for g in mp_groups if g["group_id"])
+        print(f"[detect-mp] ✅ 可轉發的社團: {len(mp_groups)} 個（group_id 解析成功 {resolved} 個）", flush=True)
+
+        _RESULT["success"] = True
+        _RESULT["data"]["mp_groups"] = mp_groups
+
+        # 覆寫快取檔為 v2 形狀（get_audience_groups 先寫入的是純名稱陣列）
+        from src.paths import DATA_DIR
+        cache_path = DATA_DIR / f"marketplace_groups_{fbid}.json"
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(mp_groups, f, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        print(f"[detect-mp] ❌ 錯誤: {e}", flush=True)
+        _RESULT["error"] = str(e)
+    finally:
+        context.close()
+        print("[detect-mp] 完成", flush=True)
+
+
+if __name__ == "__main__":
+    main()

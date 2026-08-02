@@ -1,0 +1,73 @@
+"""執行紀錄 API — 錯誤回報與截圖檢視"""
+import os
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from pathlib import Path
+from datetime import datetime
+
+from ..database import get_session, RunLog
+from ..config import DATA_DIR
+
+router = APIRouter(prefix="/api/logs", tags=["logs"], redirect_slashes=False)
+
+
+@router.get("")
+@router.get("/")
+async def list_logs(limit: int = 50, status: str | None = None, session: AsyncSession = Depends(get_session)):
+    q = select(RunLog).order_by(RunLog.created_at.desc())
+    if status:
+        q = q.where(RunLog.status == status)
+    q = q.limit(limit)
+    result = await session.execute(q)
+    logs = result.scalars().all()
+    return [
+        {
+            "id": l.id,
+            "task_type": l.task_type,
+            "status": l.status,
+            "fbid": l.fbid,
+            "screenshot_paths": l.screenshot_paths,
+            "result_json": l.result_json,
+            "error_message": l.error_message,
+            "output_tail": l.output_tail,
+            "duration_sec": l.duration_sec,
+            "created_at": l.created_at.isoformat() if l.created_at else "",
+        }
+        for l in logs
+    ]
+
+
+@router.get("/{log_id}")
+async def get_log(log_id: int, session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(RunLog).where(RunLog.id == log_id))
+    log = result.scalar_one_or_none()
+    if not log:
+        raise HTTPException(status_code=404, detail="記錄不存在")
+    return {
+        "id": log.id,
+        "task_type": log.task_type,
+        "status": log.status,
+        "fbid": log.fbid,
+        "screenshot_paths": log.screenshot_paths,
+        "result_json": log.result_json,
+        "error_message": log.error_message,
+        "output_tail": log.output_tail,
+        "duration_sec": log.duration_sec,
+        "created_at": log.created_at.isoformat() if log.created_at else "",
+    }
+
+
+@router.get("/screenshots/{rel_path:path}")
+async def serve_screenshot(rel_path: str):
+    """提供 FB_Auto screenshot 目錄下的截圖。
+    rel_path 形如 {fbid}/{檔名}.png（capture_screenshot 存的相對路徑）。"""
+    screenshot_dir = (Path(__file__).resolve().parents[3] / "FB_Auto" / "screenshot").resolve()
+    filepath = (screenshot_dir / rel_path).resolve()
+    # 路徑穿越防護：解析後必須仍在 screenshot 目錄內
+    if not str(filepath).startswith(str(screenshot_dir) + os.sep):
+        raise HTTPException(status_code=400, detail="非法路徑")
+    if not filepath.is_file():
+        raise HTTPException(status_code=404, detail="截圖不存在")
+    return FileResponse(str(filepath))

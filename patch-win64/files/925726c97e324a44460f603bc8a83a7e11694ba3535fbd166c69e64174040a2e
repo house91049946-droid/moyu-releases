@@ -1,0 +1,56 @@
+"""manifest 簽章驗證（SPEC-P23 §7 的第二道防線）。
+
+為什麼光有 SHA256 不夠：雜湊只保證「下載到的檔案內容與 manifest 寫的一致」。
+如果 manifest 本身被換掉——DNS 被劫、檔案倉庫被入侵、後台的網址被人改成別的
+位址——攻擊者可以連 manifest 一起改，雜湊照樣完全吻合，客戶端就會乖乖把惡意
+程式碼裝進去然後執行。
+
+簽章補的就是這一段：manifest 必須由持有廠商私鑰的人簽過，客戶端用內建的公鑰
+驗。攻擊者就算完全控制了檔案倉庫，也產不出通得過驗證的 manifest。
+
+金鑰：Ed25519（簽章短、驗證快、沒有參數選錯就變弱的坑）。
+  - 私鑰只留在廠商手上，由 `scripts/gen_update_key.py` 產生，**永遠不進 repo**
+  - 公鑰是下面這個常數，跟著客戶端一起發佈
+
+公鑰換掉的方式：改這個檔案再發一版——它在輕層，所以是走補丁更新推下去的。
+新舊金鑰交接時要先發一版「內建新公鑰」的更新（用舊私鑰簽），全數客戶端更新
+完成後才改用新私鑰簽。順序反了會把還沒更新的客戶端鎖在門外。
+"""
+from __future__ import annotations
+
+import base64
+
+# 由 scripts/gen_update_key.py 產生後填入（base64 的 32 bytes 原始公鑰）。
+# 留空 = 尚未啟用簽章：客戶端只驗 SHA256，行為與導入簽章前相同。
+PUBLIC_KEY_B64 = ""
+
+
+def signing_enabled() -> bool:
+    return bool(PUBLIC_KEY_B64.strip())
+
+
+def verify_manifest(raw: bytes, signature_b64: str) -> tuple[bool, str]:
+    """驗 manifest 的簽章。回傳 (通過與否, 說明)。
+
+    raw 必須是**下載到的原始位元組**，不能是 json.loads 後再 dumps 的結果——
+    重新序列化會改變空白與鍵序，簽章立刻對不上。
+    """
+    if not signing_enabled():
+        return True, "未啟用簽章"
+    if not signature_b64:
+        return False, "缺少簽章檔（manifest.json.sig）"
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError as e:      # 理論上不會：包內 Python 帶 cryptography
+        return False, f"缺少 cryptography，無法驗簽：{e}"
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(PUBLIC_KEY_B64))
+        sig = base64.b64decode(signature_b64.strip())
+    except (ValueError, TypeError) as e:
+        return False, f"公鑰或簽章格式不對：{e}"
+    try:
+        pub.verify(sig, raw)
+    except InvalidSignature:
+        return False, "簽章驗證失敗——manifest 不是廠商簽的，拒絕更新"
+    return True, "簽章正確"

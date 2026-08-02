@@ -1,0 +1,205 @@
+"""P1 CLI 入口 — 登入 → 抓社團 → mbasic 發一篇文。"""
+import argparse
+import atexit
+import json
+import sys
+from pathlib import Path
+
+from src.utils import launch_browser, capture_screenshot, perform_checks, wait_if_verification_needed, CheckResult
+from src.login import login_facebook
+from src.getclub import run_getclub
+from src.generalpost_www import www_postclub_main
+
+_JSON_PATH: str | None = None
+_RESULT: dict | None = None
+
+
+def _write_result_json():
+    """atexit 回呼：寫出 result JSON。任何錯誤只印警告，不得拋出。"""
+    if _JSON_PATH and _RESULT is not None:
+        try:
+            with open(_JSON_PATH, "w", encoding="utf-8") as f:
+                try:
+                    from src.utils import collect_screenshots
+                    _RESULT.setdefault("data", {})["screenshots"] = collect_screenshots()
+                except Exception:
+                    pass
+                json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[result-json] 寫檔失敗: {e}", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="FB Auto Poster P1 — 登入、抓社團、發文",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用範例：
+  # 第一次使用（帳密登入）
+  python -m src.run_p1 --email user@example.com --password "xxx" \\
+      --group "https://mbasic.facebook.com/groups/123456/" \\
+      --content "這是一篇測試貼文"
+
+  # 已知 fbid + 已有 cookie（跳過登入）
+  python -m src.run_p1 --fbid 1000123456789 \\
+      --group "https://mbasic.facebook.com/groups/123456/" \\
+      --content "這是一篇測試貼文"
+
+  # 含圖片
+  python -m src.run_p1 --email user@example.com --password "xxx" \\
+      --group "https://mbasic.facebook.com/groups/123456/" \\
+      --content "物件介紹..." --image /path/to/photo.jpg
+        """,
+    )
+    parser.add_argument("--email", help="FB 登入 email 或手機號碼")
+    parser.add_argument("--password", help="FB 密碼")
+    parser.add_argument("--fbid", help="已知的 FB numeric ID（若有 cookie 可跳過登入）")
+    parser.add_argument("--group", required=True, help="目標社團 mbasic URL")
+    parser.add_argument("--content", required=True, help="貼文文案")
+    parser.add_argument("--image", nargs="*", help="圖片路徑（可多張）")
+    parser.add_argument("--headless", action="store_true", help="無頭模式（不建議，會觸發 FB 偵測）")
+    parser.add_argument("--skip-groups", action="store_true", help="跳過抓社團步驟")
+    parser.add_argument("--result-json", help="結果 JSON 輸出路徑（供 backend 橋接）")
+    parser.add_argument("--keep-open", action="store_true", help="遇到驗證時保持瀏覽器開啟，等待手動處理")
+
+    args = parser.parse_args()
+
+    # ── ateexit result-json 機制 ──
+    global _JSON_PATH, _RESULT
+    fbid = args.fbid
+    _JSON_PATH = args.result_json
+    _RESULT = {
+        "schema": 2,
+        "success": False,
+        "fbid": fbid or "",
+        "error": "未完成",
+        "data": {"results": [], "item_url": None},
+    }
+    if _JSON_PATH:
+        atexit.register(_write_result_json)
+
+    # 啟動瀏覽器
+    print("=" * 50)
+    print("P1: FB Auto Poster — 登入 → 抓社團 → 發文")
+    print("=" * 50)
+
+    resolved_fbid = fbid or "temp"
+    try:
+        browser, context, page = launch_browser(
+            fbid=resolved_fbid,
+            headless=args.headless,
+        )
+    except Exception as e:
+        # 開瀏覽器就失敗（profile 被佔用、Chrome 起不來…）原本落在 try 之外，
+        # result JSON 只留初始值「未完成」，後台看不到任何原因。
+        print(f"❌ 瀏覽器啟動失敗: {e}", flush=True)
+        if _RESULT is not None:
+            _RESULT["error"] = f"瀏覽器啟動失敗：{e}"
+        sys.exit(1)
+
+    try:
+        # Step 1: 登入
+        from src.paths import COOKIES_DIR
+        if not fbid or not (COOKIES_DIR / f"{fbid}.json").exists():
+            print("\n[1/3] 登入中...")
+            if not args.email or not args.password:
+                msg = "需要 --email 和 --password 進行登入（或提供 --fbid 且有已儲存的 cookie）"
+                print(f"❌ {msg}")
+                if _RESULT is not None:
+                    _RESULT["error"] = msg
+                sys.exit(1)
+
+            result = login_facebook(page, context, args.email, args.password)
+            print(f"  → 登入結果: {result.status}")
+            if result.fbid:
+                fbid = result.fbid
+                if _RESULT is not None:
+                    _RESULT["fbid"] = fbid
+            else:
+                msg = "登入失敗，無法取得 fbid"
+                print(f"❌ {msg}")
+                if _RESULT is not None:
+                    _RESULT["error"] = msg
+                sys.exit(1)
+        else:
+            print(f"\n[1/3] Cookie 登入中 (fbid: {fbid})...")
+            from src.login import _try_cookie_login, _get_fbid_from_cookies
+            if _try_cookie_login(page, context, fbid):
+                actual_fbid = _get_fbid_from_cookies(context)
+                if actual_fbid:
+                    fbid = actual_fbid
+                    if _RESULT is not None:
+                        _RESULT["fbid"] = fbid
+                print(f"  → Cookie 登入成功, fbid: {fbid}")
+            else:
+                msg = "Cookie 已失效，請用 --email/--password 重新登入"
+                print(f"  → {msg}")
+                if _RESULT is not None:
+                    _RESULT["error"] = msg
+                sys.exit(1)
+
+        print(f"  ✓ 已登入, fbid={fbid}")
+
+        # Step 2: 抓社團清單
+        if not args.skip_groups:
+            print("\n[2/3] 抓取社團清單...")
+            groups = run_getclub(page, fbid)
+            print(f"  ✓ 抓到 {len(groups)} 個社團")
+        else:
+            print("\n[2/3] 跳過抓社團 (--skip-groups)")
+
+        # Step 3: 發文
+        print("\n[3/3] 發文中...")
+        images = args.image or None
+        post_result = www_postclub_main(
+            page=page,
+            fbid=fbid,
+            group_url=args.group,
+            content=args.content,
+            images=images,
+        )
+        print(f"  → 發文結果: {post_result.status}")
+        if post_result.permalink:
+            print(f"  → 貼文網址: {post_result.permalink}")
+        if post_result.error:
+            print(f"  → 錯誤: {post_result.error}")
+
+        # ── 更新結果 ──
+        if _RESULT is not None:
+            _RESULT["success"] = post_result.success
+            _RESULT["fbid"] = fbid
+            _RESULT["error"] = post_result.error or ""
+            _RESULT["data"]["results"] = [{
+                "group_url": args.group,
+                "status": post_result.status,
+                "permalink": post_result.permalink or "",
+                "error": post_result.error or "",
+            }]
+
+        print("\n" + "=" * 50)
+        print("✓ P1 執行完畢")
+        print("=" * 50)
+
+    except KeyboardInterrupt:
+        print("\n⚠ 使用者中斷")
+        if _RESULT is not None:
+            _RESULT["error"] = "使用者中斷"
+    except Exception as e:
+        print(f"\n❌ 錯誤: {e}")
+        if _RESULT is not None:
+            _RESULT["error"] = str(e)
+        capture_screenshot(page, fbid or "unknown", "error")
+        raise
+    finally:
+        if args.keep_open:
+            # 遇到驗證時保持瀏覽器
+            check = perform_checks(page, fbid or "unknown")
+            if wait_if_verification_needed(check, page, fbid or "unknown"):
+                if _RESULT is not None:
+                    _RESULT["data"]["results"].append({"verification": check.value, "handled": True})
+        print("關閉瀏覽器...")
+        context.close()
+
+
+if __name__ == "__main__":
+    main()

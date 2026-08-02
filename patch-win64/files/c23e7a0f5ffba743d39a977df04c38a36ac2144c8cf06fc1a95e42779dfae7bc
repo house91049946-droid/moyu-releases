@@ -1,0 +1,40 @@
+"""帳號養號 API"""
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from pydantic import BaseModel
+
+from ..database import get_session, Account
+
+router = APIRouter(prefix="/api/nurture", tags=["nurture"], redirect_slashes=False)
+
+
+class NurtureRequest(BaseModel):
+    account_id: int
+    duration_min: int = 5
+    headless: bool = False
+
+
+@router.post("/run")
+async def run_nurture(data: NurtureRequest, session: AsyncSession = Depends(get_session)):
+    """啟動帳號養號任務（模擬真人瀏覽行為，避免被 FB 判定為機器人）"""
+
+    # 驗證帳號存在且有 fbid
+    acc_result = await session.execute(select(Account).where(Account.id == data.account_id))
+    acc = acc_result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    if not acc.fb_user_id:
+        raise HTTPException(status_code=422, detail="此帳號尚未綁定 FB ID，請先到帳號設定頁面綁定")
+
+    from ..fbauto_bridge import start_long_op, cookie_exists
+
+    if not cookie_exists(acc.fb_user_id):
+        raise HTTPException(status_code=422, detail=f"cookie 不存在: {acc.fb_user_id}，請先用 CLI 登入")
+
+    args = ["--fbid", acc.fb_user_id, "--duration", str(data.duration_min)]
+    if data.headless:
+        args.append("--headless")
+    job_id = start_long_op("nurture", "src.run_nurture", args,
+                           account_id=acc.id, fbid=acc.fb_user_id)
+    return {"job_id": job_id, "state": "pending"}

@@ -1,0 +1,71 @@
+"""P16：排程規劃 + 預算把關純函式。"""
+import datetime
+import random
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.scheduler.marketplace_planner import (
+    plan_daily_times, can_afford, groups_within_budget, next_allowed_after_cooldown,
+)
+
+D = datetime.date(2026, 7, 12)
+
+
+def test_points_picks_daily_count():
+    times = plan_daily_times("points", ["09:00", "13:00", "17:00", "20:00", "22:00"],
+                             "", "", daily_count=3, random_delay=False, base_date=D, rng=random.Random(1))
+    assert len(times) == 3
+    assert times == sorted(times)                      # 已排序
+    # 未加偏移 → 都落在整點
+    assert all(t.minute == 0 for t in times)
+
+
+def test_points_daily_count_capped_by_points():
+    times = plan_daily_times("points", ["09:00", "13:00"], "", "",
+                             daily_count=5, random_delay=False, base_date=D, rng=random.Random(1))
+    assert len(times) == 2                              # 只有 2 個時間點
+
+
+def test_points_random_delay_offsets():
+    times = plan_daily_times("points", ["12:00"], "", "", daily_count=1,
+                             random_delay=True, base_date=D, rng=random.Random(7))
+    assert len(times) == 1
+    diff = abs((times[0] - datetime.datetime.combine(D, datetime.time(12, 0))).total_seconds())
+    assert diff <= 15 * 60                              # 偏移在 ±15 分鐘內
+
+
+def test_window_random_times_in_range():
+    times = plan_daily_times("window", [], "09:00", "21:00", daily_count=4,
+                             random_delay=False, base_date=D, rng=random.Random(3))
+    assert len(times) == 4
+    lo = datetime.datetime.combine(D, datetime.time(9, 0))
+    hi = datetime.datetime.combine(D, datetime.time(21, 0))
+    assert all(lo <= t <= hi for t in times)
+    assert times == sorted(times)
+
+
+def test_window_empty_when_invalid_range():
+    assert plan_daily_times("window", [], "21:00", "09:00", 3, False, D) == []
+
+
+def test_can_afford():
+    assert can_afford(remaining_listings=3, remaining_posts=30, groups_planned=20) is True
+    assert can_afford(remaining_listings=0, remaining_posts=30, groups_planned=20) is False
+    assert can_afford(remaining_listings=3, remaining_posts=0, groups_planned=20) is False
+
+
+def test_groups_within_budget():
+    assert groups_within_budget(remaining_posts=30, groups_planned=20) == 20   # 夠
+    assert groups_within_budget(remaining_posts=10, groups_planned=20) == 9     # 商品佔1，剩9
+    assert groups_within_budget(remaining_posts=1, groups_planned=20) == 0      # 只夠發商品
+    assert groups_within_budget(remaining_posts=0, groups_planned=20) == 0
+
+
+def test_cooldown():
+    finish = datetime.datetime(2026, 7, 12, 10, 0, 0)
+    nxt = next_allowed_after_cooldown(finish, 300, 600, rng=random.Random(1))
+    delta = (nxt - finish).total_seconds()
+    assert 300 <= delta <= 600
+    assert next_allowed_after_cooldown(None, 300, 600) is None

@@ -1,0 +1,358 @@
+"""P16 Marketplace 定時發文執行器。
+
+- 每日規劃時間、序列化 + 5-10 分鐘冷卻、每日預算把關。
+- 發送：挑物件 → 內容組裝（自動變裝）→ headless 上架（類別=其他）→ 分批轉發。
+- 偵測 FB 保護 / cookie 失效 → 全域暫停。dry-run 走完不發佈。
+"""
+import asyncio
+import datetime
+import random
+import shutil
+from pathlib import Path
+
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy import select
+
+from ..database import (
+    async_session_factory, MarketplaceSchedule, Property, LegalInfo, Account,
+    budget_remaining_sync, add_daily_usage_sync, get_system_state_sync, set_system_pause_sync,
+    eligible_property_ids_sync, update_property_health_sync,
+    TAIPEI, as_taipei, now_taipei,
+)
+from ..marketplace_content import assemble_content
+from .marketplace_planner import plan_daily_times, groups_within_budget
+from .task_runner import scheduler
+
+_MP_LOCK = asyncio.Lock()          # 全域一次只跑一個 marketplace 工作
+_MP_LAST_FINISH: datetime.datetime | None = None
+
+
+def _now_taipei() -> datetime.datetime:
+    return now_taipei()
+
+
+async def _load_schedule_snapshot(schedule_id: int):
+    async with async_session_factory() as s:
+        sch = (await s.execute(select(MarketplaceSchedule).where(MarketplaceSchedule.id == schedule_id))).scalar_one_or_none()
+        if not sch:
+            return None
+        acc = (await s.execute(select(Account).where(Account.id == sch.account_id))).scalar_one_or_none()
+        legal = (await s.execute(select(LegalInfo))).scalars().first()
+        return {
+            "id": sch.id, "account_id": sch.account_id, "status": sch.status,
+            "property_ids": list(sch.property_ids or []),
+            "headless": sch.headless, "dry_run": sch.dry_run,
+            "auto_delete_days": sch.auto_delete_days if sch.auto_delete_days is not None else 7,
+            "batch_min_sec": sch.batch_min_sec, "batch_max_sec": sch.batch_max_sec,
+            "cooldown_min_sec": sch.cooldown_min_sec, "cooldown_max_sec": sch.cooldown_max_sec,
+            "fbid": (acc.fb_user_id or "").strip() if acc else "",
+            "email": (acc.email or "") if acc else "",     # 警訊文字要指名是哪個帳號
+            # ⚠️ footer_text 一定要帶：介面上客戶填的就是這一欄（整段法定文案），
+            # 結構化的 agent_name/company/... 根本沒有輸入介面、永遠是空的。
+            # 這裡漏掉它，legal_footer() 就退回組結構化欄位 → 組出空字串 →
+            # Marketplace 排程發文（含分批轉發社團）從來沒帶過法定文案。
+            # GP 與發文任務兩條路徑都有帶，只有這裡漏（2026-08-02 客戶回報）。
+            "legal": {"footer_text": legal.footer_text, "agent_name": legal.agent_name,
+                      "company": legal.company, "license_no": legal.license_no,
+                      "agent_phone": legal.agent_phone, "extra": legal.extra} if legal else {},
+        }
+
+
+async def _load_property(prop_id: int):
+    async with async_session_factory() as s:
+        p = (await s.execute(select(Property).where(Property.id == prop_id))).scalar_one_or_none()
+        if not p:
+            return None
+        return {
+            "id": p.id, "name": p.name, "category": p.category, "condition": p.condition or "new",
+            "price": p.price, "city": p.city or "",
+            "titles": list(p.titles or []), "bodies": list(p.bodies or []),
+            "image_pool": list(p.image_pool or []), "cover_ids": list(p.cover_ids or []),
+            "qr_image": p.qr_image or "", "target_groups": list(p.target_groups or []),
+            "groups_per_listing": p.groups_per_listing or 20,
+            "title_cursor": p.title_cursor or 0, "body_cursor": p.body_cursor or 0,
+            "cover_cursor": p.cover_cursor or 0,
+        }
+
+
+async def _save_property_after_post(prop_id: int, cursors: dict, item_url: str | None, dry_run: bool):
+    async with async_session_factory() as s:
+        p = (await s.execute(select(Property).where(Property.id == prop_id))).scalar_one_or_none()
+        if not p:
+            return
+        p.title_cursor = cursors.get("title", p.title_cursor)
+        p.body_cursor = cursors.get("body", p.body_cursor)
+        p.cover_cursor = cursors.get("cover", p.cover_cursor)
+        if item_url and not dry_run:
+            live = list(p.live_listings or [])
+            live.append({"item_url": item_url, "posted_at": datetime.datetime.utcnow().isoformat()})
+            p.live_listings = live
+            p.post_count_total = (p.post_count_total or 0) + 1
+            p.last_posted_at = datetime.datetime.utcnow()
+        await s.commit()
+
+
+def _write_product_json(item_name: str, price: int, category: str, condition: str, body: str, image_web_paths: list[str], city: str = "") -> str:
+    """把組裝好的內容寫成 shop_article JSON 供 CLI 讀取，回傳 safe_name。圖片複製到 shop_article_images。"""
+    import json
+    import uuid
+    from ..config import DATA_DIR as BACKEND_DATA
+    from ..fbauto_bridge import FB_AUTO_DATA_DIR
+
+    upload_dir = BACKEND_DATA / "uploads"
+    shop_dir = FB_AUTO_DATA_DIR / "shop_article"
+    images_dir = FB_AUTO_DATA_DIR / "shop_article_images"
+    shop_dir.mkdir(parents=True, exist_ok=True)
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    basenames = []
+    for wp in image_web_paths:
+        # 圖片可能來自子目錄（例如從社團發文沿用過來的 /uploads/group_post/xxx.jpg），
+        # 只取 basename 會找不到檔案而整張消失，所以照 /uploads/ 之後的相對路徑找。
+        rel = wp[len("/uploads/"):] if wp.startswith("/uploads/") else wp.rsplit("/", 1)[-1]
+        src = upload_dir / rel
+        if src.exists():
+            fn = rel.replace("/", "_")     # CLI 讀的是單層目錄，攤平成檔名
+            dst = images_dir / fn
+            if not dst.exists():
+                shutil.copy2(str(src), str(dst))
+            basenames.append(fn)
+
+    safe = "".join(c for c in item_name if c.isalnum() or c in "_- ")[:40].strip() or f"item_{uuid.uuid4().hex[:8]}"
+    safe = f"{safe}_{uuid.uuid4().hex[:6]}"   # 每次不同檔名，避免「已上架過」誤判
+    product = {
+        "content": {"itemType": "product", "item_name": item_name, "item_price": price,
+                    "category": category or "其他商品", "condition": condition or "new",
+                    "item_location": city or "",
+                    "word": body, "images": basenames},
+        "images": basenames,
+    }
+    with open(shop_dir / f"{safe}.json", "w", encoding="utf-8") as f:
+        json.dump(product, f, ensure_ascii=False, indent=2)
+    return safe
+
+
+async def run_marketplace_job(schedule_id: int, force: bool = False):
+    """單次 marketplace 發送（受全域暫停、序列化冷卻、每日預算約束）。
+    force=True：忽略排程 status（供「立即測試」用），仍尊重暫停/預算/cookie。"""
+    global _MP_LAST_FINISH
+    from ..fbauto_bridge import (
+        cookie_exists, run_marketplace_post, create_run_log_sync, update_run_log_sync, BridgeResult,
+    )
+
+    st = get_system_state_sync()
+    if st["paused"]:
+        return
+
+    snap = await _load_schedule_snapshot(schedule_id)
+    if not snap or not snap["property_ids"]:
+        return
+    if not force and snap["status"] != "running":
+        return
+
+    fbid = snap["fbid"]
+    if not fbid or not cookie_exists(fbid):
+        set_system_pause_sync(True, "cookie_expired", f"排程 {schedule_id} 的帳號 cookie 失效")
+        _pause_all_marketplace()
+        return
+
+    async with _MP_LOCK:
+        # 冷卻：距上一個工作結束不足 cooldown 則等待
+        if _MP_LAST_FINISH is not None:
+            wait = random.randint(snap["cooldown_min_sec"], max(snap["cooldown_min_sec"], snap["cooldown_max_sec"]))
+            elapsed = (datetime.datetime.utcnow() - _MP_LAST_FINISH).total_seconds()
+            if elapsed < wait:
+                await asyncio.sleep(wait - elapsed)
+
+        # 每日預算
+        rl, rp = budget_remaining_sync()
+        if rl < 1 or rp < 1:
+            log_id = create_run_log_sync("marketplace", fbid, snap["account_id"])
+            update_run_log_sync(log_id, BridgeResult(success=False, error=f"今日額度已用完（商品剩{rl}/則剩{rp}）"))
+            return
+
+        # 挑物件 + 組裝（P18：跳過健康度=problem 的物件，省額度）
+        eligible = eligible_property_ids_sync(snap["property_ids"])
+        if not eligible:
+            log_id = create_run_log_sync("marketplace", fbid, snap["account_id"])
+            update_run_log_sync(log_id, BridgeResult(
+                success=False, error="排程物件全部被標記為問題物件（連續審核/被拒），已跳過；請到物件管理重新啟用"))
+            return
+        prop = await _load_property(random.choice(eligible))
+        if not prop:
+            return
+        content = assemble_content(prop, snap["legal"])
+        want = min(len(prop["target_groups"]), prop["groups_per_listing"])
+        groups_budget = groups_within_budget(rp, want)
+        groups = list(prop["target_groups"])
+        random.shuffle(groups)
+        groups = groups[:groups_budget]
+
+        safe = _write_product_json(content["title"], prop["price"], prop["category"],
+                                   prop["condition"], content["body"], content["images"],
+                                   city=prop.get("city", ""))
+
+        log_id = create_run_log_sync("marketplace", fbid, snap["account_id"])
+        result = await run_marketplace_post(
+            fbid=fbid, item_name=safe, share_groups=groups, headless=snap["headless"],
+            category=prop["category"] or "其他商品", dry_run=snap["dry_run"],
+            job_key=f"mp_{snap['account_id']}",
+        )
+        update_run_log_sync(log_id, result)
+
+        # 被 FB 登出／cookie 失效 → 全域暫停（指示與保護機制不同：要重新登入，不是等冷卻）
+        if result.needs_relogin:
+            set_system_pause_sync(
+                True, "logged_out",
+                f"帳號 {snap.get('email') or fbid} 的 FB 登入已失效（被登出或 cookie 過期），"
+                f"請到「帳號設定」重新登入，再回儀表板按「恢復」。",
+            )
+            _pause_all_marketplace()
+        # 保護偵測 → 全域暫停
+        elif result.needs_manual_action:
+            set_system_pause_sync(True, "fb_protection", result.manual_action_reason or "偵測到 FB 保護機制")
+            _pause_all_marketplace()
+
+        # 預算與物件狀態更新（dry-run 不計額度）
+        item_url = result.item_url
+        if result.success and not snap["dry_run"]:
+            submitted_groups = (result.data or {}).get("groups_submitted", len(groups))
+            add_daily_usage_sync(listings=1, posts=1 + submitted_groups)
+        # P18：依結果更新物件健康度（dry-run 不計，避免測試污染計數）
+        if not snap["dry_run"]:
+            status_text = getattr(result, "status", "") or ("成功" if result.success else "失敗")
+            update_property_health_sync(prop["id"], status_text, result.error or "")
+        await _save_property_after_post(prop["id"], content["cursors"], item_url, snap["dry_run"])
+
+        _MP_LAST_FINISH = datetime.datetime.utcnow()
+
+
+async def run_marketplace_cleanup_job(schedule_id: int, force: bool = False,
+                                      dry_run_override: bool | None = None,
+                                      days_override: int | None = None):
+    """P17：刪除該排程帳號超過 auto_delete_days 天的 Marketplace 刊登。
+    force=True：忽略排程 status（供「立即測試」用）。與發文共用 _MP_LOCK 序列化。
+    days_override：覆寫天數門檻（0=刪全部現有刊登，供建立→立即刪除測試）。"""
+    global _MP_LAST_FINISH
+    from ..fbauto_bridge import (
+        cookie_exists, run_marketplace_delete_old, create_run_log_sync, update_run_log_sync,
+    )
+
+    st = get_system_state_sync()
+    if st["paused"]:
+        return None
+
+    snap = await _load_schedule_snapshot(schedule_id)
+    if not snap:
+        return None
+    if not force and snap["status"] != "running":
+        return None
+
+    if days_override is not None:
+        days = days_override           # 測試覆寫（可為 0 = 刪全部，不加隨機）
+    else:
+        base = snap.get("auto_delete_days", 14) or 0
+        if base <= 0:
+            return None                # 該排程已關閉自動刪除（僅排程路徑受此限制）
+        days = max(1, base + random.randint(-2, 2))   # 反偵測：門檻 ±2 天隨機
+        print(f"[mp_cleanup] 門檻隨機化：{base} → {days} 天", flush=True)
+
+    fbid = snap["fbid"]
+    if not fbid or not cookie_exists(fbid):
+        return None
+
+    dry = snap["dry_run"] if dry_run_override is None else dry_run_override
+    async with _MP_LOCK:
+        log_id = create_run_log_sync("mp_cleanup", fbid, snap["account_id"])
+        result = await run_marketplace_delete_old(
+            fbid=fbid, max_age_days=days, headless=snap["headless"], dry_run=dry,
+        )
+        update_run_log_sync(log_id, result)
+        _MP_LAST_FINISH = datetime.datetime.utcnow()
+    return result
+
+
+def _pause_all_marketplace():
+    """移除所有 marketplace 排程 job（暫停）。"""
+    for job in list(scheduler.get_jobs()):
+        if job.id.startswith("mp_"):
+            job.remove()
+
+
+# ── 排程管理 ──────────────────────────────────────────
+
+def plan_and_schedule(sch: MarketplaceSchedule):
+    """依排程設定，把今天剩餘的執行時間排入 APScheduler。"""
+    base = datetime.datetime.now(TAIPEI).date()
+    # 每天隨機次數：若設了 min/max 範圍則今天取區間內亂數，否則用固定 daily_count
+    cnt = sch.daily_count
+    if (sch.daily_count_min or 0) > 0 and (sch.daily_count_max or 0) >= (sch.daily_count_min or 0):
+        cnt = random.randint(sch.daily_count_min, sch.daily_count_max)
+    times = [
+        as_taipei(t) for t in plan_daily_times(
+            sch.time_mode, sch.time_points or [], sch.window_start, sch.window_end,
+            cnt, sch.random_delay, base,
+        )
+    ]
+    now = _now_taipei()
+    added = 0
+    for i, t in enumerate(times):
+        if t <= now:
+            continue   # 已過的時間點跳過
+        scheduler.add_job(
+            func=run_marketplace_job, trigger=DateTrigger(run_date=t),
+            args=[sch.id], id=f"mp_{sch.id}_{i}", replace_existing=True,
+        )
+        added += 1
+    return added, times
+
+
+def remove_schedule_jobs(schedule_id: int):
+    for job in list(scheduler.get_jobs()):
+        if job.id.startswith(f"mp_{schedule_id}_"):
+            job.remove()
+
+
+async def restore_marketplace_schedules():
+    """重啟時：把 running 的排程重新規劃今天；並排每日 00:05 重規劃。"""
+    async with async_session_factory() as s:
+        rows = (await s.execute(select(MarketplaceSchedule).where(MarketplaceSchedule.status == "running"))).scalars().all()
+        for sch in rows:
+            # 單一排程還原失敗不可拖垮整個後端啟動
+            try:
+                plan_and_schedule(sch)
+            except Exception as e:
+                print(f"[mp] 排程 {sch.id} 還原失敗，已略過：{e}", flush=True)
+    # 每日午夜後重規劃（台北時間）
+    scheduler.add_job(func=_daily_replan, trigger=CronTrigger(hour=0, minute=5, timezone=TAIPEI),
+                      id="mp_daily_replan", replace_existing=True)
+    # 每日 03:30（台北）清理過期刊登，避開發文尖峰
+    scheduler.add_job(func=_daily_cleanup, trigger=CronTrigger(hour=3, minute=30, timezone=TAIPEI),
+                      id="mp_daily_cleanup", replace_existing=True)
+
+
+async def _daily_replan():
+    async with async_session_factory() as s:
+        rows = (await s.execute(select(MarketplaceSchedule).where(MarketplaceSchedule.status == "running"))).scalars().all()
+        for sch in rows:
+            remove_schedule_jobs(sch.id)
+            plan_and_schedule(sch)
+
+
+async def _daily_cleanup():
+    """每日清理：對每個 running 且開啟自動刪除的排程執行過期刊登刪除。
+    同帳號只跑一次（多排程共用帳號時，第二次掃到的就少了）。"""
+    async with async_session_factory() as s:
+        rows = (await s.execute(select(MarketplaceSchedule).where(MarketplaceSchedule.status == "running"))).scalars().all()
+    seen_accounts = set()
+    for sch in rows:
+        if (sch.auto_delete_days or 0) <= 0:
+            continue
+        if sch.account_id in seen_accounts:
+            continue
+        seen_accounts.add(sch.account_id)
+        try:
+            await run_marketplace_cleanup_job(sch.id)
+        except Exception:
+            continue

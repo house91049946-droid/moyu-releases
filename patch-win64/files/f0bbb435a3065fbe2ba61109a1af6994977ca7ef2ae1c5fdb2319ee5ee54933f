@@ -1,0 +1,90 @@
+"""P13：RunLog create→update 狀態轉移、duration、screenshots、result_json。
+
+執行：cd backend && python3 -m pytest tests/test_runlog.py -v
+"""
+import datetime
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.fbauto_bridge import BridgeResult, _apply_log_update
+
+
+class _LogStub:
+    """模擬 RunLog ORM 物件。"""
+    def __init__(self, created_at):
+        self.created_at = created_at
+        self.status = "running"
+        self.error_message = ""
+        self.output_tail = ""
+        self.result_json = {}
+        self.screenshot_paths = []
+        self.duration_sec = 0
+
+
+def test_apply_success():
+    log = _LogStub(datetime.datetime.utcnow() - datetime.timedelta(seconds=5))
+    result = BridgeResult(success=True, error="", output_tail="ok tail",
+                          data={"results": [{"post_url": "u"}], "screenshots": ["111/a.png"]})
+    _apply_log_update(log, result, None)
+    assert log.status == "success"
+    assert log.result_json == {"results": [{"post_url": "u"}], "screenshots": ["111/a.png"]}
+    assert log.screenshot_paths == ["111/a.png"]
+    assert log.duration_sec >= 4  # ~5 秒
+
+
+def test_apply_failed():
+    log = _LogStub(datetime.datetime.utcnow())
+    result = BridgeResult(success=False, error="boom", output_tail="err")
+    _apply_log_update(log, result, None)
+    assert log.status == "failed"
+    assert log.error_message == "boom"
+    assert log.output_tail == "err"
+
+
+def test_apply_needs_manual():
+    log = _LogStub(datetime.datetime.utcnow())
+    result = BridgeResult(success=False, error="", needs_manual_action=True, manual_action_reason="CHECKPOINT")
+    _apply_log_update(log, result, None)
+    assert log.status == "needs_manual"
+
+
+def test_explicit_screenshots_override_data():
+    log = _LogStub(datetime.datetime.utcnow())
+    result = BridgeResult(success=True, data={"screenshots": ["from/data.png"]})
+    _apply_log_update(log, result, ["explicit/shot.png"])
+    assert log.screenshot_paths == ["explicit/shot.png"]
+
+
+def test_create_update_sync_roundtrip(tmp_path, monkeypatch):
+    """以臨時 DB 驗 create_run_log_sync → update_run_log_sync 全流程。"""
+    import app.database as db
+    from sqlalchemy import create_engine, select
+    from sqlalchemy.orm import sessionmaker
+    import app.fbauto_bridge as bridge
+
+    url = f"sqlite:///{tmp_path/'r.db'}"
+    db.sync_engine = create_engine(url)
+    db.SyncSession = sessionmaker(db.sync_engine)
+    db.Base.metadata.create_all(db.sync_engine)
+
+    from app.database import RunLog
+    log_id = bridge.create_run_log_sync("nurture", fbid="111", account_id=1)
+    assert log_id is not None
+
+    with db.SyncSession() as s:
+        log = s.execute(select(RunLog).where(RunLog.id == log_id)).scalar_one()
+        assert log.status == "running"
+
+    time.sleep(1)
+    bridge.update_run_log_sync(log_id, BridgeResult(success=True, data={"actions_performed": 3}))
+
+    with db.SyncSession() as s:
+        log = s.execute(select(RunLog).where(RunLog.id == log_id)).scalar_one()
+        assert log.status == "success"
+        assert log.result_json == {"actions_performed": 3}
+        assert log.duration_sec >= 1

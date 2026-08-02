@@ -1,0 +1,91 @@
+"""P16：內容組裝純函式（標題/文案輪替、法定欄位、圖片隨機規則）。"""
+import random
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.marketplace_content import legal_footer, pick_images, assemble_content, MIN_IMAGES, FB_IMAGE_CAP
+
+
+def test_legal_footer():
+    f = legal_footer({"agent_name": "王小明", "company": "好房仲", "license_no": "123", "agent_phone": "0900"})
+    assert "經紀人：王小明" in f and "經紀業字號：123" in f and "0900" in f
+
+
+def test_legal_footer_skips_empty():
+    assert legal_footer({"agent_name": "A"}) == "經紀人：A"
+    assert legal_footer({}) == ""
+
+
+def test_pick_images_cover_first_and_count():
+    pool = [f"img{i}.jpg" for i in range(12)]
+    covers = ["img0.jpg", "img1.jpg", "img2.jpg"]
+    rng = random.Random(42)
+    images, next_cur, qr = pick_images(pool, covers, cover_cursor=0, qr_image="", rng=rng)
+    assert images[0] in covers                      # 首頁在第一張、且來自 covers
+    assert next_cur == covers.index(images[0])      # cursor 記錄本次用的索引
+    # 12 張 → ceil(12*2/3)=8，但上限 FB_IMAGE_CAP=10 → 8
+    assert len(images) == 8
+    assert len(set(images)) == len(images)          # 不重複
+
+
+def test_pick_images_cover_random_no_immediate_repeat():
+    """首頁改隨機挑，且不與上一次（cover_cursor）相同。"""
+    pool = [f"img{i}.jpg" for i in range(12)]
+    covers = ["img0.jpg", "img1.jpg", "img2.jpg"]
+    for last in range(len(covers)):
+        for seed in range(20):
+            images, next_cur, _ = pick_images(pool, covers, last, rng=random.Random(seed))
+            assert images[0] in covers
+            assert next_cur != last                  # 絕不連續同一張
+            assert next_cur == covers.index(images[0])
+
+
+def test_pick_images_min_when_few():
+    pool = ["a.jpg", "b.jpg", "c.jpg"]              # < MIN_IMAGES
+    images, _, _ = pick_images(pool, ["a.jpg"], 0, rng=random.Random(1))
+    assert images == ["a.jpg", "b.jpg", "c.jpg"]     # 用全部、首頁在前
+    assert images[0] == "a.jpg"
+
+
+def test_pick_images_respects_min_5():
+    pool = [f"img{i}.jpg" for i in range(6)]        # 6 張 → ceil(4)=4，但下限 5
+    images, _, _ = pick_images(pool, ["img0.jpg"], 0, rng=random.Random(3))
+    assert len(images) == 5
+
+
+def test_qr_random_position_not_first():
+    pool = [f"img{i}.jpg" for i in range(8)]
+    # 用固定種子讓 QR 一定被放（rng.random()<0.5）
+    for seed in range(20):
+        images, _, qr = pick_images(pool, ["img0.jpg"], 0, qr_image="qr.png", rng=random.Random(seed))
+        if qr:
+            assert "qr.png" in images
+            assert images[0] != "qr.png"            # QR 不在首頁
+            assert len(images) <= FB_IMAGE_CAP
+            break
+    else:
+        raise AssertionError("20 個種子都沒放 QR，機率邏輯可能有誤")
+
+
+def test_assemble_rotates_title_body():
+    prop = {
+        "name": "案A", "titles": ["標題1", "標題2"], "bodies": ["內文1", "內文2"],
+        "image_pool": [f"i{i}.jpg" for i in range(8)], "cover_ids": ["i0.jpg"],
+        "title_cursor": 0, "body_cursor": 0, "cover_cursor": 0, "qr_image": "",
+    }
+    legal = {"agent_name": "王", "license_no": "L1"}
+    r = assemble_content(prop, legal, rng=random.Random(5))
+    assert r["title"] == "標題1"
+    assert r["body"].startswith("內文1")
+    assert "經紀人：王" in r["body"]                  # 法定欄位有附加
+    assert r["cursors"]["title"] == 1 and r["cursors"]["body"] == 1
+    assert r["images"][0] == "i0.jpg"
+
+
+def test_assemble_no_titles_falls_back_to_name():
+    prop = {"name": "案B", "titles": [], "bodies": [], "image_pool": [], "cover_ids": []}
+    r = assemble_content(prop, {}, rng=random.Random(1))
+    assert r["title"] == "案B"
+    assert r["images"] == []

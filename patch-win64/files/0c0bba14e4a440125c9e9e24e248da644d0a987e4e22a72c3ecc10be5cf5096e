@@ -1,0 +1,268 @@
+"""Marketplace 演示 — 使用 simulate_human_typing/click 解決 React 未觸發問題
+   包含圖片上傳（FB 要求至少 1 張圖才能啟用繼續按鈕）
+   對象頁可選擇要轉發的社團（修改下方 SHARE_GROUPS 清單）"""
+import json, time
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+from src.paths import COOKIES_DIR, DATA_DIR
+from src.utils import simulate_human_typing, simulate_human_click, human_sleep, capture_screenshot
+
+fbid = "1133957806"
+
+# ── 設定：要勾選哪些社團（FB 對象頁顯示的社團名稱）──
+# 留空 = 只發布到 Marketplace，不轉發社團
+SHARE_GROUPS: list[str] = []
+# 範例：SHARE_GROUPS = ["台中買賣交流", "二手市集"]
+
+with open(COOKIES_DIR / f"{fbid}.json") as f:
+    cookies = json.load(f)
+
+p = sync_playwright().start()
+b = p.chromium.launch(headless=False, channel="chrome")
+ctx = b.new_context(
+    viewport={"width": 1280, "height": 800},
+    locale="zh-TW",
+)
+ctx.add_cookies(cookies)
+page = ctx.new_page()
+
+print("前往 Marketplace...", flush=True)
+try:
+    page.goto("https://www.facebook.com/marketplace/create/item/", wait_until="domcontentloaded", timeout=30000)
+except Exception as e:
+    print(f"goto error: {e}", flush=True)
+time.sleep(5)
+
+print(f"URL: {page.url[:80]}", flush=True)
+print(f"Title: {page.title()}", flush=True)
+
+if "marketplace/create/item" not in page.url:
+    print("❌ 未進入建立頁面")
+    page.screenshot(path="screenshot/mp_error.png")
+    ctx.close()
+    b.close()
+    p.stop()
+    exit(1)
+
+print("✅ 已進入", flush=True)
+
+# ── 步驟 1：填標題＋價格（改用 simulate_human_typing）──
+inputs = page.locator("input[type='text']").all()
+print(f"inputs: {len(inputs)}", flush=True)
+if len(inputs) < 2:
+    print(f"❌ input count={len(inputs)}")
+    page.screenshot(path="screenshot/mp_inputs.png")
+    ctx.close()
+    b.close()
+    p.stop()
+    exit(1)
+
+print("\n📝 步驟 1：逐字輸入標題...", flush=True)
+ok = simulate_human_typing(page, inputs[0], "測試藍牙耳機599元")
+print(f"   標題 {'✅ 成功' if ok else '⚠️ 降級用 fill'}", flush=True)
+if not ok:
+    inputs[0].fill("測試藍牙耳機599元")
+human_sleep(0.5, 1)
+
+print("\n💰 步驟 2：逐字輸入價格...", flush=True)
+ok = simulate_human_typing(page, inputs[1], "599")
+print(f"   價格 {'✅ 成功' if ok else '⚠️ 降級用 fill'}", flush=True)
+if not ok:
+    inputs[1].fill("599")
+human_sleep(0.5, 1)
+
+# ── 步驟 3：類別（改用 simulate_human_click）──
+print("\n📂 步驟 3：選擇類別...", flush=True)
+combos = page.locator("label[role='combobox']").all()
+print(f"   combos: {len(combos)}", flush=True)
+simulate_human_click(page, combos[0])
+time.sleep(1.5)
+opts = page.locator("[role='option']").all()
+if opts:
+    simulate_human_click(page, opts[0])
+    print("   ✅ 類別已選（點擊 option）", flush=True)
+else:
+    page.keyboard.press("ArrowDown")
+    time.sleep(0.3)
+    page.keyboard.press("Enter")
+    print("   ✅ 類別已選（鍵盤）", flush=True)
+time.sleep(1)
+
+# ── 步驟 4：狀況（依文字選「全新」）──
+print("\n🏷️  步驟 4：選擇狀況（全新）...", flush=True)
+if len(combos) >= 2:
+    simulate_human_click(page, combos[1])
+    time.sleep(1.5)
+    cond_opts = page.locator("[role='option']").all()
+    target = None
+    for o in cond_opts:
+        try:
+            if o.inner_text().strip() == "全新":
+                target = o
+                break
+        except Exception:
+            pass
+    if target:
+        simulate_human_click(page, target)
+        time.sleep(0.5)
+        shown = combos[1].inner_text().strip().replace("\n", " ")
+        print(f"   ✅ 狀況 combobox 顯示: {shown}", flush=True)
+    else:
+        print("   ⚠️ 找不到「全新」選項", flush=True)
+
+# ── 步驟 5：上傳圖片（FB 要求至少 1 張才會啟用繼續按鈕）──
+print("\n🖼️  步驟 5：上傳測試圖片...", flush=True)
+test_img = str(DATA_DIR / "shop_article_images" / "test_product_1.jpg")
+if Path(test_img).exists():
+    # 嘗試點擊新增相片區域
+    for sel in [
+        "div[role='button']:has-text('新增相片')",
+        "div[aria-label*='相片']",
+        "div[aria-label*='photo']",
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if btn.count() > 0 and btn.is_visible():
+                simulate_human_click(page, btn)
+                time.sleep(0.5)
+                break
+        except Exception:
+            continue
+
+    file_input = page.locator("input[type='file']").first
+    if file_input.count() > 0:
+        file_input.set_input_files(str(test_img))
+        print(f"   ✅ 已上傳測試圖片 ({Path(test_img).name})", flush=True)
+        time.sleep(5)  # 等 FB 處理圖片
+    else:
+        print("   ⚠️ 找不到 file input", flush=True)
+else:
+    print(f"   ❌ 找不到測試圖片: {test_img}", flush=True)
+
+# ── 步驟 6：blur/focus 強制 React flush ──
+print("\n⏳ 強制 blur/focus 讓 React flush 狀態...", flush=True)
+try:
+    inputs[1].blur()
+    time.sleep(0.3)
+    inputs[1].focus()
+except Exception:
+    pass
+time.sleep(1)
+
+# ── 步驟 7：檢查繼續按鈕 ──
+disabled = page.evaluate("() => document.querySelector('div[aria-label=\"繼續\"]')?.getAttribute('aria-disabled')")
+print(f"\n🔘 繼續按鈕狀態：{'❌ 禁用' if disabled == 'true' else '✅ 可用'}", flush=True)
+
+if disabled == "true":
+    # JS 端再強制派發一次事件
+    print("   🔄 JS 端強制派發 input/change/blur 事件...", flush=True)
+    page.evaluate("""() => {
+        document.querySelectorAll('input[type="text"]').forEach((el) => {
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('blur', { bubbles: true }));
+        });
+    }""")
+    time.sleep(1.5)
+    disabled = page.evaluate("() => document.querySelector('div[aria-label=\"繼續\"]')?.getAttribute('aria-disabled')")
+    print(f"   重試後狀態：{'❌ 禁用' if disabled == 'true' else '✅ 可用'}", flush=True)
+
+if disabled != "true":
+    print("\n🚀 點擊繼續...", flush=True)
+    btn = page.locator("div[aria-label='繼續']").first
+    simulate_human_click(page, btn)
+    time.sleep(4)
+    print(f"   URL: {page.url[:100]}", flush=True)
+
+    # ── 步驟 8：對象頁 — 勾選要轉發的社團 ──
+    if "step=audience" in page.url:
+        print(f"\n👥 對象頁 — 可轉發的社團:", flush=True)
+        if SHARE_GROUPS:
+            print(f"   目標社團: {SHARE_GROUPS}", flush=True)
+
+            # 展開「更多發布選項」
+            for sel in [
+                "div[role='button']:has-text('更多發布選項')",
+                "span:has-text('更多發布選項')",
+            ]:
+                try:
+                    expand = page.locator(sel).first
+                    if expand.count() > 0 and expand.is_visible():
+                        simulate_human_click(page, expand)
+                        time.sleep(1)
+                        break
+                except Exception:
+                    continue
+
+            # 嘗試勾選每個目標社團
+            for name in SHARE_GROUPS:
+                try:
+                    label = page.locator(f"span:has-text('{name}')").last
+                    if label.count() == 0:
+                        print(f"   ⚠️ 找不到社團: {name}", flush=True)
+                        continue
+
+                    # 往上找 role='switch' 的父層
+                    parent = label.locator("xpath=ancestor-or-self::*[@role='switch']").first
+                    if parent.count() == 0:
+                        parent = label.locator("..").first
+                        for _ in range(5):
+                            role = parent.get_attribute("role") or ""
+                            if role == "switch":
+                                break
+                            np = parent.locator("..")
+                            if np.count() == 0:
+                                break
+                            parent = np
+
+                    aria = parent.get_attribute("aria-checked") or ""
+                    if aria == "true":
+                        print(f"   [{name}] 已勾選（跳過）", flush=True)
+                        continue
+
+                    simulate_human_click(page, parent)
+                    time.sleep(0.5)
+                    aria = parent.get_attribute("aria-checked") or ""
+                    if aria == "true":
+                        print(f"   [{name}] ✅ 勾選成功", flush=True)
+                    else:
+                        print(f"   [{name}] ⚠️ 未確認", flush=True)
+                except Exception as e:
+                    print(f"   [{name}] ❌ {e}", flush=True)
+
+            page.screenshot(path="screenshot/mp_audience_selected.png")
+
+    # ── 步驟 9：發布 ──
+    time.sleep(1)
+    print("\n📤 點擊發布...", flush=True)
+    for publish_sel in [
+        "div[aria-label='發布']",
+        "div[role='button']:has-text('發布')",
+        "span:has-text('發布')",
+        "div[aria-label='發佈']",
+        "div[role='button']:has-text('發佈')",
+    ]:
+        try:
+            pub = page.locator(publish_sel).first
+            if pub.count() > 0 and pub.is_visible():
+                simulate_human_click(page, pub)
+                print(f"   ✅ 已點擊: {publish_sel}", flush=True)
+                time.sleep(4)
+                break
+        except Exception:
+            continue
+
+    print(f"   最終 URL: {page.url[:100]}", flush=True)
+
+else:
+    page.screenshot(path="screenshot/mp_disabled_final.png")
+    print("\n⚠️ 按鈕仍禁用 — 需要手動檢查 FB DOM", flush=True)
+    print("   截圖: screenshot/mp_disabled_final.png", flush=True)
+
+page.screenshot(path="screenshot/mp_demo.png")
+print(f"\n📸 截圖: screenshot/mp_demo.png", flush=True)
+print("\n全部完成，自動關閉瀏覽器...", flush=True)
+time.sleep(3)
+ctx.close()
+b.close()
+p.stop()

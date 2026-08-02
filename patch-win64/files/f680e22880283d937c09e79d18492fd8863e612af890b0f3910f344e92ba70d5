@@ -1,0 +1,22 @@
+"""路徑常數。"""
+import os
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# 可寫資料的位置（SPEC-P23 §3.2）。規則與 backend/app/config.py 對稱：
+# 未設 MOYU_DATA_ROOT → 維持原本程式目錄旁；設了 → 放 <root>/fb_auto。
+# ⚠️ backend/app/fbauto_bridge.py 也照同一份規則算出 FB_AUTO_DATA_DIR，
+#    三處必須指到同一個地方，改動時一起改。
+_DATA_ROOT = os.environ.get("MOYU_DATA_ROOT", "").strip()
+_ROOT = (Path(_DATA_ROOT).expanduser().resolve() / "fb_auto") if _DATA_ROOT else BASE_DIR
+
+DATA_DIR = _ROOT / "data"
+COOKIES_DIR = DATA_DIR / "cookies"
+SCREENSHOT_DIR = _ROOT / "screenshot"
+USER_DATA_DIR = _ROOT / "user_data"
+# config.json 屬程式設定（唯讀），留在程式目錄
+CONFIG_PATH = BASE_DIR / "config.json"
+
+for d in (DATA_DIR, COOKIES_DIR, SCREENSHOT_DIR, USER_DATA_DIR):
+    d.mkdir(parents=True, exist_ok=True)

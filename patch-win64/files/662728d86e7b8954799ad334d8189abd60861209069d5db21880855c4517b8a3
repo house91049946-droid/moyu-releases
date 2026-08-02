@@ -1,0 +1,202 @@
+"""SaaS：授權 token 落地快取 + 離線寬限 + 明確拒絕不寬限。
+
+執行：cd backend && python3 -m pytest tests/test_cloud_client.py -v
+"""
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import app.cloud_client as cc
+
+
+@pytest.fixture(autouse=True)
+def isolate(tmp_path, monkeypatch):
+    """每個測試用獨立暫存檔 + 乾淨記憶體快取 + 假雲端設定。"""
+    monkeypatch.setattr(cc, "_STATE_FILE", tmp_path / ".cloud_state")
+    monkeypatch.setattr(cc, "_LICENSE_FILE", tmp_path / ".license_key")
+    monkeypatch.setattr(cc, "_MACHINE_FILE", tmp_path / ".machine_id")
+    monkeypatch.setenv("MOYU_CLOUD_URL", "https://cloud.example.com")
+    monkeypatch.setenv("MOYU_LICENSE_KEY", "LIC-TEST-12345678")
+    monkeypatch.delenv("MOYU_OFFLINE_GRACE_DAYS", raising=False)
+    cc._token_cache["token"] = ""
+    cc._token_cache["exp"] = 0.0
+    yield
+
+
+def test_state_roundtrip_encrypted(tmp_path):
+    cc._save_state({"token": "tok1", "last_ok": 123.0, "plan": "pro"})
+    raw = (tmp_path / ".cloud_state").read_text(encoding="utf-8")
+    assert "tok1" not in raw                     # 落地必須是密文
+    st = cc._load_state()
+    assert st["token"] == "tok1" and st["plan"] == "pro"
+
+
+def test_grace_fallback_when_cloud_unreachable(monkeypatch):
+    """連不到雲端 + 落地 token 在寬限期內 → 用落地 token 放行。"""
+    cc._save_state({"token": "cached-tok", "last_ok": time.time() - 86400})  # 1 天前連過
+    monkeypatch.setattr(cc, "_activate", lambda *a, **k: (_ for _ in ()).throw(cc.CloudError("連線雲端失敗")))
+    assert cc.get_token() == "cached-tok"
+    # 寬限 token 只快取 10 分鐘，之後會再試雲端
+    assert cc._token_cache["exp"] - time.time() <= 10 * 60 + 1
+
+
+def test_grace_expired_blocks(monkeypatch):
+    """超過寬限天數 → 不放行。"""
+    cc._save_state({"token": "cached-tok", "last_ok": time.time() - (cc.grace_days() + 1) * 86400})
+    monkeypatch.setattr(cc, "_activate", lambda *a, **k: (_ for _ in ()).throw(cc.CloudError("連線雲端失敗")))
+    with pytest.raises(cc.CloudError):
+        cc.get_token()
+
+
+def test_rejected_never_gets_grace(monkeypatch):
+    """雲端明確拒絕（金鑰失效/停權）→ 即使落地 token 還新也不放行。"""
+    cc._save_state({"token": "cached-tok", "last_ok": time.time()})
+    monkeypatch.setattr(cc, "_activate", lambda *a, **k: (_ for _ in ()).throw(cc.CloudRejected("授權被拒（403）: 已停權")))
+    with pytest.raises(cc.CloudRejected):
+        cc.get_token()
+
+
+def test_call_auth_4xx_clears_cached_token(monkeypatch):
+    """雲端回 4xx → 落地 token 作廢並記錄拒絕原因。"""
+    class FakeResp:
+        status_code = 403
+        headers = {"content-type": "application/json"}
+        text = '{"detail": "授權已停用"}'
+        def json(self):
+            return {"detail": "授權已停用"}
+
+    class FakeClient:
+        def __init__(self, *a, **k): ...
+        def __enter__(self): return self
+        def __exit__(self, *a): ...
+        def post(self, *a, **k): return FakeResp()
+
+    cc._save_state({"token": "old-tok", "last_ok": time.time()})
+    monkeypatch.setattr(cc.httpx, "Client", FakeClient)
+    with pytest.raises(cc.CloudRejected):
+        cc._call_auth("/auth/heartbeat", timeout=5)
+    st = cc._load_state()
+    assert st["token"] == "" and "授權已停用" in st["rejected_reason"]
+
+
+def test_heartbeat_success_persists(monkeypatch):
+    class FakeResp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        def json(self):
+            return {"token": "new-tok", "plan": "pro", "expires_at": "2027-01-01T00:00:00"}
+
+    class FakeClient:
+        def __init__(self, *a, **k): ...
+        def __enter__(self): return self
+        def __exit__(self, *a): ...
+        def post(self, *a, **k): return FakeResp()
+
+    monkeypatch.setattr(cc.httpx, "Client", FakeClient)
+    cc.heartbeat()
+    st = cc._load_state()
+    assert st["token"] == "new-tok" and st["plan"] == "pro"
+    assert time.time() - st["last_ok"] < 5
+    assert cc._token_cache["token"] == "new-tok"
+
+
+def test_license_status_states(monkeypatch):
+    # 未設定
+    monkeypatch.setenv("MOYU_LICENSE_KEY", "")
+    assert cc.license_status(probe=False)["state"] == "unconfigured"
+    monkeypatch.setenv("MOYU_LICENSE_KEY", "LIC-TEST-12345678")
+
+    # ok：15 分鐘內連過
+    cc._save_state({"token": "t", "last_ok": time.time(), "rejected_reason": ""})
+    assert cc.license_status(probe=False)["state"] == "ok"
+
+    # grace：超過 15 分鐘、未過寬限
+    cc._save_state({"token": "t", "last_ok": time.time() - 3600, "rejected_reason": ""})
+    s = cc.license_status(probe=False)
+    assert s["state"] == "grace" and 0 < s["grace_remaining_days"] <= cc.grace_days()
+
+    # blocked：被拒
+    cc._save_state({"token": "", "last_ok": time.time(), "rejected_reason": "（403）已停權"})
+    assert cc.license_status(probe=False)["state"] == "blocked"
+
+    # never_activated：有 key 但從未成功
+    cc._clear_state()
+    assert cc.license_status(probe=False)["state"] == "never_activated"
+
+
+def test_report_usage_caches_snapshot(monkeypatch):
+    """回報成功 → 雲端聚合結果快取進 state，snapshot 讀得到；隔日快照自動失效。"""
+    import datetime
+    tz = datetime.timezone(datetime.timedelta(hours=8))
+    today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
+
+    class FakeResp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        def json(self):
+            return {"date": today, "listings": 7, "posts": 30,
+                    "caps": {"listings": 10, "posts": 50}, "over": {"listings": False, "posts": False}}
+
+    class FakeClient:
+        def __init__(self, *a, **k): ...
+        def __enter__(self): return self
+        def __exit__(self, *a): ...
+        def post(self, *a, **k): return FakeResp()
+
+    monkeypatch.setattr(cc.httpx, "Client", FakeClient)
+    monkeypatch.setattr(cc, "get_token", lambda: "tok")
+    out = cc.report_usage(listings=1, posts=3)
+    assert out and out["listings"] == 7
+    snap = cc.cloud_usage_snapshot()
+    assert snap and snap["posts"] == 30
+
+    # 過期快照（昨天）→ None
+    st = cc._load_state()
+    st["cloud_usage"]["date"] = "2000-01-01"
+    cc._save_state(st)
+    assert cc.cloud_usage_snapshot() is None
+
+
+def test_report_usage_best_effort_never_raises(monkeypatch):
+    monkeypatch.setattr(cc, "get_token", lambda: (_ for _ in ()).throw(cc.CloudError("斷網")))
+    assert cc.report_usage(listings=1) is None       # 不拋、回 None
+
+
+def test_budget_remaining_respects_cloud_snapshot(monkeypatch):
+    """雲端聚合已用 9/10 → 即使本地只用 2，剩餘 listings 以雲端為準 = 1。"""
+    import app.database as db
+    monkeypatch.setattr(db, "get_daily_budget_sync", lambda: (2, 5))
+    monkeypatch.setattr(db, "current_limits_sync", lambda: (10, 50))
+    snap = {"date": "x", "listings": 9, "posts": 10,
+            "caps": {"listings": 10, "posts": 50}}
+    monkeypatch.setattr(cc, "cloud_usage_snapshot", lambda: snap)
+    rl, rp = db.budget_remaining_sync()
+    assert rl == 1                                   # min(10-2, 10-9)
+    assert rp == 40                                  # min(50-5, 50-10)
+
+    monkeypatch.setattr(cc, "cloud_usage_snapshot", lambda: None)
+    rl, rp = db.budget_remaining_sync()
+    assert (rl, rp) == (8, 45)                       # 無快照 → 純本地
+
+
+def test_hardware_fingerprint_stable_hash():
+    """有硬體資訊的平台：回 64 位 sha256 hex 且跨次呼叫穩定。"""
+    fp1, fp2 = cc._hardware_fingerprint(), cc._hardware_fingerprint()
+    if fp1:                                          # CI/容器可能取不到 → 空字串走檔案型
+        assert len(fp1) == 64 and fp1 == fp2
+    assert cc._machine_fingerprint()                 # 任何平台都要拿得到指紋
+
+
+def test_set_and_clear_license_key(monkeypatch):
+    monkeypatch.delenv("MOYU_LICENSE_KEY", raising=False)   # 讓檔案生效
+    monkeypatch.setattr(cc, "license_status", lambda probe=True: {"state": "ok"})
+    cc.set_license_key("  LIC-NEW-KEY  ")
+    assert cc._LICENSE_FILE.read_text(encoding="utf-8") == "LIC-NEW-KEY"
+    assert cc.license_key() == "LIC-NEW-KEY"
+    cc.clear_license_key()
+    assert not cc._LICENSE_FILE.exists()
+    assert cc._load_state() == {}

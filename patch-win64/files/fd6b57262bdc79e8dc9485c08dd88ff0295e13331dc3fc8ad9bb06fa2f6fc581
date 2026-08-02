@@ -1,0 +1,81 @@
+"""SaaS：授權硬鎖 — 未啟用授權時除白名單外全 API 封鎖。
+
+執行：cd backend && python3 -m pytest tests/test_license_gate.py -v
+"""
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import app.cloud_client as cc
+from app.main import _gate_blocks, LICENSE_GATE_WHITELIST
+
+
+@pytest.fixture(autouse=True)
+def reset(monkeypatch):
+    monkeypatch.delenv("MOYU_DEV_MODE", raising=False)
+    cc.invalidate_gate_cache()
+    yield
+    cc.invalidate_gate_cache()
+
+
+# ── 路徑白名單 ────────────────────────────────────────────
+
+@pytest.mark.parametrize("path", [
+    "/api/health", "/api/license/status", "/api/license/key", "/api/version/check",
+])
+def test_whitelist_paths_not_gated(path):
+    assert _gate_blocks(path) is False
+
+
+@pytest.mark.parametrize("path", [
+    "/api/accounts", "/api/posts", "/api/marketplace/post", "/api/properties",
+    "/api/logs", "/api/jobs/x", "/api/nurture/run", "/api/status",
+])
+def test_business_paths_gated(path):
+    assert _gate_blocks(path) is True
+
+
+def test_non_api_paths_not_gated():
+    assert _gate_blocks("/uploads/img.png") is False
+    assert _gate_blocks("/") is False
+
+
+# ── 授權狀態判定 ──────────────────────────────────────────
+
+def test_gate_allows_ok_and_grace(monkeypatch):
+    for state in ("ok", "grace"):
+        cc.invalidate_gate_cache()
+        monkeypatch.setattr(cc, "license_status", lambda probe=False, s=state: {"state": s})
+        assert cc.license_gate_ok() is True
+
+
+def test_gate_blocks_bad_states(monkeypatch):
+    for state in ("unconfigured", "never_activated", "blocked"):
+        cc.invalidate_gate_cache()
+        monkeypatch.setattr(cc, "license_status", lambda probe=False, s=state: {"state": s})
+        assert cc.license_gate_ok() is False
+
+
+def test_dev_mode_bypasses(monkeypatch):
+    monkeypatch.setenv("MOYU_DEV_MODE", "1")
+    monkeypatch.setattr(cc, "license_status",
+                        lambda probe=False: (_ for _ in ()).throw(AssertionError("不應被呼叫")))
+    assert cc.license_gate_ok() is True
+
+
+def test_gate_cache_and_invalidate(monkeypatch):
+    calls = {"n": 0}
+    def fake_status(probe=False):
+        calls["n"] += 1
+        return {"state": "blocked"}
+    monkeypatch.setattr(cc, "license_status", fake_status)
+    assert cc.license_gate_ok() is False
+    assert cc.license_gate_ok() is False
+    assert calls["n"] == 1                    # 15 秒內走快取
+
+    monkeypatch.setattr(cc, "license_status", lambda probe=False: {"state": "ok"})
+    cc.invalidate_gate_cache()                # 啟用金鑰後立即重判
+    assert cc.license_gate_ok() is True
