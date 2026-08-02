@@ -1,0 +1,66 @@
+"""應用設定模組"""
+import os
+from pathlib import Path
+from pydantic_settings import BaseSettings
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# 可寫資料的位置（SPEC-P23 §3.2）。
+#
+# 未設 MOYU_DATA_ROOT → 維持原本「程式目錄旁的 data/」，便攜包行為完全不變。
+# 設了 → 資料改放該根目錄下，程式目錄可以是唯讀／可被更新覆蓋／可被卸載，
+# 供安裝檔版本用（啟動器設 MOYU_DATA_ROOT=%LOCALAPPDATA%\moyu）。
+#
+# ⚠️ 佈局規則與 FB_Auto/src/paths.py 必須一致——那是獨立套件、無法 import 本檔，
+#    兩邊各自照同一份規則算：backend → <root>/backend，FB_Auto → <root>/fb_auto。
+_DATA_ROOT = os.environ.get("MOYU_DATA_ROOT", "").strip()
+DATA_ROOT = Path(_DATA_ROOT).expanduser().resolve() if _DATA_ROOT else None
+DATA_DIR = (DATA_ROOT / "backend") if DATA_ROOT else (BASE_DIR / "data")
+
+
+class Settings(BaseSettings):
+    app_name: str = "FB Auto Poster"
+    app_version: str = "1.0.26"
+    host: str = "127.0.0.1"
+    port: int = 3081
+    debug: bool = True
+
+    # 資料庫
+    database_url: str = f"sqlite+aiosqlite:///{DATA_DIR}/fb_poster.db"
+
+    # Chrome / Chromedriver 路徑
+    chrome_binary: str = ""
+    chromedriver_path: str = ""
+
+    # Selenium 設定
+    headless: bool = False
+    page_load_timeout: int = 30
+    implicit_wait: int = 10
+
+    # 排程設定
+    scheduler_max_workers: int = 5
+
+    # CORS 允許來源（逗號分隔）。含開發埠 3000 與便攜包 13000。env: FB_CORS_ORIGINS
+    cors_origins: str = (
+        "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001,"
+        "http://localhost:13000,http://127.0.0.1:13000"
+    )
+
+    model_config = {"env_prefix": "FB_"}
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+
+settings = Settings()
+
+# 確保必要目錄存在（cookie/profile/截圖都在 FB_Auto 側，backend 只管 DB、上傳圖與登入 log）
+for d in [
+    DATA_DIR,
+    DATA_DIR / "uploads",
+    DATA_DIR / "uploads" / "group_post",
+    DATA_DIR / "logs",
+]:
+    d.mkdir(parents=True, exist_ok=True)
