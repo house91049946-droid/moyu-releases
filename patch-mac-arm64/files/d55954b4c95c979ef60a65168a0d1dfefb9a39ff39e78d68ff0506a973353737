@@ -1,0 +1,179 @@
+"""疑難排解 API（SPEC-P23 §3.5 第 1 個入口：介面內）。
+
+安裝檔版本會把程式與資料藏起來，客戶再也點不到 修復排程.bat / 診斷後端.bat，
+也翻不到 logs 資料夾——這裡把那些手段搬進介面。
+
+⚠️ 這是「後端還活著」時的入口。後端起不來的情境靠另兩個入口（開始選單捷徑、
+   啟動器自動偵測），見 SPEC-P23 §3.5。
+"""
+import datetime
+import io
+import platform
+import sys
+import zipfile
+from pathlib import Path
+
+from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
+from sqlalchemy import select
+
+from ..config import BASE_DIR, DATA_DIR, DATA_ROOT, settings
+from ..database import GpSchedule, MarketplaceSchedule, SyncSession
+from ..fbauto_bridge import FB_AUTO_DATA_DIR
+
+router = APIRouter(prefix="/api/troubleshoot", tags=["troubleshoot"])
+
+# CLI 執行日誌（login_*.log、mp_cleanup_*.log …）
+LOG_DIR = DATA_DIR / "logs"
+# 服務日誌（uvicorn / next 的 stdout）。後端啟動失敗的 traceback 只會出現在這裡
+# ——診斷包漏了它就等於沒有診斷價值。
+# 便攜包：啟動腳本導到「包根的 logs/」，即程式目錄旁（見 build_portable.py 的
+# _run_backend.bat）。安裝檔版本程式目錄可能唯讀，屆時會落在資料根下。
+# 兩個候選都掃，存在的才收。
+SERVICE_LOG_DIRS = [d for d in (
+    BASE_DIR.parent / "logs",
+    (DATA_ROOT / "logs") if DATA_ROOT else None,
+) if d is not None]
+# 單檔取尾端上限，避免長期累積的大檔把 zip 撐爆
+_TAIL_BYTES = 2 * 1024 * 1024
+# CLI 日誌只收最近幾個（客戶可能累積上百個）
+_MAX_CLI_LOGS = 20
+
+
+def _schedule_counts() -> dict:
+    """各類排程的狀態統計（不碰 FB，純讀 DB）。"""
+    out = {}
+    with SyncSession() as s:
+        for key, model in (("group_post", GpSchedule), ("marketplace", MarketplaceSchedule)):
+            try:
+                rows = s.execute(select(model)).scalars().all()
+                out[key] = {
+                    "total": len(rows),
+                    "running": sum(1 for r in rows if r.status == "running"),
+                }
+            except Exception as e:
+                out[key] = {"error": str(e)}
+    return out
+
+
+def _machine_info() -> dict:
+    """機器基本資訊。必須夠快——這支端點前端只給 8 秒，不可以叫外部程式。"""
+    info = {
+        "os": f"{platform.system()} {platform.release()}",
+        "os_version": platform.version()[:120],
+        "arch": platform.machine(),
+        "pkg_platform": "win64" if sys.platform.startswith("win") else (
+            "mac-arm64" if platform.machine() == "arm64" else f"{sys.platform}-{platform.machine()}"),
+        "python": sys.version.split()[0],
+    }
+    try:
+        import os as _os
+        info["cpu"] = _os.cpu_count()
+    except Exception:
+        pass
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        info["ram_gb"] = round(vm.total / (1024 ** 3), 1)
+        info["ram_free_gb"] = round(vm.available / (1024 ** 3), 1)
+        du = psutil.disk_usage(str(DATA_DIR))
+        info["disk_free_gb"] = round(du.free / (1024 ** 3), 1)
+    except Exception:
+        pass          # psutil 不在就算了，其餘欄位照樣有用
+    return info
+
+
+@router.get("/status")
+async def status():
+    """診斷資訊總覽：版本、平台、實際資料路徑、排程狀態。
+
+    資料路徑會因 MOYU_DATA_ROOT 而不同（SPEC-P23 §3.2），客戶回報問題時
+    我們得知道他的資料到底在哪。
+    """
+    return {
+        "version": settings.app_version,
+        "platform": f"{platform.system()} {platform.release()}",
+        "python": sys.version.split()[0],
+        # 機器基本資訊：客戶回報問題時一起帶上去，才不用來回問「你什麼系統、幾版」
+        # （2026-08-02：Windows 客戶回報抓社團跳掉，後台完全看不出他跑哪一版）
+        "machine": _machine_info(),
+        "data_root": str(DATA_ROOT) if DATA_ROOT else None,
+        "data_dir": str(DATA_DIR),
+        "fb_auto_data_dir": str(FB_AUTO_DATA_DIR),
+        "log_dir": str(LOG_DIR),
+        "log_dir_exists": LOG_DIR.exists(),
+        "service_log_dirs": [str(d) for d in SERVICE_LOG_DIRS if d.is_dir()],
+        "schedules": _schedule_counts(),
+    }
+
+
+@router.post("/open-log-folder")
+async def open_log_folder():
+    """在客戶電腦上開啟日誌資料夾（後端就跑在本機，故可行）。
+
+    優先開服務日誌那個目錄——客戶要找的通常是 backend.log。
+    """
+    import subprocess
+
+    target = next((d for d in SERVICE_LOG_DIRS if d.is_dir()),
+                  LOG_DIR if LOG_DIR.exists() else DATA_DIR)
+    target.mkdir(parents=True, exist_ok=True)
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", str(target)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(target)])
+        else:
+            subprocess.Popen(["xdg-open", str(target)])
+    except Exception as e:
+        return {"ok": False, "path": str(target), "error": str(e)}
+    return {"ok": True, "path": str(target)}
+
+
+@router.get("/diagnostic-bundle")
+async def diagnostic_bundle():
+    """打包診斷資訊成 zip 供客戶回報（記憶體內組，不落地暫存檔）。
+
+    只收日誌與環境資訊；不含 cookie、密碼、授權金鑰等機密。
+    """
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        info = await status()
+        lines = [f"摸魚 診斷資訊 {stamp}", ""]
+        for k, v in info.items():
+            lines.append(f"{k}: {v}")
+        z.writestr("info.txt", "\n".join(lines))
+
+        def _add(p: Path, arcname: str) -> None:
+            try:
+                z.writestr(arcname, p.read_bytes()[-_TAIL_BYTES:])
+            except Exception as e:
+                z.writestr(f"{arcname}.read-error.txt", str(e))
+
+        # 服務日誌（backend.log / frontend.log）——最重要，全收
+        for d in SERVICE_LOG_DIRS:
+            if not d.is_dir():
+                continue
+            for p in sorted(d.glob("*.log")):
+                if p.is_file():
+                    _add(p, f"service/{p.name}")
+
+        # CLI 執行日誌：只收最近 _MAX_CLI_LOGS 個（依修改時間新→舊）
+        if LOG_DIR.is_dir():
+            cli = [p for p in LOG_DIR.glob("*")
+                   if p.is_file() and p.suffix.lower() in (".log", ".txt")]
+            cli.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            dropped = len(cli) - _MAX_CLI_LOGS
+            for p in cli[:_MAX_CLI_LOGS]:
+                _add(p, f"logs/{p.name}")
+            if dropped > 0:
+                z.writestr("logs/_note.txt",
+                           f"另有 {dropped} 個較舊的執行日誌未收錄（只取最近 {_MAX_CLI_LOGS} 個）。\n"
+                           f"完整日誌在客戶端：{LOG_DIR}\n")
+
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="moyu-diagnostic-{stamp}.zip"'},
+    )
