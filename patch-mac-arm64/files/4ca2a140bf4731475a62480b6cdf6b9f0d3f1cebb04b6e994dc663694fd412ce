@@ -1,0 +1,153 @@
+"""貼文內容的完整性——標題、法定區塊、AI 不得吃掉客戶原文。
+
+三個都是 2026-07-31 客戶回報的實際問題：
+  1. 標題沒有跟著發出去（「發文任務」那條路徑只取了內文）
+  2. 法定文案沒有 po 上去（同一條路徑完全沒附法定區塊）
+  3. 把法定文案寫進基底文案交給 AI 改寫，AI 會把它刪掉
+
+前兩個的根因是同一件事：同樣的組裝邏輯寫了兩份，社團發文那份有帶、發文任務
+那份沒有。所以修法是抽成共用函式，並在這裡釘住行為。
+
+執行：cd backend && python3 -m pytest tests/test_post_content_integrity.py -v
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.deepseek_client import must_keep_lines, restore_dropped_lines
+from app.marketplace_content import compose_post_content
+
+
+# ── 標題要跟內文一起送出 ──────────────────────────────
+
+def test_title_is_prepended():
+    assert compose_post_content("三房車位", "採光好") == "三房車位\n\n採光好"
+
+
+def test_no_title_leaves_body_alone():
+    """沒有標題時不該多出前導空行。"""
+    assert compose_post_content("", "採光好") == "採光好"
+    assert compose_post_content(None, "採光好") == "採光好"
+
+
+def test_whitespace_only_title_is_not_a_title():
+    assert compose_post_content("   \n ", "採光好") == "採光好"
+
+
+# ── AI 不得吃掉客戶原文的電話／法定文案 ────────────────
+
+def test_must_keep_picks_phone_and_legal_lines():
+    base = ("溫馨三房\n"
+            "採光極佳、生活機能便利\n"
+            "洽詢專線 0912-345-678\n"
+            "王大明 不動產經紀人 (95)字第123456號\n")
+    keep = must_keep_lines(base)
+    assert "洽詢專線 0912-345-678" in keep
+    assert "王大明 不動產經紀人 (95)字第123456號" in keep
+    assert "採光極佳、生活機能便利" not in keep      # 一般賣點不該被鎖
+
+
+def test_dropped_phone_is_restored():
+    base = "溫馨三房\n洽詢專線 0912-345-678\n"
+    versions = [{"title": "好屋", "body": "採光極佳，生活機能便利！"}]
+
+    out = restore_dropped_lines(base, versions)
+
+    assert "0912-345-678" in out[0]["body"]
+
+
+def test_dropped_legal_line_is_restored():
+    base = "溫馨三房\n王大明 不動產經紀人 (95)字第123456號\n"
+    versions = [{"title": "好屋", "body": "採光極佳！"}]
+
+    out = restore_dropped_lines(base, versions)
+
+    assert "不動產經紀人" in out[0]["body"]
+
+
+def test_reformatted_phone_is_not_duplicated():
+    """AI 常把 0912-345-678 改寫成 0912345678——那不算弄丟，硬補會變兩支電話。"""
+    base = "洽詢專線 0912-345-678\n"
+    versions = [{"title": "好屋", "body": "快來電 0912345678 預約看屋！"}]
+
+    out = restore_dropped_lines(base, versions)
+
+    assert out[0]["body"].count("0912") == 1
+
+
+def test_kept_line_untouched_when_present():
+    base = "王大明 不動產經紀人 (95)字第123456號\n"
+    body = "採光極佳！\n王大明 不動產經紀人 (95)字第123456號"
+    versions = [{"title": "好屋", "body": body}]
+
+    assert restore_dropped_lines(base, versions)[0]["body"] == body
+
+
+def test_no_contact_info_means_no_changes():
+    base = "溫馨三房，採光極佳"
+    versions = [{"title": "好屋", "body": "改寫過的內文"}]
+
+    assert restore_dropped_lines(base, versions)[0]["body"] == "改寫過的內文"
+
+
+def test_all_versions_are_checked():
+    base = "洽詢專線 0912-345-678\n"
+    versions = [{"title": f"版本{i}", "body": "沒有電話的內文"} for i in range(3)]
+
+    out = restore_dropped_lines(base, versions)
+
+    assert all("0912-345-678" in v["body"] for v in out)
+
+
+# ── 法定文案：四條發文路徑都必須真的帶到 ──────────────────
+#
+# 2026-08-02 客戶再次回報「法定文案沒有跟內文一起發出去」。根因不是組裝邏輯，
+# 而是 marketplace_runner 的 schedule snapshot 漏了 footer_text 這個欄位：
+# legal_footer() 於是退回組結構化欄位（agent_name/company/...），而那些欄位
+# 根本沒有輸入介面、永遠是空的 → 組出空字串 → 一個字都沒附。
+# GP 與發文任務兩條有帶、只有 MP 漏，所以症狀是「有些路徑有、有些沒有」。
+
+import inspect
+
+from app.marketplace_content import assemble_content, legal_footer
+
+_FOOTER = "某某不動產-某某加盟店\n某某不動產經紀有限公司\n某某 (某市)經紀字第00000號"
+
+
+def test_footer_text_wins_over_structured_fields():
+    assert legal_footer({"footer_text": _FOOTER, "agent_name": "不該用到"}) == _FOOTER
+
+
+def test_legal_footer_survives_none_columns():
+    """欄位是後來才加的，舊資料列讀出來是 None——這裡炸掉等於整批發文中斷。"""
+    assert legal_footer({k: None for k in
+                         ("footer_text", "agent_name", "company",
+                          "license_no", "agent_phone", "extra")}) == ""
+    assert legal_footer({}) == ""
+    assert legal_footer(None) == ""
+
+
+def test_assemble_content_appends_footer():
+    prop = {"titles": ["標題"], "bodies": ["內文"], "title_cursor": 0, "body_cursor": 0,
+            "image_pool": [], "cover_ids": []}
+    body = assemble_content(prop, {"footer_text": _FOOTER})["body"]
+    assert body.startswith("內文")
+    assert body.endswith(_FOOTER), "法定文案必須附在內文結尾"
+
+
+def test_every_runner_passes_footer_text():
+    """釘住根因：每條發文路徑組給 legal_footer 的 dict 都必須包含 footer_text。
+
+    這是原始碼層級的檢查——漏掉這個鍵不會報錯，只會安靜地少發法定文案，
+    正是它上次躲過所有檢查的原因。
+    """
+    from app.scheduler import group_post_runner, marketplace_runner, task_runner
+    from app.api import marketplace as mp_api
+
+    for mod in (group_post_runner, marketplace_runner, task_runner, mp_api):
+        src = inspect.getsource(mod)
+        assert '"footer_text"' in src, (
+            f"{mod.__name__} 組法定 dict 時沒帶 footer_text——"
+            f"legal_footer() 會退回空的結構化欄位，等於不附法定文案"
+        )
