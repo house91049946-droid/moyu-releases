@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    摸魚 App 圖示（給 .icns / .ico 用，1024 見方）。
+
+    原本 .app 的圖示是拿 32×32 的 favicon 放大到 1024，糊成一片。這支是照
+    App 圖示的規格重畫：圓角方磚底 + 海水漸層 + 主角魚，遠看認得出、
+    縮到 16px 也還看得懂輪廓。配色沿用 favicon（魚 #38bdf8、深海 #0f172a）。
+  -->
+  <defs>
+    <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1e3a5f"/>
+      <stop offset="55%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#070d1a"/>
+    </linearGradient>
+    <linearGradient id="fish" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7dd3fc"/>
+      <stop offset="60%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#0ea5e9"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="45%" stop-color="#ffffff" stop-opacity="0.03"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.42" cy="0.46" r="0.55">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- 底磚：macOS 風格圓角方 -->
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#sea)"/>
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#glow)"/>
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#gloss)"/>
+
+  <!-- 水面光紋：兩道細弧，暗示「在水裡」 -->
+  <g stroke="#38bdf8" stroke-opacity="0.22" stroke-width="14" stroke-linecap="round" fill="none">
+    <path d="M188 252 q80 -42 160 0 t160 0"/>
+    <path d="M520 200 q70 -36 140 0"/>
+  </g>
+
+  <!-- 魚（重心略偏左下，右側留給尾鰭） -->
+  <g transform="translate(512 552)">
+    <!-- 尾鰭 -->
+    <path d="M150 0 L300 -104 Q272 0 300 104 Z" fill="url(#fish)" opacity="0.92"/>
+    <!-- 背鰭：要真的凸出身體輪廓，縮到 16px 才看得出是魚而不是一顆蛋 -->
+    <path d="M-40 -120 Q20 -246 128 -128 Q34 -168 -40 -120 Z" fill="#0ea5e9"/>
+    <!-- 腹鰭 -->
+    <path d="M-16 110 Q30 210 132 128 Q40 152 -16 110 Z" fill="#0284c7"/>
+    <!-- 身體 -->
+    <ellipse cx="0" cy="0" rx="222" ry="140" fill="url(#fish)"/>
+    <!-- 身體上緣高光 -->
+    <path d="M-190 -44 Q-40 -150 150 -70 Q-20 -108 -190 -44 Z" fill="#ffffff" opacity="0.20"/>
+    <!-- 鰓線 -->
+    <path d="M-96 -92 Q-128 0 -96 92" stroke="#0284c7" stroke-width="12"
+          stroke-linecap="round" fill="none" opacity="0.55"/>
+    <!-- 眼睛 -->
+    <circle cx="-124" cy="-30" r="30" fill="#f8fafc"/>
+    <circle cx="-132" cy="-30" r="17" fill="#0f172a"/>
+    <circle cx="-140" cy="-38" r="6" fill="#ffffff" opacity="0.9"/>
+  </g>
+
+  <!-- 氣泡：讓畫面有「悠哉」的感覺 -->
+  <g fill="#e0f2fe">
+    <circle cx="286" cy="380" r="26" opacity="0.5"/>
+    <circle cx="228" cy="304" r="16" opacity="0.36"/>
+    <circle cx="196" cy="246" r="10" opacity="0.24"/>
+  </g>
+</svg>
