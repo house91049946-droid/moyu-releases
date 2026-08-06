@@ -1,0 +1,142 @@
+"""自動養號的每日排程（老闆 2026-08-06：時長區間隨機、一日次數隨機、時間隨機）。
+
+沿用 marketplace_runner 的模式：
+- 啟動時與每日 00:15（台北）規劃當天——在 window 內隨機灑 N 個時間點
+  （N 在 daily_count_min/max 區間隨機），每點掛一個 DateTrigger。
+- 觸發時長在 duration_min/max 區間隨機取。三層隨機，行為才不像鬧鐘。
+- 尊重全域暫停；帳號忙（同 fbid 已有瀏覽器任務）就跳過這一點，
+  fbauto_bridge 的 busy-wait 已經處理排隊，不必自己搶。
+"""
+import datetime
+import random
+
+from sqlalchemy import select
+
+from ..database import async_session_factory, Account, NurtureConfig
+from .marketplace_planner import plan_daily_times
+from .task_runner import scheduler
+
+try:
+    from zoneinfo import ZoneInfo
+    TAIPEI = ZoneInfo("Asia/Taipei")
+except Exception:                                    # pragma: no cover
+    TAIPEI = datetime.timezone(datetime.timedelta(hours=8))
+
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+
+
+def _as_taipei(t: datetime.datetime) -> datetime.datetime:
+    return t.replace(tzinfo=TAIPEI) if t.tzinfo is None else t.astimezone(TAIPEI)
+
+
+async def get_or_create_config(session, account_id: int) -> NurtureConfig:
+    cfg = (await session.execute(
+        select(NurtureConfig).where(NurtureConfig.account_id == account_id)
+    )).scalars().first()
+    if not cfg:
+        cfg = NurtureConfig(account_id=account_id)
+        session.add(cfg)
+        await session.flush()
+    return cfg
+
+
+def _remove_jobs():
+    for job in list(scheduler.get_jobs()):
+        if job.id.startswith("nurture_"):
+            job.remove()
+
+
+async def run_scheduled_nurture(account_id: int):
+    """單次自動養號：檢查暫停/綁定/cookie → spawn CLI（時長區間隨機）。"""
+    import asyncio
+
+    from ..fbauto_bridge import start_long_op, cookie_exists
+    from ..database import get_system_state_sync
+
+    try:
+        st = await asyncio.to_thread(get_system_state_sync)
+        if getattr(st, "paused", None) or (isinstance(st, dict) and st.get("paused")):
+            print("[nurture-sched] 系統已暫停，略過本次自動養號", flush=True)
+            return
+    except Exception:
+        pass
+
+    async with async_session_factory() as s:
+        acc = (await s.execute(select(Account).where(Account.id == account_id))).scalar_one_or_none()
+        if not acc or not acc.fb_user_id:
+            print("[nurture-sched] 帳號不存在或未綁定，略過", flush=True)
+            return
+        cfg = await get_or_create_config(s, account_id)
+        if not cfg.enabled:
+            return                                     # 期間被關掉了
+        duration = random.randint(min(cfg.duration_min or 3, cfg.duration_max or 8),
+                                  max(cfg.duration_min or 3, cfg.duration_max or 8))
+        fbid = acc.fb_user_id
+        headless = bool(cfg.headless)
+
+    if not cookie_exists(fbid):
+        print(f"[nurture-sched] cookie 不存在（{fbid}），略過本次自動養號", flush=True)
+        return
+
+    args = ["--fbid", fbid, "--duration", str(duration)]
+    if headless:
+        args.append("--headless")
+    try:
+        job_id = start_long_op("nurture", "src.run_nurture", args,
+                               account_id=account_id, fbid=fbid)
+        print(f"[nurture-sched] 自動養號啟動：{duration} 分鐘（job {job_id}）", flush=True)
+    except RuntimeError as e:
+        # 同 fbid 正忙（排程發文中等）——本次讓路，明天還有
+        print(f"[nurture-sched] 略過：{e}", flush=True)
+
+
+async def plan_and_schedule() -> list[str]:
+    """把「今天剩餘」的自動養號時間點排入 APScheduler。回傳排定時間（顯示用）。"""
+    _remove_jobs()
+    async with async_session_factory() as s:
+        row = (await s.execute(
+            select(NurtureConfig).where(NurtureConfig.enabled == True)  # noqa: E712
+        )).scalars().first()
+        if not row:
+            return []
+        lo = max(1, min(row.daily_count_min or 1, row.daily_count_max or 1))
+        hi = max(lo, row.daily_count_max or 1)
+        count = random.randint(lo, hi)
+        account_id = row.account_id
+        window = (row.window_start or "09:00", row.window_end or "22:00")
+
+    base = datetime.datetime.now(TAIPEI).date()
+    times = [_as_taipei(t) for t in plan_daily_times(
+        "window", [], window[0], window[1], count, False, base)]
+    now = datetime.datetime.now(TAIPEI)
+    planned = []
+    for i, t in enumerate(times):
+        if t <= now:
+            continue
+        scheduler.add_job(func=run_scheduled_nurture, trigger=DateTrigger(run_date=t),
+                          args=[account_id], id=f"nurture_{i}", replace_existing=True)
+        planned.append(t.strftime("%H:%M"))
+    if planned:
+        print(f"[nurture-sched] 今日自動養號已排 {len(planned)} 次：{'、'.join(planned)}", flush=True)
+    return planned
+
+
+def scheduled_times_today() -> list[str]:
+    """目前已排定、還沒執行的時間點（前端顯示用）。"""
+    out = []
+    for job in scheduler.get_jobs():
+        if job.id.startswith("nurture_") and job.id != "nurture_daily_replan" and job.next_run_time:
+            out.append(job.next_run_time.astimezone(TAIPEI).strftime("%H:%M"))
+    return sorted(out)
+
+
+async def restore_nurture_schedule():
+    """啟動時：規劃今天剩餘場次＋掛每日 00:15 重規劃。"""
+    try:
+        await plan_and_schedule()
+    except Exception as e:
+        print(f"[nurture-sched] 啟動規劃失敗（不影響其他功能）：{e}", flush=True)
+    scheduler.add_job(func=plan_and_schedule,
+                      trigger=CronTrigger(hour=0, minute=15, timezone=TAIPEI),
+                      id="nurture_daily_replan", replace_existing=True)
