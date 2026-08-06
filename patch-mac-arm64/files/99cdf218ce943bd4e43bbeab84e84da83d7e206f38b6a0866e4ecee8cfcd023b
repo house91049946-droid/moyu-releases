@@ -1,0 +1,389 @@
+"""疑難排解 API（SPEC-P23 §3.5 第 1 個入口：介面內）。
+
+安裝檔版本會把程式與資料藏起來，客戶再也點不到 修復排程.bat / 診斷後端.bat，
+也翻不到 logs 資料夾——這裡把那些手段搬進介面。
+
+⚠️ 這是「後端還活著」時的入口。後端起不來的情境靠另兩個入口（開始選單捷徑、
+   啟動器自動偵測），見 SPEC-P23 §3.5。
+"""
+import datetime
+import io
+import platform
+import sys
+import zipfile
+from pathlib import Path
+
+from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
+from sqlalchemy import select
+
+from ..config import BASE_DIR, DATA_DIR, DATA_ROOT, settings
+from ..database import GpSchedule, MarketplaceSchedule, RunLog, SyncSession
+from ..fbauto_bridge import FB_AUTO_DATA_DIR
+
+router = APIRouter(prefix="/api/troubleshoot", tags=["troubleshoot"])
+
+# CLI 執行日誌（login_*.log、mp_cleanup_*.log …）
+LOG_DIR = DATA_DIR / "logs"
+# 服務日誌（uvicorn / next 的 stdout）。後端啟動失敗的 traceback 只會出現在這裡
+# ——診斷包漏了它就等於沒有診斷價值。
+# 便攜包：啟動腳本導到「包根的 logs/」，即程式目錄旁（見 build_portable.py 的
+# _run_backend.bat）。安裝檔版本程式目錄可能唯讀，屆時會落在資料根下。
+# 兩個候選都掃，存在的才收。
+SERVICE_LOG_DIRS = [d for d in (
+    BASE_DIR.parent / "logs",
+    (DATA_ROOT / "logs") if DATA_ROOT else None,
+) if d is not None]
+# 單檔取尾端上限，避免長期累積的大檔把 zip 撐爆
+_TAIL_BYTES = 2 * 1024 * 1024
+# CLI 日誌只收最近幾個（客戶可能累積上百個）
+_MAX_CLI_LOGS = 20
+
+
+def _schedule_counts() -> dict:
+    """各類排程的狀態統計（不碰 FB，純讀 DB）。"""
+    out = {}
+    with SyncSession() as s:
+        for key, model in (("group_post", GpSchedule), ("marketplace", MarketplaceSchedule)):
+            try:
+                rows = s.execute(select(model)).scalars().all()
+                out[key] = {
+                    "total": len(rows),
+                    "running": sum(1 for r in rows if r.status == "running"),
+                }
+            except Exception as e:
+                out[key] = {"error": str(e)}
+    return out
+
+
+def _machine_info() -> dict:
+    """機器基本資訊。必須夠快——這支端點前端只給 8 秒，不可以叫外部程式。"""
+    info = {
+        "os": f"{platform.system()} {platform.release()}",
+        "os_version": platform.version()[:120],
+        "arch": platform.machine(),
+        "pkg_platform": "win64" if sys.platform.startswith("win") else (
+            "mac-arm64" if platform.machine() == "arm64" else f"{sys.platform}-{platform.machine()}"),
+        "python": sys.version.split()[0],
+    }
+    try:
+        import os as _os
+        info["cpu"] = _os.cpu_count()
+    except Exception:
+        pass
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        info["ram_gb"] = round(vm.total / (1024 ** 3), 1)
+        info["ram_free_gb"] = round(vm.available / (1024 ** 3), 1)
+        du = psutil.disk_usage(str(DATA_DIR))
+        info["disk_free_gb"] = round(du.free / (1024 ** 3), 1)
+    except Exception:
+        pass          # psutil 不在就算了，其餘欄位照樣有用
+    return info
+
+
+def _detect_system_chrome() -> dict:
+    """找系統安裝的 Google Chrome（不呼叫外部程式，純檔案系統判斷——要快）。
+
+    為什麼重要：FB 自動化預設走 Playwright channel="chrome"（用系統 Chrome，
+    真實指紋）。那台若沒裝 Chrome，抓社團/登入會**瞬間**失敗——2026-08 Windows
+    客戶「按了馬上跳掉」的頭號嫌疑。這裡就是要在授權頁把這件事講明白。
+    """
+    import re as _re
+    found, version = None, ""
+    if sys.platform.startswith("win"):
+        import os as _os
+        for base in (_os.environ.get("PROGRAMFILES"),
+                     _os.environ.get("PROGRAMFILES(X86)"),
+                     _os.environ.get("LOCALAPPDATA")):
+            if not base:
+                continue
+            exe = Path(base) / "Google/Chrome/Application/chrome.exe"
+            if exe.is_file():
+                found = exe
+                # 版本目錄跟 chrome.exe 同層（例：Application/151.0.7922.76/）
+                vers = sorted((d.name for d in exe.parent.iterdir()
+                               if d.is_dir() and _re.fullmatch(r"[\d.]+", d.name)), reverse=True)
+                version = vers[0] if vers else ""
+                break
+    elif sys.platform == "darwin":
+        for app in (Path("/Applications/Google Chrome.app"),
+                    Path.home() / "Applications/Google Chrome.app"):
+            exe = app / "Contents/MacOS/Google Chrome"
+            if exe.is_file():
+                found = exe
+                try:
+                    import plistlib
+                    with open(app / "Contents/Info.plist", "rb") as f:
+                        version = plistlib.load(f).get("CFBundleShortVersionString", "")
+                except Exception:
+                    version = ""
+                break
+    else:
+        import shutil as _shutil
+        p = _shutil.which("google-chrome") or _shutil.which("google-chrome-stable")
+        if p:
+            found = Path(p)
+    return {"installed": found is not None,
+            "path": str(found) if found else "",
+            "version": version}
+
+
+def _detect_bundled_chromium() -> dict:
+    """包內 Chromium（browsers/chromium-*）。有它才有『沒裝 Chrome 也能跑』的退路。"""
+    import os as _os
+    cands = []
+    env = _os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+    if env:
+        cands.append(Path(env))
+    cands.append(BASE_DIR.parent / "browsers")
+    for d in cands:
+        if d.is_dir() and any(d.glob("chromium-*")):
+            return {"present": True, "path": str(d)}
+    return {"present": False, "path": ""}
+
+
+@router.get("/env-check")
+async def env_check():
+    """環境認證（授權管理頁用）：逐項檢查會讓客戶卡住的環境因素，附修復方式。
+
+    每項：status = ok / warn / fail。純本機檢查 + 一個 5 秒的雲端連線探測。
+    """
+    import asyncio
+
+    checks: list[dict] = []
+
+    # 1) 系統 Chrome —— FB 自動化預設用它
+    chrome = _detect_system_chrome()
+    bundled = _detect_bundled_chromium()
+    if chrome["installed"]:
+        checks.append({
+            "key": "chrome", "label": "Google Chrome（發文用瀏覽器）", "status": "ok",
+            "detail": f"已安裝 {chrome['version'] or ''}".strip(),
+        })
+    else:
+        checks.append({
+            "key": "chrome", "label": "Google Chrome（發文用瀏覽器）", "status": "fail",
+            "detail": "找不到系統安裝的 Google Chrome——登入、抓社團、發文都會馬上失敗",
+            "fix": "請到 https://www.google.com/chrome/ 下載安裝 Google Chrome 後，"
+                   "回到本頁按「重新檢測」確認變成綠燈。",
+        })
+
+    # 2) 內建瀏覽器（備援）
+    checks.append({
+        "key": "bundled_chromium", "label": "內建瀏覽器（備援）",
+        "status": "ok" if bundled["present"] else "warn",
+        "detail": "已隨程式附帶" if bundled["present"] else "未找到內建瀏覽器（一般不影響，僅失去備援）",
+    })
+
+    # 3) 記憶體 —— Chrome 起不來的常見原因
+    try:
+        import psutil
+        avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+        if avail_gb < 1.5:
+            checks.append({
+                "key": "memory", "label": "可用記憶體", "status": "warn",
+                "detail": f"目前只剩 {avail_gb:.1f} GB——瀏覽器可能起不來或中途被系統關閉",
+                "fix": "請先關閉其他大型程式（瀏覽器分頁、修圖軟體…）再執行發文或抓社團。",
+            })
+        else:
+            checks.append({"key": "memory", "label": "可用記憶體", "status": "ok",
+                           "detail": f"{avail_gb:.1f} GB 可用"})
+    except Exception:
+        pass
+
+    # 4) 磁碟空間
+    try:
+        import psutil
+        free_gb = psutil.disk_usage(str(DATA_DIR)).free / (1024 ** 3)
+        checks.append({
+            "key": "disk", "label": "磁碟空間",
+            "status": "ok" if free_gb >= 2 else "warn",
+            "detail": f"{free_gb:.1f} GB 可用" + ("" if free_gb >= 2 else "——低於 2 GB，更新與日誌可能失敗"),
+            **({} if free_gb >= 2 else {"fix": "請清理磁碟釋放空間。"}),
+        })
+    except Exception:
+        pass
+
+    # 5) 雲端連線（授權、AI 文案都要靠它）
+    from ..cloud_client import cloud_url
+    url = cloud_url()
+    if not url:
+        checks.append({"key": "cloud", "label": "雲端服務連線", "status": "fail",
+                       "detail": "未設定雲端網址（MOYU_CLOUD_URL）",
+                       "fix": "請聯絡廠商。"})
+    else:
+        def _probe() -> tuple[bool, str]:
+            try:
+                from .. import http_client
+                with http_client.client(5) as c:
+                    r = c.get(f"{url}/health")
+                return r.status_code == 200, f"HTTP {r.status_code}"
+            except Exception as e:
+                return False, str(e)[:120]
+        ok, detail = await asyncio.to_thread(_probe)
+        checks.append({
+            "key": "cloud", "label": "雲端服務連線",
+            "status": "ok" if ok else "fail",
+            "detail": "連線正常" if ok else f"連不上（{detail}）",
+            **({} if ok else {"fix": "請確認電腦有網路、公司防火牆未擋住對外連線；"
+                                     "斷網時授權有離線寬限，恢復連線後會自動回復。"}),
+        })
+
+    overall = ("fail" if any(c["status"] == "fail" for c in checks)
+               else "warn" if any(c["status"] == "warn" for c in checks) else "ok")
+    return {"overall": overall, "checks": checks}
+
+
+@router.get("/status")
+async def status():
+    """診斷資訊總覽：版本、平台、實際資料路徑、排程狀態。
+
+    資料路徑會因 MOYU_DATA_ROOT 而不同（SPEC-P23 §3.2），客戶回報問題時
+    我們得知道他的資料到底在哪。
+    """
+    return {
+        "version": settings.app_version,
+        "platform": f"{platform.system()} {platform.release()}",
+        "python": sys.version.split()[0],
+        # 機器基本資訊：客戶回報問題時一起帶上去，才不用來回問「你什麼系統、幾版」
+        # （2026-08-02：Windows 客戶回報抓社團跳掉，後台完全看不出他跑哪一版）
+        "machine": _machine_info(),
+        "data_root": str(DATA_ROOT) if DATA_ROOT else None,
+        "data_dir": str(DATA_DIR),
+        "fb_auto_data_dir": str(FB_AUTO_DATA_DIR),
+        "log_dir": str(LOG_DIR),
+        "log_dir_exists": LOG_DIR.exists(),
+        "service_log_dirs": [str(d) for d in SERVICE_LOG_DIRS if d.is_dir()],
+        "schedules": _schedule_counts(),
+    }
+
+
+@router.get("/recent-errors")
+async def recent_errors(limit: int = 5):
+    """最近的失敗紀錄 + 服務日誌尾端，供回饋自動附上。
+
+    為什麼要有：客戶勾了「同時傳送日誌」送回來的四次回饋，實際日誌都是 0 字元
+    （2026-08-04 查出）。那個緩衝抓的是瀏覽器 console，而我們自己的失敗路徑
+    根本沒往 console 寫東西——真正的錯誤在後端的 CLI 日誌裡，從來沒送出來過。
+    這支把後端真正知道的東西整理成一段純文字，回饋直接帶走。
+    """
+    out: list[str] = []
+
+    # 1) 最近的失敗／需人工 RunLog（CLI 的實際錯誤與 stdout 尾端都在這裡）
+    try:
+        with SyncSession() as s:
+            rows = s.execute(
+                select(RunLog)
+                .where(RunLog.status.in_(("failed", "needs_manual")))
+                .order_by(RunLog.created_at.desc())
+                .limit(max(1, min(limit, 20)))
+            ).scalars().all()
+        for r in rows:
+            out.append(f"[{r.created_at:%m-%d %H:%M}] {r.task_type} {r.status}"
+                       f"（{r.duration_sec or 0}s）")
+            if r.error_message:
+                out.append(f"  error: {r.error_message[:600]}")
+            if r.output_tail:
+                out.append("  output_tail:")
+                out.extend("    " + ln for ln in r.output_tail.strip().splitlines()[-25:])
+    except Exception as e:      # noqa: BLE001 — 診斷用，永遠不能自己炸掉
+        out.append(f"（讀取執行紀錄失敗：{e}）")
+
+    # 2) 最近的 CLI 日誌檔尾端（run_sync_groups / login 等）
+    try:
+        files = sorted(LOG_DIR.glob("*.log"), key=lambda f: f.stat().st_mtime, reverse=True)[:2]
+        for f in files:
+            txt = f.read_text(encoding="utf-8", errors="replace")
+            out.append(f"--- {f.name}（尾端）---")
+            out.extend(txt.strip().splitlines()[-40:])
+    except Exception as e:      # noqa: BLE001
+        out.append(f"（讀取 CLI 日誌失敗：{e}）")
+
+    # 3) 後端服務日誌尾端（起不來的 traceback 只會在這裡）
+    try:
+        for d in SERVICE_LOG_DIRS:
+            f = d / "backend.log"
+            if f.is_file():
+                txt = f.read_text(encoding="utf-8", errors="replace")
+                out.append(f"--- backend.log（尾端）---")
+                out.extend(txt.strip().splitlines()[-40:])
+                break
+    except Exception as e:      # noqa: BLE001
+        out.append(f"（讀取 backend.log 失敗：{e}）")
+
+    text = "\n".join(out)
+    return {"text": text[-20000:], "lines": len(out)}
+
+
+@router.post("/open-log-folder")
+async def open_log_folder():
+    """在客戶電腦上開啟日誌資料夾（後端就跑在本機，故可行）。
+
+    優先開服務日誌那個目錄——客戶要找的通常是 backend.log。
+    """
+    import subprocess
+
+    target = next((d for d in SERVICE_LOG_DIRS if d.is_dir()),
+                  LOG_DIR if LOG_DIR.exists() else DATA_DIR)
+    target.mkdir(parents=True, exist_ok=True)
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", str(target)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(target)])
+        else:
+            subprocess.Popen(["xdg-open", str(target)])
+    except Exception as e:
+        return {"ok": False, "path": str(target), "error": str(e)}
+    return {"ok": True, "path": str(target)}
+
+
+@router.get("/diagnostic-bundle")
+async def diagnostic_bundle():
+    """打包診斷資訊成 zip 供客戶回報（記憶體內組，不落地暫存檔）。
+
+    只收日誌與環境資訊；不含 cookie、密碼、授權金鑰等機密。
+    """
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        info = await status()
+        lines = [f"摸魚 診斷資訊 {stamp}", ""]
+        for k, v in info.items():
+            lines.append(f"{k}: {v}")
+        z.writestr("info.txt", "\n".join(lines))
+
+        def _add(p: Path, arcname: str) -> None:
+            try:
+                z.writestr(arcname, p.read_bytes()[-_TAIL_BYTES:])
+            except Exception as e:
+                z.writestr(f"{arcname}.read-error.txt", str(e))
+
+        # 服務日誌（backend.log / frontend.log）——最重要，全收
+        for d in SERVICE_LOG_DIRS:
+            if not d.is_dir():
+                continue
+            for p in sorted(d.glob("*.log")):
+                if p.is_file():
+                    _add(p, f"service/{p.name}")
+
+        # CLI 執行日誌：只收最近 _MAX_CLI_LOGS 個（依修改時間新→舊）
+        if LOG_DIR.is_dir():
+            cli = [p for p in LOG_DIR.glob("*")
+                   if p.is_file() and p.suffix.lower() in (".log", ".txt")]
+            cli.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            dropped = len(cli) - _MAX_CLI_LOGS
+            for p in cli[:_MAX_CLI_LOGS]:
+                _add(p, f"logs/{p.name}")
+            if dropped > 0:
+                z.writestr("logs/_note.txt",
+                           f"另有 {dropped} 個較舊的執行日誌未收錄（只取最近 {_MAX_CLI_LOGS} 個）。\n"
+                           f"完整日誌在客戶端：{LOG_DIR}\n")
+
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="moyu-diagnostic-{stamp}.zip"'},
+    )
