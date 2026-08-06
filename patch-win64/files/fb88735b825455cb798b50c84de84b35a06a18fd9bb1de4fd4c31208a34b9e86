@@ -1,0 +1,184 @@
+"""備份匯出／匯入（SPEC-P23 §3.2 資料根的延伸）。
+
+為什麼要有（2026-08-06 老闆要求）：重灌電腦或換機時，客戶得重新登入 FB、
+重貼授權金鑰、重建所有物件與排程——等於整套重設一次。這裡把「換一台機器
+就回不來」的東西全部打包成一個 zip，另一台匯入就接著用。
+
+收哪些：
+  - 資料庫（fb_poster.db）：帳號、物件、文案、排程、社團清單、發文紀錄
+  - 授權金鑰（.license_key）與雲端狀態
+  - FB cookie（FB_Auto/data/cookies/）與抓好的社團清單
+  - 上傳的圖片（backend/data/uploads/）
+
+不收：日誌、螢幕截圖、瀏覽器 profile（user_data，含快取動輒上 GB，
+換機本來就該重新登入產生）。
+
+⚠️ 這個 zip 含 cookie 與授權金鑰——等同帳號憑證，請客戶妥善保管、不要外流。
+"""
+import datetime
+import io
+import json
+import shutil
+import zipfile
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi.responses import StreamingResponse
+
+from ..config import DATA_DIR, settings
+from ..fbauto_bridge import FB_AUTO_DATA_DIR
+
+router = APIRouter(prefix="/api/backup", tags=["backup"])
+
+# zip 內的邏輯目錄 → 本機實際路徑。匯出與匯入共用同一份對照，
+# 才不會出現「匯出得到、匯入放錯地方」。
+_LICENSE_FILE = DATA_DIR / ".license_key"
+_STATE_FILE = DATA_DIR / ".license_state"
+_DB_FILE = DATA_DIR / "fb_poster.db"
+
+_MANIFEST_NAME = "backup-info.json"
+# 單檔上限，防止匯入被塞入超大檔案撐爆磁碟
+_MAX_MEMBER_BYTES = 200 * 1024 * 1024
+
+
+def _iter_export_items() -> list[tuple[Path, str]]:
+    """(本機路徑, zip 內路徑) 清單。只收存在的東西。"""
+    items: list[tuple[Path, str]] = []
+
+    for f, arc in ((_DB_FILE, "backend/fb_poster.db"),
+                   (_LICENSE_FILE, "backend/.license_key"),
+                   (_STATE_FILE, "backend/.license_state")):
+        if f.is_file():
+            items.append((f, arc))
+
+    uploads = DATA_DIR / "uploads"
+    if uploads.is_dir():
+        for p in uploads.rglob("*"):
+            if p.is_file():
+                items.append((p, f"backend/uploads/{p.relative_to(uploads).as_posix()}"))
+
+    # FB_Auto 的 data：cookie 與抓好的社團清單（<fbid>.json），不含 logs/screenshot
+    if FB_AUTO_DATA_DIR.is_dir():
+        for p in FB_AUTO_DATA_DIR.rglob("*"):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(FB_AUTO_DATA_DIR)
+            if rel.parts and rel.parts[0] in ("logs", "screenshot", "screenshots"):
+                continue
+            items.append((p, f"fb_auto/{rel.as_posix()}"))
+
+    return items
+
+
+@router.get("/export")
+async def export_backup():
+    """把重灌後需要的東西全部打包成 zip 供下載。"""
+    items = _iter_export_items()
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(_MANIFEST_NAME, json.dumps({
+            "app_version": settings.app_version,
+            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "file_count": len(items),
+            "note": "摸魚備份檔。含 FB cookie 與授權金鑰，等同帳號憑證，請妥善保管。",
+        }, ensure_ascii=False, indent=2))
+        for src, arc in items:
+            try:
+                z.write(src, arc)
+            except OSError as e:      # 單檔讀不到不該讓整包失敗
+                z.writestr(f"{arc}.read-error.txt", str(e))
+
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="moyu-backup-{stamp}.zip"'},
+    )
+
+
+def _safe_target(arc: str) -> Path | None:
+    """把 zip 內路徑映回本機路徑；不認識或有跳脫意圖的一律拒絕。
+
+    安全邊界：備份檔可能來自任何地方，絕不能讓 `../../` 這種路徑寫到
+    資料目錄以外（zip slip）。
+    """
+    arc = arc.replace("\\", "/").lstrip("/")
+    if ".." in arc.split("/"):
+        return None
+
+    if arc == "backend/fb_poster.db":
+        return _DB_FILE
+    if arc == "backend/.license_key":
+        return _LICENSE_FILE
+    if arc == "backend/.license_state":
+        return _STATE_FILE
+    if arc.startswith("backend/uploads/"):
+        base, rel = DATA_DIR / "uploads", arc[len("backend/uploads/"):]
+    elif arc.startswith("fb_auto/"):
+        base, rel = FB_AUTO_DATA_DIR, arc[len("fb_auto/"):]
+    else:
+        return None
+    if not rel:
+        return None
+    target = (base / rel).resolve()
+    if not str(target).startswith(str(base.resolve())):
+        return None                     # 解析後跑出目錄外 → 丟掉
+    return target
+
+
+@router.post("/import")
+async def import_backup(file: UploadFile = File(...)):
+    """匯入備份 zip，覆蓋本機資料。
+
+    ⚠️ 會覆蓋現有資料庫與 cookie。舊檔先改名成 .bak-<時間> 留一份，
+    匯入的內容有問題時還能手動救回來。匯入後**必須重新啟動**才會生效
+    ——資料庫連線與排程都是開機時建立的。
+    """
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=422, detail="檔案是空的")
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=422, detail="不是有效的 zip 備份檔")
+
+    names = zf.namelist()
+    if _MANIFEST_NAME not in names:
+        raise HTTPException(
+            status_code=422,
+            detail="這不是摸魚的備份檔（缺少 backup-info.json）。請選擇「匯出備份」產生的 zip。")
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    restored, skipped = 0, []
+
+    for info in zf.infolist():
+        if info.is_dir() or info.filename == _MANIFEST_NAME:
+            continue
+        if info.file_size > _MAX_MEMBER_BYTES:
+            skipped.append(f"{info.filename}（檔案過大）")
+            continue
+        target = _safe_target(info.filename)
+        if target is None:
+            skipped.append(info.filename)
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():                       # 舊檔留一份再覆蓋
+                shutil.move(str(target), f"{target}.bak-{stamp}")
+            with zf.open(info) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
+            restored += 1
+        except OSError as e:
+            skipped.append(f"{info.filename}（{e}）")
+
+    if restored == 0:
+        raise HTTPException(status_code=422, detail="備份檔裡沒有可還原的內容")
+
+    return {
+        "ok": True,
+        "restored": restored,
+        "skipped": skipped[:20],
+        "restart_required": True,
+        "message": f"已還原 {restored} 個檔案。請關閉並重新啟動「摸魚」讓資料生效。",
+    }
