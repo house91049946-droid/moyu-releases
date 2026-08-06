@@ -1,0 +1,778 @@
+"""帳號管理 API"""
+import json
+import os
+import sys
+from pathlib import Path
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete, func, case
+from pydantic import BaseModel, field_serializer, field_validator
+from typing import Optional
+from datetime import datetime
+
+from ..database import get_session, Account, Group, async_session_factory
+
+router = APIRouter(prefix="/api/accounts", tags=["accounts"], redirect_slashes=False)
+
+
+class AccountCreate(BaseModel):
+    email: str
+    password: str = ""
+    note: str = ""
+    two_factor_auth: str = ""
+    cookie: str = ""
+    proxy: str = ""
+    user_agent: str = ""
+    fb_version: str = "www"
+
+
+class AccountUpdate(BaseModel):
+    password: Optional[str] = None
+    note: Optional[str] = None
+    two_factor_auth: Optional[str] = None
+    cookie: Optional[str] = None
+    proxy: Optional[str] = None
+    user_agent: Optional[str] = None
+    fb_version: Optional[str] = None
+
+
+class AccountResponse(BaseModel):
+    id: int
+    email: str
+    note: str
+    two_factor_auth: str
+    fb_version: str
+    status: str
+    fb_user_id: str
+    fb_name: str
+    proxy: str
+    user_agent: str
+    created_at: str
+    # 社團統計（列表端點才填；帳號設定頁的狀態列直接顯示，不必展開才看得到）
+    group_count: int = 0
+    mp_group_count: int = 0
+
+    model_config = {"from_attributes": True}
+
+    @field_validator('created_at', mode='before')
+    @classmethod
+    def coerce_created_at(cls, v):
+        if isinstance(v, datetime):
+            return v.isoformat()
+        return str(v) if v else ''
+
+
+@router.get("", response_model=list[AccountResponse])
+@router.get("/", response_model=list[AccountResponse])
+async def list_accounts(session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(Account).order_by(Account.created_at.desc()))
+    accounts = result.scalars().all()
+    # 每帳號的社團數／可轉發數（單帳號產品，這裡不會是大查詢）
+    counts = {r[0]: (r[1], r[2]) for r in (await session.execute(
+        select(Group.account_id,
+               func.count(Group.id),
+               func.sum(case((Group.can_post == True, 1), else_=0)))  # noqa: E712
+        .group_by(Group.account_id)
+    )).all()}
+    out = []
+    for acc in accounts:
+        item = AccountResponse.model_validate(acc)
+        total, mp = counts.get(acc.id, (0, 0))
+        item.group_count = int(total or 0)
+        item.mp_group_count = int(mp or 0)
+        out.append(item)
+    return out
+
+
+@router.post("", response_model=AccountResponse)
+@router.post("/", response_model=AccountResponse)
+async def create_account(data: AccountCreate, session: AsyncSession = Depends(get_session)):
+    # 單帳號限制
+    existing_count = await session.execute(select(Account))
+    if len(existing_count.scalars().all()) >= 1:
+        raise HTTPException(status_code=400, detail="系統僅支援單一帳號，請先刪除既有帳號再新增")
+
+    existing = await session.execute(select(Account).where(Account.email == data.email))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="帳號已存在")
+
+    from ..crypto import encrypt_secret
+    acc = Account(
+        email=data.email,
+        password=encrypt_secret(data.password),
+        note=data.note,
+        two_factor_auth=data.two_factor_auth,
+        cookie=data.cookie,
+        proxy=data.proxy,
+        user_agent=data.user_agent,
+        fb_version=data.fb_version,
+    )
+    session.add(acc)
+    await session.commit()
+    await session.refresh(acc)
+    return acc
+
+
+@router.post("/batch")
+async def batch_create_accounts(accounts: list[AccountCreate], session: AsyncSession = Depends(get_session)):
+    """批量新增帳號。系統僅支援單一帳號，超過 1 筆只取第一筆。"""
+    # 單帳號限制
+    existing_count = await session.execute(select(Account))
+    if len(existing_count.scalars().all()) >= 1:
+        raise HTTPException(status_code=400, detail="系統僅支援單一帳號，請先刪除既有帳號再新增")
+
+    if len(accounts) > 1:
+        accounts = accounts[:1]  # 只取第一筆
+    from ..crypto import encrypt_secret
+    created = []
+    skipped = []
+    for data in accounts:
+        existing = await session.execute(select(Account).where(Account.email == data.email))
+        if existing.scalar_one_or_none():
+            skipped.append(data.email)
+            continue
+        acc = Account(
+            email=data.email,
+            password=encrypt_secret(data.password),
+            note=data.note,
+            two_factor_auth=data.two_factor_auth,
+            cookie=data.cookie,
+            proxy=data.proxy,
+            user_agent=data.user_agent,
+            fb_version=data.fb_version,
+        )
+        session.add(acc)
+        created.append(data.email)
+    await session.commit()
+    return {"created": created, "skipped": skipped, "total": len(created)}
+
+
+@router.get("/{account_id}", response_model=AccountResponse)
+async def get_account(account_id: int, session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(Account).where(Account.id == account_id))
+    acc = result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    return acc
+
+
+@router.put("/{account_id}", response_model=AccountResponse)
+async def update_account(account_id: int, data: AccountUpdate, session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(Account).where(Account.id == account_id))
+    acc = result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+
+    update_data = data.model_dump(exclude_unset=True)
+    if "password" in update_data:
+        # 空字串代表不改密碼（避免把既有密文清掉）；非空才加密覆寫
+        if update_data["password"]:
+            from ..crypto import encrypt_secret
+            update_data["password"] = encrypt_secret(update_data["password"])
+        else:
+            update_data.pop("password")
+    for key, value in update_data.items():
+        setattr(acc, key, value)
+    await session.commit()
+    await session.refresh(acc)
+    return acc
+
+
+@router.get("/{account_id}/groups")
+async def get_account_groups(account_id: int, session: AsyncSession = Depends(get_session)):
+    """取回該帳號已抓取的所有社團"""
+    result = await session.execute(select(Group).where(Group.account_id == account_id).order_by(Group.group_name))
+    groups = result.scalars().all()
+    return [
+        {
+            "id": g.id,
+            "group_name": g.group_name,
+            "group_url": g.group_url,
+            "group_id": g.group_id,
+            "member_count": g.member_count,
+            "can_post": g.can_post,
+        }
+        for g in groups
+    ]
+
+
+@router.delete("/{account_id}")
+async def delete_account(account_id: int, session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(Account).where(Account.id == account_id))
+    acc = result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+
+    await session.delete(acc)
+    await session.commit()
+    return {"message": f"帳號 {acc.email} 已刪除"}
+
+
+class BindFbidRequest(BaseModel):
+    fbid: str
+
+
+@router.post("/{account_id}/bind-fbid")
+async def bind_fbid(account_id: int, data: BindFbidRequest, session: AsyncSession = Depends(get_session)):
+    """綁定 FB_Auto cookie 的 fbid 到帳號"""
+    result = await session.execute(select(Account).where(Account.id == account_id))
+    acc = result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+
+    from ..fbauto_bridge import cookie_exists
+    fbid = data.fbid.strip()
+    if not fbid:
+        raise HTTPException(status_code=422, detail="fbid 不得為空白")
+    if not cookie_exists(fbid):
+        raise HTTPException(
+            status_code=422,
+            detail=f"cookie 不存在: {fbid}，請先用 FB_Auto CLI 登入該帳號",
+        )
+
+    acc.fb_user_id = fbid
+    await session.commit()
+    await session.refresh(acc)
+    return {"id": acc.id, "email": acc.email, "fb_user_id": acc.fb_user_id}
+
+
+@router.post("/{account_id}/first-login")
+async def first_login(account_id: int, session: AsyncSession = Depends(get_session)):
+    """一鍵登入：spawn 登入子進程後即刻回傳 pending。
+    前端輪詢 GET /{id}/first-login/status，登入完成時由該端點自動綁定 fbid 並匯入社團。"""
+    from ..fbauto_bridge import start_first_login, browser_busy_reason
+
+    busy = browser_busy_reason()
+    if busy:
+        raise HTTPException(status_code=409,
+            detail=f"目前有「{busy}」正在使用瀏覽器，無法同時開啟帳號瀏覽器。請先按『緊急停止』或等目前工作結束後再試。")
+
+    result = await session.execute(select(Account).where(Account.id == account_id))
+    acc = result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    if not acc.password:
+        raise HTTPException(status_code=422, detail="此帳號未設定密碼，無法自動登入")
+
+    from ..crypto import decrypt_secret, DecryptError
+    try:
+        plain_password = decrypt_secret(acc.password)
+    except DecryptError:
+        raise HTTPException(status_code=422, detail="密碼無法解密（加密金鑰遺失），請重新編輯此帳號設定密碼")
+
+    try:
+        start_first_login(
+            account_id=acc.id,
+            email=acc.email,
+            password=plain_password,
+            headless=False,
+        )
+    except RuntimeError:
+        raise HTTPException(status_code=409, detail="登入已在進行中，請稍候或在瀏覽器完成驗證")
+
+    acc.status = "logging_in"
+    await session.commit()
+
+    return {
+        "id": acc.id,
+        "email": acc.email,
+        "state": "pending",
+        "message": "瀏覽器已開啟，請手動完成登入。系統會自動綁定 FB ID 並匯入社團。",
+    }
+
+
+@router.post("/{account_id}/relogin")
+async def relogin(account_id: int, session: AsyncSession = Depends(get_session)):
+    """快速重新登入：只換一份新 cookie，不暖身、不重抓社團。
+
+    被 FB 登出時客戶要的是趕快回到能發文的狀態；走「一鍵登入」會連帶跑
+    暖身瀏覽＋整份社團匯入（動輒好幾分鐘），而社團清單本來就還在
+    （2026-08-02 客戶回報）。進度沿用 first-login/status 輪詢。
+    """
+    from ..fbauto_bridge import start_first_login, browser_busy_reason
+
+    busy = browser_busy_reason()
+    if busy:
+        raise HTTPException(status_code=409,
+            detail=f"目前有「{busy}」正在使用瀏覽器，無法同時開啟帳號瀏覽器。請先按『緊急停止』或等目前工作結束後再試。")
+
+    acc = (await session.execute(select(Account).where(Account.id == account_id))).scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    if not acc.password:
+        raise HTTPException(status_code=422, detail="此帳號未設定密碼，無法自動登入")
+
+    from ..crypto import decrypt_secret, DecryptError
+    try:
+        plain_password = decrypt_secret(acc.password)
+    except DecryptError:
+        raise HTTPException(status_code=422, detail="密碼無法解密（加密金鑰遺失），請重新編輯此帳號設定密碼")
+
+    try:
+        start_first_login(
+            account_id=acc.id, email=acc.email, password=plain_password,
+            headless=False, skip_groups=True,
+        )
+    except RuntimeError:
+        raise HTTPException(status_code=409, detail="登入已在進行中，請稍候或在瀏覽器完成驗證")
+
+    acc.status = "logging_in"
+    await session.commit()
+    return {
+        "id": acc.id, "email": acc.email, "state": "pending",
+        "message": "瀏覽器已開啟，請完成登入（含驗證）。拿到新 cookie 就結束，不會重抓社團。",
+    }
+
+
+def _normalize_mp_ids(entries: list) -> set[str]:
+    """把 MP 可轉發清單正規化為 group_id 集合。
+    接受：group_id 字串、URL 字串（舊格式）、{name,url,group_id} dict（detect v2）。"""
+    import re
+    ids: set[str] = set()
+    for e in entries or []:
+        if isinstance(e, dict):
+            gid = e.get("group_id", "")
+            if not gid:
+                m = re.search(r"/groups/(\d+)/?", e.get("url", ""))
+                gid = m.group(1) if m else ""
+        elif isinstance(e, str):
+            m = re.search(r"/groups/(\d+)/?", e)
+            gid = m.group(1) if m else (e if e.isdigit() else "")
+        else:
+            continue
+        if gid:
+            ids.add(gid)
+    return ids
+
+
+def _unresolved_names(entries: list) -> set[str]:
+    """MP 清單中解析不出 group_id 的條目名稱（僅這些允許名稱 fallback 比對）。"""
+    import re
+    names: set[str] = set()
+    for e in entries or []:
+        if isinstance(e, dict):
+            gid = e.get("group_id", "")
+            if not gid:
+                m = re.search(r"/groups/(\d+)/?", e.get("url", ""))
+                gid = m.group(1) if m else ""
+            if not gid and e.get("name"):
+                names.add(e["name"])
+        elif isinstance(e, str) and "/groups/" not in e and not e.isdigit():
+            names.add(e)  # 舊格式純名稱
+    return names
+
+
+def _import_groups(account_id: int, groups_list: list[dict], mp_group_ids: list):
+    """以登入結果重建帳號社團列（呼叫端負責 commit）。MP 身分以 group_id 比對。"""
+    import re
+    mp_id_set = _normalize_mp_ids(mp_group_ids)
+    rows = []
+    for g in groups_list or []:
+        url = g.get("url", "")
+        gid = g.get("group_id", "")
+        if not gid:
+            m = re.search(r"/groups/(\d+)/?", url)
+            gid = m.group(1) if m else ""
+        can_post = bool(g.get("can_marketplace")) or (bool(gid) and gid in mp_id_set)
+        rows.append(Group(
+            account_id=account_id,
+            group_name=g.get("name", ""),
+            group_url=url,
+            group_id=gid,
+            can_post=can_post,
+        ))
+    return rows
+
+
+@router.get("/{account_id}/first-login/status")
+async def first_login_status(account_id: int, session: AsyncSession = Depends(get_session)):
+    """輪詢一鍵登入進度。success 時在此完成落庫：綁 fbid、匯入社團、標記 MP 可轉發。"""
+    from ..fbauto_bridge import poll_first_login
+
+    result = await session.execute(select(Account).where(Account.id == account_id))
+    acc = result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+
+    poll = poll_first_login(account_id)
+    state = poll["state"]
+
+    if state == "success":
+        acc.fb_user_id = poll["fbid"]
+        acc.status = "active"
+        # 快速重登（--skip-groups）根本沒抓社團，拿空清單去 delete+import 會把客戶
+        # 整份社團洗掉。保險起見連「一般登入但一個社團都沒抓到」也不覆蓋。
+        if poll.get("skipped_groups") or not poll.get("groups"):
+            await session.commit()
+            group_count = await session.scalar(
+                select(func.count(Group.id)).where(Group.account_id == account_id))
+            mp_count = await session.scalar(
+                select(func.count(Group.id)).where(Group.account_id == account_id, Group.can_post == True))
+            return {
+                "state": "success", "fb_user_id": acc.fb_user_id,
+                "group_count": group_count or 0, "mp_group_count": mp_count or 0,
+                "groups_kept": True,
+            }
+        await session.execute(delete(Group).where(Group.account_id == account_id))
+        rows = _import_groups(account_id, poll.get("groups", []), poll.get("mp_group_ids", []))
+        for r in rows:
+            session.add(r)
+        await session.commit()
+        return {
+            "state": "success",
+            "fb_user_id": acc.fb_user_id,
+            "group_count": len(rows),
+            "mp_group_count": sum(1 for r in rows if r.can_post),
+        }
+
+    if state == "failed":
+        acc.status = "login_failed"
+        await session.commit()
+        return {"state": "failed", "error": poll.get("error", ""), "fb_user_id": acc.fb_user_id}
+
+    if state == "pending":
+        return {"state": "pending", "elapsed_sec": poll.get("elapsed_sec", 0)}
+
+    # state == "none"：無進行中工作。若帳號已綁定 → 冪等回 success（頁面重整後再問也正確）
+    if acc.fb_user_id:
+        if acc.status == "logging_in":       # 收尾中斷（如後端重啟）遺留的狀態 → 正規化
+            acc.status = "active"
+            await session.commit()
+        group_count = await session.scalar(
+            select(func.count(Group.id)).where(Group.account_id == account_id)
+        )
+        mp_count = await session.scalar(
+            select(func.count(Group.id)).where(Group.account_id == account_id, Group.can_post == True)
+        )
+        return {
+            "state": "success",
+            "fb_user_id": acc.fb_user_id,
+            "group_count": group_count,
+            "mp_group_count": mp_count,
+        }
+    return {"state": "none"}
+
+
+@router.post("/{account_id}/unbind-fbid")
+async def unbind_fbid(account_id: int, session: AsyncSession = Depends(get_session)):
+    """解除 FB ID 綁定（cookie 檔保留，重新一鍵登入或手動綁定可復原）。"""
+    result = await session.execute(select(Account).where(Account.id == account_id))
+    acc = result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+
+    acc.fb_user_id = ""
+    acc.status = "inactive"
+    await session.commit()
+    return {"id": acc.id, "email": acc.email, "message": "已解除綁定"}
+
+
+@router.post("/{account_id}/sync-groups")
+async def sync_groups(account_id: int, use_cache: bool = False,
+                      session: AsyncSession = Depends(get_session)):
+    """重新抓取帳號社團（開瀏覽器真的去 FB 翻一次）。
+
+    ⚠️ 這支原本是「優先從本機 data 檔讀取，檔案不存在才開瀏覽器」。問題有兩個，
+    都是客戶實際踩到的（2026-08-02 Windows 客戶「抓社團馬上跳掉」）：
+
+    1. 只要 FB_Auto/data/<fbid>.json 存在，這顆按鈕就**永遠只讀舊檔、從不重抓**，
+       瞬間回應——客戶按下去畫面閃一下、社團一個都沒多，看起來就像壞掉。而首次
+       登入之後那個檔案一定存在，等於這顆按鈕從那之後就再也沒有作用。
+    2. 讀完舊檔會先 delete 掉資料庫裡**全部**社團再重建。舊檔殘缺或是空的，
+       社團就整批消失（7/30 另一位客戶回報「找不到我原有的社團」很可能是這個）。
+
+    現在預設一律重抓；use_cache=true 才走本機快取（供內部流程沿用剛抓好的結果）。
+    無論走哪條路，抓到 0 個社團時一律不動資料庫——寧可不更新，也不能把客戶的
+    社團清單清空。
+    """
+    from ..fbauto_bridge import cookie_exists
+
+    result = await session.execute(select(Account).where(Account.id == account_id))
+    acc = result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    if not acc.fb_user_id:
+        raise HTTPException(status_code=422, detail="尚未綁定 FB ID")
+
+    fbid = acc.fb_user_id
+
+    import re
+    from ..fbauto_bridge import FB_AUTO_DATA_DIR
+    data_path = FB_AUTO_DATA_DIR / f"{fbid}.json"
+    groups_list = []
+
+    if use_cache and data_path.exists():
+        try:
+            with open(data_path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            raise HTTPException(422, f"本機社團快取讀取失敗：{e}")
+        if isinstance(raw, dict):
+            for name, url in raw.items():
+                gid = ""
+                m = re.search(r"/groups/(\d+)/?", url)
+                if m:
+                    gid = m.group(1)
+                groups_list.append({"name": name, "url": url, "group_id": gid})
+    else:
+        if not cookie_exists(fbid):
+            raise HTTPException(status_code=422, detail="cookie 已失效或尚未登入，請先到帳號設定重新登入")
+        from ..fbauto_bridge import run_sync_groups, create_run_log_sync, update_run_log_sync
+        # 留一筆 RunLog：抓社團失敗原本什麼紀錄都沒有，執行紀錄與診斷包都看不到，
+        # 客戶回報「抓不到社團」時我們手上一片空白（2026-08-04）
+        log_id = create_run_log_sync("sync_groups", fbid, account_id)
+        bridge_result = await run_sync_groups(fbid=fbid)
+        update_run_log_sync(log_id, bridge_result)
+        if not bridge_result.success:
+            raise HTTPException(status_code=422, detail=f"社團抓取失敗: {bridge_result.error}")
+        groups_list = bridge_result.groups
+
+    # 抓到 0 個 → 一定是哪裡出錯（帳號沒社團也不會按這顆）。直接擋下，
+    # 不可以拿空清單去 delete 客戶既有的社團。
+    if not groups_list:
+        existing = await session.scalar(
+            select(func.count(Group.id)).where(Group.account_id == account_id))
+        raise HTTPException(
+            422,
+            f"這次一個社團都沒抓到，已保留原本的 {existing or 0} 個不動。"
+            "常見原因：FB 未登入或 cookie 失效、社團頁面載入逾時。請先重新登入再試。",
+        )
+
+    # ── 寫入 DB ──
+    await session.execute(delete(Group).where(Group.account_id == account_id))
+    for g in groups_list:
+        gid = g.get("group_id", "")
+        if not gid:
+            m = re.search(r"/groups/(\d+)/?", g.get("url", ""))
+            if m:
+                gid = m.group(1)
+        session.add(Group(
+            account_id=account_id,
+            group_name=g.get("name", ""),
+            group_url=g.get("url", ""),
+            group_id=gid,
+            can_post=False,
+        ))
+    await session.commit()
+
+    # Auto-trigger MP group detection in background (fire-and-forget)
+    import asyncio as _asyncio
+    async def _auto_detect():
+        try:
+            from ..fbauto_bridge import run_detect_mp_groups
+            br = await run_detect_mp_groups(fbid=fbid, headless=True)
+            if br.success and br.groups:
+                mp_id_set = _normalize_mp_ids(br.groups)
+                fallback_names = _unresolved_names(br.groups)
+                async with async_session_factory() as s2:
+                    all_g = await s2.execute(select(Group).where(Group.account_id == account_id))
+                    for g in all_g.scalars().all():
+                        hit = (g.group_id and g.group_id in mp_id_set) or \
+                              (g.group_name in fallback_names)
+                        if hit and not g.can_post:
+                            g.can_post = True
+                    await s2.commit()
+        except Exception:
+            pass  # auto-detect 失敗不影響主流程
+
+    _asyncio.create_task(_auto_detect())
+
+    return {
+        "total_groups": len(groups_list),
+        "groups": groups_list,
+    }
+
+
+@router.get("/{account_id}/sync-progress")
+async def sync_progress(account_id: int):
+    """抓社團的即時進度（輕量文字流）。
+
+    做法：CLI 的 stdout 會**即時**寫進 data/logs/run_sync_groups_*.log，
+    這裡回傳最新那個檔的尾端幾行；前端在等 sync-groups 回應期間每幾秒拿一次，
+    顯示「正在做什麼、抓到幾個」。成本只有讀一個小檔案的尾端——刻意不用
+    畫面串流（CDP screencast 很吃 CPU，會拖慢抓取本身）。
+    """
+    import time as _time
+    from ..fbauto_bridge import LOGIN_LOG_DIR
+    try:
+        files = sorted(LOGIN_LOG_DIR.glob("run_sync_groups_*.log"),
+                       key=lambda f: f.stat().st_mtime, reverse=True)
+    except OSError:
+        files = []
+    if not files:
+        return {"active": False, "lines": []}
+    newest = files[0]
+    age = _time.time() - newest.stat().st_mtime
+    if age > 20 * 60:            # 20 分鐘沒動靜 → 不是這一輪的
+        return {"active": False, "lines": []}
+    try:
+        with open(newest, "rb") as f:
+            f.seek(max(0, newest.stat().st_size - 8000))
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return {"active": False, "lines": []}
+    lines = [ln.strip() for ln in tail.splitlines() if ln.strip()][-12:]
+    return {"active": age < 30, "lines": lines}
+
+
+@router.post("/{account_id}/detect-mp-groups")
+async def detect_mp_groups(account_id: int, session: AsyncSession = Depends(get_session)):
+    """檢測哪些已同步社團可以轉發 Marketplace：spawn 檢測任務後回 job_id。
+    前端輪詢 GET /api/jobs/{job_id}，成功時由該端點完成 can_post 落庫。"""
+    result = await session.execute(select(Account).where(Account.id == account_id))
+    acc = result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    if not acc.fb_user_id:
+        raise HTTPException(status_code=422, detail="尚未綁定 FB ID")
+
+    fbid = acc.fb_user_id
+    from ..fbauto_bridge import start_long_op, cookie_exists
+    if not cookie_exists(fbid):
+        raise HTTPException(status_code=422, detail="cookie 已失效，請重新使用一鍵登入")
+
+    job_id = start_long_op("detect", "src.run_detect_mp_groups",
+                           ["--fbid", fbid, "--headless"],
+                           account_id=account_id, fbid=fbid)
+    return {"job_id": job_id, "state": "pending"}
+
+
+@router.post("/{account_id}/process-detect-results")
+async def process_detect_results(account_id: int, session: AsyncSession = Depends(get_session)):
+    """讀取 CLI 輸出的 marketplace_groups JSON，更新 DB can_post 欄位"""
+    result = await session.execute(select(Account).where(Account.id == account_id))
+    acc = result.scalar_one_or_none()
+    if not acc or not acc.fb_user_id:
+        raise HTTPException(status_code=422, detail="帳號不存在或尚未綁定 FB ID")
+
+    fbid = acc.fb_user_id
+    from ..fbauto_bridge import FB_AUTO_DATA_DIR
+    mp_file = FB_AUTO_DATA_DIR / f"marketplace_groups_{fbid}.json"
+
+    if not mp_file.exists():
+        return {"success": False, "message": "尚無檢測結果，請先執行檢測"}
+
+    with open(mp_file, encoding="utf-8") as f:
+        mp_entries = json.load(f)  # v2: [{name,url,group_id}]；舊格式: [名稱]
+
+    mp_id_set = _normalize_mp_ids(mp_entries)
+    fallback_names = _unresolved_names(mp_entries)
+
+    all_groups = await session.execute(select(Group).where(Group.account_id == account_id))
+    updated = 0
+    matched_by_name = 0
+    for g in all_groups.scalars().all():
+        if g.group_id and g.group_id in mp_id_set:
+            should_post = True
+        elif g.group_name in fallback_names:
+            should_post = True
+            matched_by_name += 1
+        else:
+            should_post = False
+        if g.can_post != should_post:
+            g.can_post = should_post
+            updated += 1
+
+    await session.commit()
+
+    total = await session.scalar(select(func.count(Group.id)).where(Group.account_id == account_id))
+    can_post_count = await session.scalar(
+        select(func.count(Group.id)).where(Group.account_id == account_id, Group.can_post == True)
+    )
+
+    return {
+        "success": True,
+        "total_groups": total,
+        "can_post_count": can_post_count,
+        "mp_groups_found": len(mp_entries),
+        "updated": updated,
+        "matched_by_name": matched_by_name,
+    }
+
+
+@router.get("/{account_id}/mp-groups")
+async def get_mp_groups(account_id: int, session: AsyncSession = Depends(get_session)):
+    """取得可轉發 Marketplace 的社團（can_post=True）"""
+    result = await session.execute(
+        select(Group).where(Group.account_id == account_id, Group.can_post == True)
+    )
+    groups = result.scalars().all()
+    return [
+        {
+            "id": g.id,
+            "group_name": g.group_name,
+            "group_url": g.group_url,
+            "group_id": g.group_id,
+            "can_post": g.can_post,
+        }
+        for g in groups
+    ]
+
+
+@router.post("/{account_id}/cookie-login")
+async def cookie_login(account_id: int, session: AsyncSession = Depends(get_session)):
+    """Cookie 登入：開啟瀏覽器進入 FB 主頁，保持開啟不關閉。"""
+    from ..fbauto_bridge import run_cookie_login_bg, cookie_exists, browser_busy_reason
+
+    busy = browser_busy_reason()
+    if busy:
+        raise HTTPException(status_code=409,
+            detail=f"目前有「{busy}」正在使用瀏覽器，無法同時開啟帳號瀏覽器。請先按『緊急停止』或等目前工作結束後再試。")
+
+    result = await session.execute(select(Account).where(Account.id == account_id))
+    acc = result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    if not acc.fb_user_id:
+        raise HTTPException(status_code=422, detail="尚未綁定 FB ID，請先使用一鍵登入")
+    if not cookie_exists(acc.fb_user_id):
+        acc.status = "limited"
+        await session.commit()
+        raise HTTPException(status_code=422, detail="Cookie 已失效，請重新使用一鍵登入")
+
+    # 一併把帳密帶下去：cookie 若在開啟過程中才發現失效，子進程會自動改走帳密
+    # 登入；FB 換了登入版面就把瀏覽器留給客戶手動登，不再直接關掉視窗退出。
+    plain_password = ""
+    if acc.password:
+        from ..crypto import decrypt_secret, DecryptError
+        try:
+            plain_password = decrypt_secret(acc.password)
+        except DecryptError:
+            plain_password = ""      # 解不開就退回純 cookie 行為，不擋使用者
+
+    # 背景啟動，不等待結束（瀏覽器保持開啟直到使用者手動關閉）
+    bridge_result = await run_cookie_login_bg(
+        fbid=acc.fb_user_id, email=acc.email if plain_password else "", password=plain_password,
+    )
+
+    # 只是檢查 cookie 是否仍有效，實際登入在另一個 process 中進行
+    acc.status = "active"
+    await session.commit()
+    return {
+        "id": acc.id, "email": acc.email, "fb_user_id": acc.fb_user_id,
+        "message": "瀏覽器已開啟，保持登入中" + ("（若 cookie 失效會自動帶入密碼，請在視窗完成驗證）" if plain_password else ""),
+    }
+
+
+@router.post("/{account_id}/groups/sync")
+async def sync_account_groups(account_id: int, group_urls: list[dict], session: AsyncSession = Depends(get_session)):
+    """同步帳號的社團列表"""
+    result = await session.execute(select(Account).where(Account.id == account_id))
+    acc = result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+
+    # 清除舊社團
+    await session.execute(delete(Group).where(Group.account_id == account_id))
+
+    for g in group_urls:
+        group = Group(
+            account_id=account_id,
+            group_name=g.get("name", ""),
+            group_url=g.get("url", ""),
+            group_id=g.get("group_id", ""),
+        )
+        session.add(group)
+
+    await session.commit()
+    return {"message": f"已同步 {len(group_urls)} 個社團"}

@@ -1,0 +1,222 @@
+"""P4 — 帳號養號模組（模擬真人瀏覽行為）。"""
+import random
+import time
+from dataclasses import dataclass
+from enum import Enum
+
+from playwright.sync_api import Page
+
+from src.config_loader import T
+from src.utils import enhanced_get, human_sleep, perform_checks, CheckResult, capture_screenshot
+
+
+class NurtureAction(Enum):
+    SCROLL_FEED = "scroll_feed"
+    BROWSE_GROUP = "browse_group"
+    LIKE_POST = "like_post"
+    STAY = "stay"
+    SCROLL_GROUP = "scroll_group"
+    CLICK_COMMENT = "click_comment"
+
+
+# 行為池（機率分配）
+ACTION_POOL = [
+    (NurtureAction.SCROLL_FEED, 0.30),
+    (NurtureAction.BROWSE_GROUP, 0.20),
+    (NurtureAction.LIKE_POST, 0.15),
+    (NurtureAction.STAY, 0.20),
+    (NurtureAction.SCROLL_GROUP, 0.10),
+    (NurtureAction.CLICK_COMMENT, 0.05),
+]
+
+
+@dataclass
+class NurtureResult:
+    success: bool
+    duration_sec: int
+    actions_performed: int
+    aborted_reason: str = ""
+
+
+def _pick_action() -> NurtureAction:
+    """依機率隨機選一個養號行為。"""
+    r = random.random()
+    cumulative = 0.0
+    for action, prob in ACTION_POOL:
+        cumulative += prob
+        if r <= cumulative:
+            return action
+    return NurtureAction.STAY
+
+
+def raiseaccount_www(
+    page: Page,
+    fbid: str,
+    groups: list[str],
+    duration_sec: int = 300,
+    lang: str = "zh",
+) -> NurtureResult:
+    """
+    模擬真人瀏覽行為（mbasic 版）。
+
+    Args:
+        page: Playwright Page
+        fbid: FB numeric ID
+        groups: 養號用的社團 mbasic 網址列表
+        duration_sec: 總養號時長（秒）
+        lang: 語言
+
+    Returns:
+        NurtureResult
+    """
+    print(f"[nurture] Starting for {fbid}, duration: {duration_sec}s, groups: {len(groups)}")
+    start_time = time.time()
+    actions_done = 0
+
+    while (time.time() - start_time) < duration_sec:
+        # 健康檢查
+        check = perform_checks(page, fbid)
+        if check != CheckResult.OK:
+            capture_screenshot(page, fbid, f"nurture_{check.value}")
+            return NurtureResult(
+                success=False,
+                duration_sec=int(time.time() - start_time),
+                actions_performed=actions_done,
+                aborted_reason=check.value,
+            )
+
+        action = _pick_action()
+        actions_done += 1
+        print(f"[nurture] Action {actions_done}: {action.value}")
+
+        try:
+            if action == NurtureAction.SCROLL_FEED:
+                # 捲動動態消息
+                enhanced_get(page, "https://mbasic.facebook.com/")
+                human_sleep(1, 3)
+                for _ in range(random.randint(3, 8)):
+                    page.mouse.wheel(0, random.randint(200, 800))
+                    human_sleep(2, 6)
+
+            elif action == NurtureAction.BROWSE_GROUP and groups:
+                # 隨機點入一個社團
+                group_url = random.choice(groups)
+                enhanced_get(page, group_url)
+                human_sleep(3, 8)
+                for _ in range(random.randint(2, 5)):
+                    page.mouse.wheel(0, random.randint(200, 600))
+                    human_sleep(2, 5)
+
+            elif action == NurtureAction.LIKE_POST:
+                _like_post(page)
+
+            elif action == NurtureAction.STAY:
+                # 只停留
+                human_sleep(5, 15)
+
+            elif action == NurtureAction.SCROLL_GROUP and groups:
+                group_url = random.choice(groups)
+                enhanced_get(page, group_url)
+                for _ in range(random.randint(3, 6)):
+                    page.mouse.wheel(0, random.randint(200, 500))
+                    human_sleep(1, 4)
+
+            elif action == NurtureAction.CLICK_COMMENT:
+                # 點開留言但不留言
+                try:
+                    comment_link = page.locator("text=/留言|comment/i").first
+                    if comment_link.count() > 0:
+                        comment_link.click(timeout=5000)
+                        human_sleep(2, 5)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print(f"[nurture] Action failed: {action.value} — {e}")
+            # 不中斷，繼續下一個行為
+
+    elapsed = int(time.time() - start_time)
+    print(f"[nurture] Completed: {actions_done} actions in {elapsed}s")
+    return NurtureResult(success=True, duration_sec=elapsed, actions_performed=actions_done)
+
+
+def _like_post(page: Page) -> bool:
+    """對目前畫面上的一篇貼文按讚。
+
+    舊寫法 `text=讚` 直接 click 有兩個問題（2026-08-06 老闆回報「按下去會有
+    按愛心等選項」）：
+    1. www 版 FB 滑鼠停在讚鈕上約半秒就彈出表情選單（讚/大心/加油…），
+       蓋住原鈕，click 落空或點到別的東西。
+    2. text=讚 會誤中讚數、留言區的讚等非按鈕元素。
+
+    做法：用 aria-label 精準找貼文讚鈕 → 取座標直接 mouse.click（移過去就
+    按，不給表情選單彈出的時間）→ 若選單還是彈出來了，就點選單裡的「讚」
+    完成按讚 → 最後按 Esc、把滑鼠移開，並用「移除讚」驗證有沒有成功。
+    """
+    btns = page.locator("div[role='button'][aria-label='讚'], div[role='button'][aria-label='Like']")
+    n = btns.count()
+    if n == 0:
+        # 舊版/文字介面（mbasic 殘留）退回文字連結
+        try:
+            fallback = page.locator("a:has-text('讚')").first
+            if fallback.count() > 0:
+                fallback.click(timeout=5000)
+                human_sleep(1, 3)
+                return True
+        except Exception:
+            pass
+        return False
+
+    btn = btns.nth(random.randrange(min(n, 5)))
+    try:
+        btn.scroll_into_view_if_needed(timeout=3000)
+        human_sleep(0.5, 1.2)
+        box = btn.bounding_box()
+        if not box:
+            return False
+        # 直接以座標快點：hover 到 click 之間幾乎沒有間隔，表情選單來不及彈
+        page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, delay=30)
+        human_sleep(1, 2)
+
+        # 表情選單還是彈出來了 → 點選單裡的「讚」（選單在 dialog/menu 容器內）
+        flyout = page.locator(
+            "div[role='dialog'] div[role='button'][aria-label='讚'], "
+            "div[role='menu'] div[role='button'][aria-label='讚'], "
+            "div[role='dialog'] div[role='button'][aria-label='Like'], "
+            "div[role='menu'] div[role='button'][aria-label='Like']")
+        if flyout.count() > 0:
+            try:
+                flyout.first.click(timeout=3000)
+                human_sleep(0.5, 1.5)
+            except Exception:
+                pass
+
+        # 收尾：關掉殘留選單、滑鼠移開，避免影響後續動作
+        try:
+            page.keyboard.press("Escape")
+            page.mouse.move(12, 12)
+        except Exception:
+            pass
+
+        liked = page.locator(
+            "div[role='button'][aria-label='移除讚'], div[role='button'][aria-label='Remove Like']"
+        ).count() > 0
+        print(f"[nurture] like_post {'成功' if liked else '未確認（可能仍成功）'}")
+        human_sleep(1, 2)
+        return liked
+    except Exception as e:
+        print(f"[nurture] like_post 失敗: {e}")
+        return False
+
+
+def success_log(fbid: str):
+    """寫一筆養號成功記錄到 schedule.log。"""
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    job_id = str(int(time.time() * 10000))
+    line = f"{ts};自動養號;成功;{fbid};;;{job_id}\n"
+    from src.paths import DATA_DIR
+    log_path = DATA_DIR / "schedule.log"
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(line)
+    print(f"[log] {line.strip()}")

@@ -1,0 +1,455 @@
+"""本地 Agent → 雲端控制台 client（授權 + AI 代理）。
+
+設定（env 或 backend/data 檔）：
+- MOYU_CLOUD_URL：雲端基底網址（設了才啟用雲端模式）
+- MOYU_LICENSE_KEY 或 backend/data/.license_key：授權金鑰
+- MOYU_OFFLINE_GRACE_DAYS：離線寬限天數（預設 5，規格允許 3–7）
+機器指紋存 backend/data/.machine_id（第一次自動產生）。
+token 快取於記憶體 + Fernet 加密落地 backend/data/.cloud_state；
+連不到雲端時用落地 token 進入離線寬限，超過寬限才鎖；
+被雲端明確拒絕（金鑰失效/停權/席次滿）不適用寬限。
+"""
+import contextlib
+import json
+import os
+import stat
+import time
+import uuid
+
+import httpx
+
+from .config import DATA_DIR
+
+_LICENSE_FILE = DATA_DIR / ".license_key"
+_MACHINE_FILE = DATA_DIR / ".machine_id"
+_STATE_FILE = DATA_DIR / ".cloud_state"
+
+_token_cache = {"token": "", "exp": 0.0}
+
+
+class CloudError(Exception):
+    pass
+
+
+class CloudRejected(CloudError):
+    """雲端明確拒絕（4xx：金鑰無效/過期/停權/席次滿）——不適用離線寬限。"""
+
+
+def grace_days() -> int:
+    try:
+        return max(1, int(os.environ.get("MOYU_OFFLINE_GRACE_DAYS", "5")))
+    except ValueError:
+        return 5
+
+
+# ── 授權狀態落地（Fernet 加密，與密碼共用金鑰）─────────────
+
+def _load_state() -> dict:
+    if not _STATE_FILE.exists():
+        return {}
+    try:
+        from .crypto import decrypt_secret
+        return json.loads(decrypt_secret(_STATE_FILE.read_text(encoding="utf-8").strip()))
+    except Exception:
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    with contextlib.suppress(Exception):
+        from .crypto import encrypt_secret
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _STATE_FILE.write_text(encrypt_secret(json.dumps(state, ensure_ascii=False)), encoding="utf-8")
+        os.chmod(_STATE_FILE, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+
+
+def _clear_state() -> None:
+    _token_cache["token"] = ""
+    _token_cache["exp"] = 0.0
+    invalidate_gate_cache()
+    with contextlib.suppress(OSError):
+        _STATE_FILE.unlink()
+
+
+def cloud_url() -> str:
+    return os.environ.get("MOYU_CLOUD_URL", "").strip().rstrip("/")
+
+
+def license_key() -> str:
+    k = os.environ.get("MOYU_LICENSE_KEY", "").strip()
+    if k:
+        return k
+    if _LICENSE_FILE.exists():
+        return _LICENSE_FILE.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def cloud_enabled() -> bool:
+    """有雲端網址 + 授權金鑰才走雲端模式。"""
+    return bool(cloud_url() and license_key())
+
+
+def _hardware_fingerprint() -> str:
+    """硬體特徵雜湊（複製程式檔案帶不走）：
+    macOS IOPlatformUUID / Windows Win32_ComputerSystemProduct.UUID / Linux machine-id。
+    取不到回空字串（由呼叫端退回檔案型指紋）。"""
+    import hashlib
+    import platform
+    import re
+    import subprocess
+    raw = ""
+    with contextlib.suppress(Exception):
+        sysname = platform.system()
+        if sysname == "Darwin":
+            out = subprocess.run(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            m = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out)
+            raw = m.group(1) if m else ""
+        elif sysname == "Windows":
+            # CREATE_NO_WINDOW：後端以隱藏視窗常駐，這裡若不加旗標，客戶在
+            # 授權管理貼上金鑰（觸發啟用→算指紋）的瞬間會閃出一個 CMD 黑窗
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_ComputerSystemProduct).UUID"],
+                capture_output=True, text=True, timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
+            raw = "" if out.upper() in ("", "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF") else out
+        else:
+            for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+                if os.path.exists(p):
+                    raw = open(p, encoding="utf-8").read().strip()
+                    break
+    if not raw:
+        return ""
+    return hashlib.sha256(f"moyu:{raw}".encode()).hexdigest()
+
+
+def _machine_fingerprint() -> str:
+    """優先硬體特徵現算（每次算、不信任落地檔）；硬體取不到才用檔案型（相容舊行為）。"""
+    fp = _hardware_fingerprint()
+    if fp:
+        with contextlib.suppress(OSError):                 # 落地僅供除錯參考
+            _MACHINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _MACHINE_FILE.write_text(fp, encoding="utf-8")
+        return fp
+    if _MACHINE_FILE.exists():
+        return _MACHINE_FILE.read_text(encoding="utf-8").strip()
+    fp = uuid.uuid4().hex
+    with contextlib.suppress(OSError):
+        _MACHINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _MACHINE_FILE.write_text(fp, encoding="utf-8")
+    return fp
+
+
+def _remember_success(payload: dict) -> None:
+    """activate/heartbeat 成功 → 更新記憶體快取 + 加密落地（供離線寬限）。"""
+    tok = payload.get("token", "")
+    _token_cache["token"] = tok
+    _token_cache["exp"] = time.time() + 55 * 60      # 保守：早於 token 實際到期就重取
+    state = _load_state()
+    state.update({
+        "token": tok,
+        "last_ok": time.time(),
+        "plan": payload.get("plan", state.get("plan", "")),
+        "display_name": payload.get("display_name", state.get("display_name", "")),
+        "caps": payload.get("caps", state.get("caps", {})),
+        "expires_at": payload.get("expires_at", state.get("expires_at")),
+        "rejected_reason": "",
+    })
+    _save_state(state)
+    invalidate_gate_cache()          # 啟用/續期成功 → 硬鎖立即重判
+
+
+def _call_auth(endpoint: str, timeout: float) -> dict:
+    """打 /auth/activate 或 /auth/heartbeat。網路問題拋 CloudError；4xx 拋 CloudRejected 並記錄。"""
+    url = cloud_url()
+    key = license_key()
+    if not (url and key):
+        raise CloudError("未設定雲端網址或授權金鑰")
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            r = c.post(f"{url}{endpoint}",
+                       json={"license_key": key, "machine_fingerprint": _machine_fingerprint()})
+    except httpx.HTTPError as e:
+        raise CloudError(f"連線雲端失敗: {e}") from e
+    if r.status_code != 200:
+        detail = r.json().get("detail", r.text[:120]) if r.headers.get("content-type", "").startswith("application/json") else r.text[:120]
+        if 400 <= r.status_code < 500:
+            state = _load_state()
+            state["rejected_reason"] = f"（{r.status_code}）{detail}"
+            state["token"] = ""            # 明確拒絕 → 落地 token 作廢，不得再靠寬限放行
+            _save_state(state)
+            _token_cache["token"] = ""
+            invalidate_gate_cache()  # 被停權/失效 → 硬鎖立即重判
+            raise CloudRejected(f"授權被拒（{r.status_code}）: {detail}")
+        raise CloudError(f"雲端異常（{r.status_code}）: {detail}")
+    return r.json()
+
+
+def _activate(timeout: float = 20) -> str:
+    """用 license_key 換 token（含機器綁定），快取 + 落地。"""
+    payload = _call_auth("/auth/activate", timeout)
+    tok = payload.get("token", "")
+    if not tok:
+        raise CloudError("雲端未回傳 token")
+    _remember_success(payload)
+    return tok
+
+
+def heartbeat(timeout: float = 15) -> dict:
+    """定期續期 token + 回報存活。成功回雲端 payload；網路失敗拋 CloudError（寬限由 get_token 處理）。"""
+    payload = _call_auth("/auth/heartbeat", timeout)
+    if payload.get("token"):
+        _remember_success(payload)
+    return payload
+
+
+def get_token() -> str:
+    """優先記憶體快取 → 重新 activate → 連不上雲端時用落地 token 走離線寬限。"""
+    if _token_cache["token"] and time.time() < _token_cache["exp"]:
+        return _token_cache["token"]
+    try:
+        return _activate()
+    except CloudRejected:
+        raise                                        # 明確拒絕不給寬限
+    except CloudError:
+        state = _load_state()
+        tok, last_ok = state.get("token", ""), float(state.get("last_ok") or 0)
+        if tok and last_ok and (time.time() - last_ok) < grace_days() * 86400:
+            # 寬限期內用落地 token；記憶體只快取 10 分鐘，之後會再試著連雲端
+            _token_cache["token"] = tok
+            _token_cache["exp"] = time.time() + 10 * 60
+            return tok
+        raise
+
+
+def license_status(probe: bool = True) -> dict:
+    """回報授權狀態給本地 UI。probe=True 時先嘗試打一次 heartbeat（短逾時）取得即時結果。"""
+    url, key = cloud_url(), license_key()
+    if not url or not key:
+        return {"state": "unconfigured", "cloud_url": url, "has_key": bool(key),
+                "grace_days": grace_days()}
+
+    error = ""
+    if probe:
+        try:
+            heartbeat(timeout=8)
+        except CloudRejected as e:
+            error = str(e)
+        except CloudError as e:
+            error = str(e)
+
+    state = _load_state()
+    last_ok = float(state.get("last_ok") or 0)
+    now = time.time()
+    if state.get("rejected_reason"):
+        st = "blocked"
+    elif last_ok and (now - last_ok) < 15 * 60:
+        st = "ok"                                    # 15 分鐘內連過雲端
+    elif last_ok and (now - last_ok) < grace_days() * 86400:
+        st = "grace"
+    else:
+        st = "blocked" if last_ok else "never_activated"
+
+    remaining = max(0.0, grace_days() - (now - last_ok) / 86400) if last_ok else 0.0
+    return {
+        "state": st,
+        "cloud_url": url,
+        "has_key": True,
+        "masked_key": key[:4] + "…" + key[-4:] if len(key) > 8 else "…",
+        "display_name": state.get("display_name", ""),
+        "plan": state.get("plan", ""),
+        "caps": state.get("caps", {}),
+        "expires_at": state.get("expires_at"),
+        "last_ok": last_ok or None,
+        "grace_days": grace_days(),
+        "grace_remaining_days": round(remaining, 1),
+        "rejected_reason": state.get("rejected_reason", ""),
+        "error": error,
+    }
+
+
+# ── 授權硬鎖（未啟用 = 全功能封鎖）────────────────────────
+_gate_cache = {"ok": None, "ts": 0.0}
+
+
+def invalidate_gate_cache() -> None:
+    _gate_cache["ok"] = None
+    _gate_cache["ts"] = 0.0
+
+
+def license_gate_ok() -> bool:
+    """授權硬鎖判定：ok/grace 放行，其餘封鎖。15 秒快取避免每請求讀盤。
+    MOYU_DEV_MODE=1（僅開發啟動腳本設定）一律放行。"""
+    if os.environ.get("MOYU_DEV_MODE") == "1":
+        return True
+    now = time.time()
+    if _gate_cache["ok"] is not None and (now - _gate_cache["ts"]) < 15:
+        return _gate_cache["ok"]
+    ok = license_status(probe=False).get("state") in ("ok", "grace")
+    _gate_cache["ok"] = ok
+    _gate_cache["ts"] = now
+    return ok
+
+
+def apply_trial(name: str, phone: str, email: str,
+                company: str = "", referral_code: str = "", timeout: float = 25) -> dict:
+    """向雲端申請試用鑰（同機器指紋只能領一次）。回 {license_key, trial_days, expires_at}。"""
+    url = cloud_url()
+    if not url:
+        raise CloudError("未設定雲端網址（MOYU_CLOUD_URL），無法申請試用")
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            r = c.post(f"{url}/apply", json={
+                "name": name, "phone": phone, "email": email, "company": company,
+                "referral_code": referral_code,
+                "machine_fingerprint": _machine_fingerprint(),
+            })
+    except httpx.HTTPError as e:
+        raise CloudError(f"連線雲端失敗: {e}") from e
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("detail", "")
+        except Exception:
+            detail = r.text[:200]
+        raise CloudRejected(str(detail) or f"申請失敗（{r.status_code}）")
+    return r.json()
+
+
+def referral_info(timeout: float = 10) -> dict:
+    """取我的介紹碼（雲端沒有就當場產一個）＋組好可分享的綁定連結。
+
+    分享連結指向 landing 頁帶 ?ref=<碼>：朋友點了 → 雲端記下 IP →
+    他下載後在軟體內申請試用時就算沒填碼也會自動綁定（cloud apply 端點回查）。
+    """
+    url = cloud_url()
+    key = license_key()
+    if not url or not key:
+        raise CloudError("尚未設定授權金鑰")
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            r = c.post(f"{url}/auth/referral-info", json={
+                "license_key": key,
+                "machine_fingerprint": _machine_fingerprint(),
+            })
+    except httpx.HTTPError as e:
+        raise CloudError(f"連線雲端失敗: {e}") from e
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("detail", "")
+        except Exception:
+            detail = r.text[:200]
+        raise CloudRejected(str(detail) or f"查詢失敗（{r.status_code}）")
+    data = r.json()
+    data["share_url"] = f"{url}/?ref={data.get('code', '')}"
+    return data
+
+
+def set_license_key(key: str) -> dict:
+    """寫入授權金鑰（0600）並立即嘗試啟用，回 license_status。"""
+    _LICENSE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _LICENSE_FILE.write_text(key.strip(), encoding="utf-8")
+    with contextlib.suppress(OSError):
+        os.chmod(_LICENSE_FILE, stat.S_IRUSR | stat.S_IWUSR)
+    _clear_state()                                   # 換 key 一切重來
+    return license_status(probe=True)
+
+
+def clear_license_key() -> None:
+    with contextlib.suppress(OSError):
+        _LICENSE_FILE.unlink()
+    _clear_state()
+
+
+def ai_generate(base_content: str, n_versions: int = 5, timeout: float = 120) -> list[dict]:
+    """呼叫雲端 /ai/generate（帶授權 token）。token 失效時重取一次。"""
+    url = cloud_url()
+
+    def _call(token: str):
+        with httpx.Client(timeout=timeout) as c:
+            return c.post(f"{url}/ai/generate",
+                          headers={"Authorization": f"Bearer {token}"},
+                          json={"base_content": base_content, "n_versions": n_versions})
+
+    try:
+        r = _call(get_token())
+        if r.status_code == 401:                     # token 過期 → 重取一次
+            _token_cache["token"] = ""
+            r = _call(get_token())
+    except httpx.HTTPError as e:
+        raise CloudError(f"連線雲端失敗: {e}") from e
+
+    if r.status_code != 200:
+        detail = r.json().get("detail", r.text[:150]) if r.headers.get("content-type", "").startswith("application/json") else r.text[:150]
+        raise CloudError(f"雲端 AI 失敗（{r.status_code}）: {detail}")
+    versions = r.json().get("versions", [])
+    if not versions:
+        raise CloudError("雲端未生成有效版本")
+    return versions
+
+
+def report_usage(listings: int = 0, posts: int = 0, timeout: float = 10) -> dict | None:
+    """回報用量 delta 到雲端（跨機器聚合）。best-effort：任何失敗回 None 不拋。
+    成功時把雲端「今日聚合總量+caps」快取進 .cloud_state，供本地預算把關參考。"""
+    if not cloud_enabled():
+        return None
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            r = c.post(f"{cloud_url()}/usage/report",
+                       headers={"Authorization": f"Bearer {get_token()}"},
+                       json={"listings": listings, "posts": posts})
+        if r.status_code == 401:                     # token 過期 → 重取一次
+            _token_cache["token"] = ""
+            with httpx.Client(timeout=timeout) as c:
+                r = c.post(f"{cloud_url()}/usage/report",
+                           headers={"Authorization": f"Bearer {get_token()}"},
+                           json={"listings": listings, "posts": posts})
+        if r.status_code != 200:
+            import sys
+            print(f"[usage] 回報失敗 HTTP {r.status_code}: {r.text[:120]}", file=sys.stderr, flush=True)
+            return None
+        summary = r.json()
+    except (CloudError, httpx.HTTPError, ValueError) as e:
+        import sys
+        print(f"[usage] 回報失敗（連線/授權）: {e}", file=sys.stderr, flush=True)
+        return None
+    state = _load_state()
+    state["cloud_usage"] = summary                   # {date, listings, posts, caps, over}
+    _save_state(state)
+    return summary
+
+
+def cloud_usage_snapshot() -> dict | None:
+    """上次回報時快取的雲端今日聚合用量（不打網路）。非今日或不存在回 None。"""
+    snap = _load_state().get("cloud_usage")
+    if not snap:
+        return None
+    import datetime
+    tz = datetime.timezone(datetime.timedelta(hours=8))
+    if snap.get("date") != datetime.datetime.now(tz).strftime("%Y-%m-%d"):
+        return None
+    return snap
+
+
+def fetch_config(timeout: float = 15) -> bool:
+    """抓雲端下發設定（選擇器/timings）→ 快取到 FB_Auto/data/served_config.json，供 CLI 讀取。
+    成功回 True；未設雲端或失敗回 False（客戶端用內建 fallback）。"""
+    import json
+    url = cloud_url()
+    if not url:
+        return False
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            r = c.get(f"{url}/config")
+        if r.status_code != 200:
+            return False
+        payload = r.json()
+    except (httpx.HTTPError, ValueError):
+        return False
+    try:
+        from .fbauto_bridge import FB_AUTO_DATA_DIR
+        FB_AUTO_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        (FB_AUTO_DATA_DIR / "served_config.json").write_text(
+            json.dumps(payload.get("data", {}), ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
