@@ -1,0 +1,298 @@
+"""排程任務執行器 — 透過 fbauto_bridge 呼叫 FB_Auto CLI。
+
+設計要點（P12）：
+- 每社團短交易（不橫跨 sleep 佔住連線）。
+- cycle 用單一 IntervalTrigger，不再 Cron + 手動疊加。
+- group_cursor 續發輪替。
+- lifespan 呼叫 restore_jobs 重啟還原。
+- 真 stop：bridge kill_job 中止子進程。
+- 每社團寫 RunLog（P13）。
+"""
+import asyncio
+import datetime
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy import select
+
+from ..database import async_session_factory, PostTask, PostHistory, Account, Article, LegalInfo
+from ..marketplace_content import compose_post_content, legal_footer
+from .. import post_dedup
+
+scheduler = AsyncIOScheduler()
+
+
+def compute_batch(groups: list, cursor: int, per_run: int) -> tuple[list, int]:
+    """從 cursor 取 per_run 個社團，回傳 (本輪社團, 新 cursor)。
+    per_run<=0 表示一次全發。繞回起點時新 cursor 為 0（視為一輪完成）。"""
+    n = len(groups)
+    if n == 0:
+        return [], 0
+    if per_run <= 0 or per_run >= n:
+        return list(groups), 0
+    start = cursor % n
+    batch = groups[start:start + per_run]
+    new_cursor = start + per_run
+    if new_cursor >= n:
+        new_cursor = 0
+    return batch, new_cursor
+
+
+class TaskScheduler:
+    """任務排程管理"""
+
+    def __init__(self):
+        self._scheduler = scheduler
+
+    def start(self):
+        if not self._scheduler.running:
+            self._scheduler.start()
+
+    def stop(self):
+        if self._scheduler.running:
+            self._scheduler.shutdown(wait=False)
+
+    def add_task(self, task: PostTask):
+        """將任務加入排程。cycle 用單一 IntervalTrigger，once 用 DateTrigger。"""
+        if task.schedule_type == "immediate":
+            trigger = DateTrigger(run_date=datetime.datetime.now())
+        elif task.schedule_type == "once":
+            trigger = DateTrigger(run_date=task.next_run)
+        elif task.schedule_type == "cycle":
+            trigger = IntervalTrigger(
+                hours=task.cycle_hours,
+                start_date=task.next_run or datetime.datetime.now(),
+            )
+        else:  # weekly
+            hh, mm = task.time_of_day.split(":")
+            trigger = CronTrigger(
+                hour=hh, minute=mm,
+                day_of_week=",".join(map(str, task.week_days)) if task.week_days else "*",
+            )
+
+        self._scheduler.add_job(
+            func=run_post_task,
+            trigger=trigger,
+            args=[task.id],
+            id=f"task_{task.id}",
+            replace_existing=True,
+        )
+
+    def remove_task(self, task_id: int):
+        try:
+            self._scheduler.remove_job(f"task_{task_id}")
+        except Exception:
+            pass
+
+
+task_scheduler = TaskScheduler()
+
+
+async def _load_task_snapshot(task_id: int):
+    """短交易讀出執行所需的任務快照與帳號/文案，隨即關閉 session。"""
+    async with async_session_factory() as session:
+        task = (await session.execute(select(PostTask).where(PostTask.id == task_id))).scalar_one_or_none()
+        if not task:
+            return None
+        account = (await session.execute(select(Account).where(Account.id == task.account_id))).scalar_one_or_none()
+        article_title = article_content = ""
+        if task.article_id:
+            art = (await session.execute(select(Article).where(Article.id == task.article_id))).scalar_one_or_none()
+            if art:
+                article_title = art.title or ""
+                article_content = art.content
+        # 法定區塊（房仲法規強制）：社團發文與 Marketplace 都會附，這條路徑先前漏了
+        legal_row = (await session.execute(select(LegalInfo))).scalars().first()
+        legal = {
+            "footer_text": legal_row.footer_text, "agent_name": legal_row.agent_name,
+            "company": legal_row.company, "license_no": legal_row.license_no,
+            "agent_phone": legal_row.agent_phone, "extra": legal_row.extra,
+        } if legal_row else {}
+        # 攤平成純資料，避免跨 session 用 ORM 物件
+        return {
+            "id": task.id,
+            "account_id": task.account_id,
+            "status": task.status,
+            "schedule_type": task.schedule_type,
+            "target_groups": list(task.target_groups or []),
+            "groups_per_run": task.groups_per_run,
+            "group_cursor": task.group_cursor or 0,
+            "shuffle_groups": task.shuffle_groups,
+            "sleep_seconds": task.sleep_seconds,
+            "add_timestamp": task.add_timestamp,
+            "add_sequence": task.add_sequence,
+            "sequence_start": task.sequence_start,
+            "cycle_hours": task.cycle_hours,
+            "headless": task.headless,
+            "fbid": (account.fb_user_id or "").strip() if account else "",
+            "account_exists": account is not None,
+            "article_title": article_title,
+            "article_content": article_content,
+            "legal_footer": legal_footer(legal),
+        }
+
+
+async def _current_status(task_id: int) -> str | None:
+    """短交易讀最新任務狀態（停止偵測用）。"""
+    async with async_session_factory() as session:
+        row = await session.execute(select(PostTask.status).where(PostTask.id == task_id))
+        return row.scalar_one_or_none()
+
+
+async def _set_task_fields(task_id: int, **fields):
+    async with async_session_factory() as session:
+        task = (await session.execute(select(PostTask).where(PostTask.id == task_id))).scalar_one_or_none()
+        if not task:
+            return
+        for k, v in fields.items():
+            setattr(task, k, v)
+        await session.commit()
+
+
+async def _record_history(task_id: int, account_id: int, group: dict, bridge):
+    async with async_session_factory() as session:
+        permalink = ""
+        if bridge.results and isinstance(bridge.results, list):
+            permalink = bridge.results[0].get("permalink", "")
+        session.add(PostHistory(
+            account_id=account_id,
+            task_id=task_id,
+            group_name=group.get("name", ""),
+            group_url=group.get("url", ""),
+            post_url=permalink or "",
+            status="success" if bridge.success else "failed",
+            error_message=bridge.error,
+        ))
+        await session.commit()
+
+
+async def run_post_task(task_id: int):
+    """執行發文任務（每社團短交易，不橫跨 sleep 佔住 DB 連線）。"""
+    from ..fbauto_bridge import run_group_post, create_run_log, update_run_log
+
+    snap = await _load_task_snapshot(task_id)
+    if not snap or snap["status"] in ("stopped", "completed"):
+        return
+
+    if not snap["account_exists"]:
+        await _set_task_fields(task_id, status="error")
+        return
+
+    fbid = snap["fbid"]
+    if not fbid:
+        await _record_history(task_id, snap["account_id"], {}, _FailStub("帳號未綁定 fbid，請先完成 FB_Auto 登入"))
+        await _set_task_fields(task_id, status="error")
+        return
+
+    await _set_task_fields(task_id, status="running", progress=0)
+
+    # 本輪社團（游標輪替 + 可選洗牌）
+    groups = snap["target_groups"]
+    if snap["shuffle_groups"]:
+        import random
+        groups = list(groups)
+        random.shuffle(groups)
+    batch, new_cursor = compute_batch(groups, snap["group_cursor"], snap["groups_per_run"])
+
+    seq = snap["sequence_start"] if snap["add_sequence"] else 0
+    try:
+        for i, group in enumerate(batch):
+            # 每輪開頭讀最新狀態偵測停止
+            if (await _current_status(task_id)) in ("stopped", "error"):
+                break
+
+            # 標題要跟內文一起發出去：文案的標題是客戶花錢請 AI 生的賣點，
+            # 之前這裡只取 content，等於每篇貼文都少了第一行（社團發文那條有帶，
+            # 只有這條漏掉，所以症狀是「有些發文沒標題」）。
+            content = compose_post_content(snap["article_title"], snap["article_content"])
+            if snap["legal_footer"]:
+                content = (content + "\n\n" + snap["legal_footer"]).strip()
+            if snap["add_timestamp"]:
+                ts = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+                content += f"\n\n--- 發文時間: {ts} ---"
+            if snap["add_sequence"]:
+                content += f"\n(#{seq})"
+                seq += 1
+
+            # 同文案同社團 7 日內不重發：重複灌同一篇是 FB 判垃圾訊息最直接的
+            # 特徵，也會被社團管理員踢。排程重疊或客戶手動再按一次都會踩到。
+            skip, why, gkey, chash = post_dedup.should_skip(
+                group.get("url", ""), content, group.get("group_id", ""))
+            if skip:
+                print(f"[post] 跳過 {group.get('name', '')}：{why}", flush=True)
+                await _set_task_fields(task_id, progress=i + 1)
+                continue
+
+            log_id = await create_run_log("post", fbid=fbid, account_id=snap["account_id"])
+            bridge = await run_group_post(
+                fbid=fbid,
+                group_url=group.get("url", ""),
+                content=content,
+                headless=snap["headless"],
+                job_key=f"post_{task_id}",
+            )
+            await update_run_log(log_id, bridge)
+            if bridge.success:
+                post_dedup.record_post(gkey, chash, snap["account_id"], group.get("name", ""))
+            await _record_history(task_id, snap["account_id"], group, bridge)
+            await _set_task_fields(task_id, progress=i + 1)
+
+            if i < len(batch) - 1:
+                await asyncio.sleep(snap["sleep_seconds"])
+
+        # 收尾：更新游標與狀態
+        now = datetime.datetime.utcnow()
+        if snap["schedule_type"] == "cycle":
+            # cycle 不自行 re-add（IntervalTrigger 會自動再觸發）；只更新游標與顯示時間
+            await _set_task_fields(
+                task_id,
+                status="pending",
+                group_cursor=new_cursor,
+                last_run=now,
+                next_run=now + datetime.timedelta(hours=snap["cycle_hours"]),
+            )
+        else:
+            await _set_task_fields(task_id, status="completed", group_cursor=new_cursor, last_run=now)
+            if snap["schedule_type"] == "once":
+                task_scheduler.remove_task(task_id)
+
+    except Exception:
+        await _set_task_fields(task_id, status="error")
+        raise
+
+
+class _FailStub:
+    """給未綁定 fbid 情況造一筆 failed history 用的最小替身。"""
+    def __init__(self, error: str):
+        self.success = False
+        self.error = error
+        self.results = []
+
+
+async def restore_jobs():
+    """重啟後從 DB 還原排程：cycle 重排、未過期 once 重排、running 中斷者重排。"""
+    async with async_session_factory() as session:
+        rows = await session.execute(
+            select(PostTask).where(
+                PostTask.schedule_type.in_(("once", "cycle")),
+                PostTask.status.in_(("pending", "running")),
+            )
+        )
+        tasks = rows.scalars().all()
+        now = datetime.datetime.utcnow()
+        restored = 0
+        for task in tasks:
+            if task.schedule_type == "once":
+                if task.next_run and task.next_run <= now:
+                    task.status = "missed"
+                    continue
+            else:  # cycle
+                if not task.next_run or task.next_run <= now:
+                    task.next_run = now + datetime.timedelta(seconds=30)
+            if task.status == "running":
+                task.status = "pending"
+            task_scheduler.add_task(task)
+            restored += 1
+        await session.commit()
+        return restored
