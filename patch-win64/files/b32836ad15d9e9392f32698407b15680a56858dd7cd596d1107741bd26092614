@@ -1,0 +1,180 @@
+"""DeepSeek 文案生成（建立物件時呼叫；發送時不用）。
+
+金鑰來源：env FB_DEEPSEEK_API_KEY 優先，否則讀 backend/data/.deepseek_key（gitignore）。
+"""
+import json
+import os
+import re
+from pathlib import Path
+
+import httpx
+
+from . import http_client
+from .config import DATA_DIR
+
+_KEY_FILE = DATA_DIR / ".deepseek_key"
+_API_URL = "https://api.deepseek.com/chat/completions"
+_MODEL = "deepseek-chat"
+
+
+class DeepSeekError(Exception):
+    pass
+
+
+def _load_key() -> str:
+    key = os.environ.get("FB_DEEPSEEK_API_KEY", "").strip()
+    if key:
+        return key
+    if _KEY_FILE.exists():
+        return _KEY_FILE.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def has_key() -> bool:
+    return bool(_load_key())
+
+
+_SYSTEM_PROMPT = (
+    "你是台灣房地產 Facebook Marketplace 文案助手。"
+    "使用者會提供一段『基底文案』（含事實資訊與賣點）。請據此生成多個差異明顯的『變體版本』，"
+    "每個版本包含一個標題與一段完整內文，用來輪流發文以降低重複偵測。"
+    "嚴格規則："
+    "1) 【絕對鐵律】所有數字與事實（坪數、室內坪、格局、車位、屋齡、樓層、管理費、價格、"
+    "社區名、地址、電話等）一律『原封不動』照抄，絕對不可增刪或竄改任何數字。"
+    "2) 【必須真的改寫，不能只換排版】每個版本要用『不同的句子、不同的詞彙、不同的句型與行文角度』"
+    "重新描述賣點——例如同一個賣點換成不同說法、換同義詞、改用情境描述，"
+    "讓每版讀起來像不同人寫的，而不只是換 emoji 或調換順序。"
+    "3) 標題每版都不同、簡潔吸睛、切入角度各異。"
+    "4) 【保留使用者原文】不要『自行新增』使用者沒寫的經紀人／公司／經紀業字號等法定資訊（系統會另外自動附加）；"
+    "但若使用者的基底文案『原文已寫入』電話、聯絡方式、姓名或法定文案，務必『原封不動完整保留』，絕對不可刪除或改寫。"
+    "5) 【最重要：讀起來要像人打的，不能有 AI 味】平台會辨識 AI 生成內容並降低觸及，"
+    "所以寧可樸素也不要漂亮。務必避免以下 AI 特徵："
+    "  ・不要每行都放 emoji 當項目符號（✅🏠📍🚗💰🌟🔥 這種整齊的清單一看就是 AI）；"
+    "    整篇 emoji 最多 0-2 個，很多版本應該一個都沒有。"
+    "  ・不要工整的排比與對仗（「不僅…更…」「既…又…」「讓您…讓您…」）。"
+    "  ・不要廣告腔套語：機不可失、錯過可惜、絕佳選擇、盡在不言中、您的理想家園、"
+    "    誠意滿滿、值得擁有、心動不如馬上行動、快來看看、歡迎來電洽詢。"
+    "  ・不要用破折號（—）分句，不要用全形括號堆疊補充。"
+    "  ・驚嘆號整篇最多一個，多數版本零個。"
+    "  ・不要每段長度都差不多；不要開頭就總結、結尾又呼應的作文結構。"
+    "6) 【要有的樣子】想像一個台灣房仲自己用手機打的貼文："
+    "  ・口語、直白，長短句夾雜，偶爾用「這間」「屋主」「我自己覺得」「有興趣可以問我」這類說法；"
+    "  ・可以有個人觀察或帶一點主觀（例如「採光真的不錯」「這個價位在這一帶算少見」）；"
+    "  ・條列可以用，但用單純的換行或「.」「-」，而且只列 2-4 項關鍵規格，其餘寫成句子；"
+    "  ・結尾自然帶過即可（例如「想看房再跟我說」「細節可以私訊」），不必每版都有行動呼籲。"
+    "7) 各版本的長度與結構要不一樣：有的短短三四行，有的寫成兩小段，不要每版格式雷同。"
+    "只回傳 JSON，格式：{\"versions\": [{\"title\": \"..\", \"body\": \"..\"}, ...]}，body 內用真正的換行符號分行，不要多餘文字。"
+)
+
+
+# 客戶把電話／法定文案寫進基底文案，AI 卻把它吃掉——提示詞已經三令五申
+# （雲端與本地兩份都寫了「原封保留、不可刪除」），但模型不是每次都聽話。
+# 房仲的聯絡方式與經紀資訊漏掉是會出事的，所以不能只靠提示詞，這裡再補一道
+# 確定性的檢查：基底有、生成版本沒有的，直接補回去。
+_PHONE_RE = re.compile(r"(?:\+?886[\s\-]?)?0?9\d{2}[\s\-]?\d{3}[\s\-]?\d{3}"
+                       r"|\(?0\d\)?[\s\-]?\d{3,4}[\s\-]?\d{4}")
+_LEGAL_HINTS = ("經紀人", "經紀業", "字號", "證號", "不動產", "仲介", "公司名稱")
+
+
+def _digits(s: str) -> str:
+    return re.sub(r"\D", "", s)
+
+
+def must_keep_lines(base_content: str) -> list[str]:
+    """從基底文案裡挑出「絕對不能被改寫掉」的行：含電話或法定關鍵字的整行。"""
+    keep = []
+    for line in (base_content or "").splitlines():
+        t = line.strip()
+        if not t:
+            continue
+        if _PHONE_RE.search(t) or any(h in t for h in _LEGAL_HINTS):
+            keep.append(t)
+    return keep
+
+
+def restore_dropped_lines(base_content: str, versions: list[dict]) -> list[dict]:
+    """生成版本若把 must-keep 的內容弄丟了，補回到內文結尾。
+
+    電話比對只看數字：AI 常把 0912-345-678 改寫成 0912345678 或加空格，
+    那種情況不算弄丟，硬補反而會重複。
+    """
+    keep = must_keep_lines(base_content)
+    if not keep:
+        return versions
+    for v in versions:
+        body = v.get("body") or ""
+        body_digits = _digits(body)
+        missing = []
+        for line in keep:
+            phones = _PHONE_RE.findall(line)
+            if phones:
+                if all(_digits(p) in body_digits for p in phones):
+                    continue      # 電話還在（可能換了寫法），不必補
+            elif line in body:
+                continue
+            missing.append(line)
+        if missing:
+            v["body"] = (body.rstrip() + "\n\n" + "\n".join(missing)).strip()
+    return versions
+
+
+def generate_from_base(base_content: str, n_versions: int = 5, timeout: float = 90) -> list[dict]:
+    """依使用者貼的基底文案生成 N 個變體。回傳 [{title, body}, ...]（數字/事實鎖定）。
+
+    SaaS 模式（設了 MOYU_CLOUD_URL + 授權金鑰）→ 走雲端 /ai/generate（金鑰在伺服器）。
+    否則走本地 DeepSeek（開發後備；SaaS 上線後移除）。
+    """
+    if not (base_content or "").strip():
+        raise DeepSeekError("基底文案是空的")
+
+    # 優先走雲端代理（授權 + 金鑰在伺服器端）
+    from .cloud_client import cloud_enabled, ai_generate, CloudError
+    if cloud_enabled():
+        try:
+            return restore_dropped_lines(base_content, ai_generate(base_content, n_versions))
+        except CloudError as e:
+            raise DeepSeekError(str(e)) from e
+
+    # 後備：本地直呼 DeepSeek（開發用）
+    key = _load_key()
+    if not key:
+        raise DeepSeekError("尚未設定雲端授權，也沒有本地 DeepSeek 金鑰")
+
+    user_prompt = (
+        f"基底文案如下（數字/事實必須完全照抄）：\n\n{base_content}\n\n"
+        f"請生成 {n_versions} 個不同的變體版本（各含 title 與 body）。"
+        "再次提醒：要像真人房仲隨手打的，不要 AI 味——少 emoji、不要整齊條列、"
+        "不要廣告腔、長短句自然夾雜，每版結構都不一樣。"
+    )
+    payload = {
+        "model": _MODEL,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 1.1,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+    try:
+        with http_client.client(timeout) as client:
+            resp = client.post(_API_URL, json=payload, headers=headers)
+    except httpx.HTTPError as e:
+        raise DeepSeekError(f"DeepSeek 連線失敗: {e}") from e
+    if resp.status_code != 200:
+        raise DeepSeekError(f"DeepSeek 回應 {resp.status_code}: {resp.text[:200]}")
+
+    try:
+        content = resp.json()["choices"][0]["message"]["content"]
+        data = json.loads(content)
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        raise DeepSeekError(f"DeepSeek 回應解析失敗: {e}") from e
+
+    versions = []
+    for v in data.get("versions", []):
+        if isinstance(v, dict) and v.get("title") and v.get("body"):
+            versions.append({"title": str(v["title"]).strip(), "body": str(v["body"]).strip()})
+    if not versions:
+        raise DeepSeekError("DeepSeek 未生成有效的版本")
+    return restore_dropped_lines(base_content, versions)
