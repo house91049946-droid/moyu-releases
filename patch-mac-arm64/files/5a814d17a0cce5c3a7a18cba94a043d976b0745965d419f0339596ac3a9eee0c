@@ -1,0 +1,510 @@
+"""P4 — 貼文刪除模組（清除過期貼文、Marketplace 商品）。"""
+import contextlib
+import datetime
+import json
+import re
+from pathlib import Path
+
+from playwright.sync_api import Page
+
+from src.config_loader import T
+from src.paths import DATA_DIR
+from src.utils import (
+    enhanced_get, enhanced_click, human_sleep, perform_checks, CheckResult,
+    capture_screenshot, simulate_human_click,
+)
+
+
+def calculate_post_age_in_days(post_time_str: str) -> int:
+    """從 postTime 字串（YYYY/MM/DD HH:MM:SS）計算貼文年齡（天數）。"""
+    try:
+        post_time = datetime.datetime.strptime(post_time_str, "%Y/%m/%d %H:%M:%S")
+        delta = datetime.datetime.now() - post_time
+        return delta.days
+    except ValueError:
+        return 0
+
+
+def convert_text_to_post_date(text: str) -> str | None:
+    """將 FB 顯示的相對時間（如 3天前、2 hours ago）轉為 YYYY/MM/DD。"""
+    now = datetime.datetime.now()
+    patterns = [
+        (r"(\d+)天前", "days"),
+        (r"(\d+)星期前", "weeks"),
+        (r"(\d+)個月前", "months"),
+        (r"(\d+)年", "years"),
+        (r"(\d+)\s*days?\s*ago", "days"),
+        (r"(\d+)\s*weeks?\s*ago", "weeks"),
+        (r"(\d+)\s*hours?\s*ago", "hours"),
+        (r"(\d+)\s*分鐘前", "minutes"),
+        (r"(\d+)\s*小時前", "hours"),
+        (r"剛剛", "now"),
+    ]
+    for pattern, unit in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            if unit == "now":
+                return now.strftime("%Y/%m/%d")
+            num = int(match.group(1))
+            if unit == "days":
+                delta = datetime.timedelta(days=num)
+            elif unit == "weeks":
+                delta = datetime.timedelta(weeks=num)
+            elif unit == "months":
+                delta = datetime.timedelta(days=num * 30)
+            elif unit == "years":
+                delta = datetime.timedelta(days=num * 365)
+            elif unit == "hours":
+                delta = datetime.timedelta(hours=num)
+            elif unit == "minutes":
+                delta = datetime.timedelta(minutes=num)
+            else:
+                delta = datetime.timedelta()
+            post_time = now - delta
+            return post_time.strftime("%Y/%m/%d")
+    return None
+
+
+def www_delete_club_post_main(
+    page: Page,
+    fbid: str,
+    group_url: str,
+    post_url: str | None = None,
+    lang: str = "zh",
+) -> bool:
+    """
+    刪除指定社團中的貼文。
+    post_url=None 時刪除該社團中最近一篇。
+
+    Returns:
+        是否成功刪除
+    """
+    print(f"[delete] Deleting post in {group_url}")
+
+    check = perform_checks(page, fbid)
+    if check != CheckResult.OK:
+        return False
+
+    if not enhanced_get(page, group_url):
+        return False
+
+    human_sleep(2, 4)
+
+    # 找貼文的刪除按鈕
+    # mbasic 版：每個貼文可能有一個 ... 或 ▼ 選單
+    menu_btn = page.locator("a:has-text('...'), a:has-text('▼')").first
+    if menu_btn.count() > 0:
+        menu_btn.click()
+        human_sleep(1, 2)
+
+    # 找刪除選項
+    delete_sel = "text=刪除貼文, text=移除, text=Delete post, text=Delete"
+    if enhanced_click(page, delete_sel, timeout=5000, retries=2):
+        human_sleep(1, 2)
+        # 確認刪除
+        confirm_sel = "text=刪除, text=確認, text=Confirm"
+        enhanced_click(page, confirm_sel, timeout=3000, retries=1)
+        human_sleep(1, 3)
+        return True
+
+    return False
+
+
+def delete_posts_by_urls(page: Page, fbid: str, post_urls: list[str]) -> list[str]:
+    """依明確的貼文 URL 清單刪除（資料源改由 backend PostHistory 提供，不再讀 postStatus.json）。
+    回傳實際刪除成功的 post_url 清單。"""
+    deleted: list[str] = []
+    for post_url in post_urls:
+        m = re.search(r"groups/(\d+)", post_url)
+        if not m:
+            continue
+        group_url = f"https://mbasic.facebook.com/groups/{m.group(1)}/"
+        try:
+            if www_delete_club_post_main(page, fbid, group_url, post_url):
+                deleted.append(post_url)
+        except Exception as e:
+            print(f"[delete] 刪除失敗 {post_url}: {e}", flush=True)
+        human_sleep(3, 8)
+    return deleted
+
+
+def delete_old_posts(
+    page: Page,
+    fbid: str,
+    max_age_days: int = 7,
+    groups: list[str] | None = None,
+    dry_run: bool = False,
+) -> int:
+    """
+    批次刪除超過 max_age_days 天的舊貼文。
+
+    Returns:
+        刪除的貼文數量
+    """
+    deleted_count = 0
+
+    # 從 postStatus.json 讀取貼文列表
+    status_path = DATA_DIR / "postStatus.json"
+    if not status_path.exists():
+        return 0
+
+    with open(status_path, "r", encoding="utf-8") as f:
+        try:
+            status_data = json.load(f)
+        except json.JSONDecodeError:
+            return 0
+
+    fbid_posts = status_data.get(fbid, {})
+    if not fbid_posts:
+        return 0
+
+    for post_url, info in fbid_posts.items():
+        post_time = info.get("postTime", "")
+        age = calculate_post_age_in_days(post_time)
+        if age >= max_age_days:
+            # 從 URL 中取出 group url
+            group_id_match = re.search(r"groups/(\d+)", post_url)
+            if group_id_match:
+                group_url = f"https://mbasic.facebook.com/groups/{group_id_match.group(1)}/"
+                if dry_run:
+                    print(f"[delete] Would delete: {post_url} (age: {age} days)")
+                else:
+                    if www_delete_club_post_main(page, fbid, group_url, post_url):
+                        deleted_count += 1
+                        # 標記為已刪除
+                        fbid_posts[post_url]["removed"] = True
+                    human_sleep(3, 8)
+
+    if not dry_run and deleted_count > 0:
+        with open(status_path, "w", encoding="utf-8") as f:
+            json.dump(status_data, f, ensure_ascii=False, indent=2)
+
+    return deleted_count
+
+
+def delete_marketplace_posts(
+    page: Page,
+    fbid: str,
+    item_url: str,
+) -> bool:
+    """刪除指定的 Marketplace 商品刊登。"""
+    if not enhanced_get(page, item_url):
+        return False
+
+    human_sleep(2, 4)
+
+    # 找刪除按鈕
+    delete_selectors = [
+        "text=刪除刊登",
+        "text=Delete listing",
+        "div[aria-label='刪除']",
+        "div[aria-label='Delete']",
+    ]
+    for sel in delete_selectors:
+        if enhanced_click(page, sel, timeout=5000, retries=1):
+            human_sleep(1, 2)
+            # 確認
+            enhanced_click(page, "text=刪除, text=Delete", timeout=3000)
+            return True
+
+    return False
+
+
+def _age_days_from_text(text: str) -> int:
+    """從卡片文字解析張貼年齡（天）。無法判定回 -1（保守：不刪）。
+    優先解析銷售頁的絕對日期「M/D上架」，再退回相對時間（X天前）。"""
+    if not text:
+        return -1
+    # 銷售頁格式：「7/12上架」/「7月12日」（絕對日期）
+    m = re.search(r"(\d{1,2})\s*/\s*(\d{1,2})\s*上架", text) or re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", text)
+    if m:
+        mon, day = int(m.group(1)), int(m.group(2))
+        today = datetime.date.today()
+        try:
+            d = datetime.date(today.year, mon, day)
+            if d > today:                       # 跨年：解析出的日期在未來 → 視為去年
+                d = datetime.date(today.year - 1, mon, day)
+            return (today - d).days
+        except ValueError:
+            return -1
+    # 退回相對時間
+    d = convert_text_to_post_date(text)
+    if not d:
+        return -1
+    return calculate_post_age_in_days(d + " 00:00:00")
+
+
+def _open_selling_page(page: Page) -> bool:
+    """開賣家「你的商品/銷售中」頁並捲動載入。"""
+    from src.utils import human_idle
+    urls = [
+        "https://www.facebook.com/marketplace/you/selling",
+        "https://www.facebook.com/marketplace/you/",
+    ]
+    for u in urls:
+        if enhanced_get(page, u):
+            print(f"[del_mp] 已開啟：{u}", flush=True)
+            human_sleep(3, 5)
+            human_idle(page)
+            for _ in range(10):
+                page.mouse.wheel(0, 1600)
+                human_sleep(0.8, 1.6)
+            return True
+    print("[del_mp] ⚠️ 無法開啟銷售頁面", flush=True)
+    return False
+
+
+# FB 刊登卡片不是 <a>，而是 div 卡片，右側有「更多選項」（⋯）按鈕。
+# 用它定位每張卡片，並把卡片/按鈕標上 data-mpdel 索引供 Playwright 點擊。
+_SCAN_CARDS_JS = r"""() => {
+    const labels = {};
+    document.querySelectorAll('[aria-label]').forEach(el => {
+        const l = el.getAttribute('aria-label'); if (l) labels[l] = (labels[l] || 0) + 1;
+    });
+    // 「更多選項」按鈕的 aria-label 實際是「{標題}適用的更多選項」→ 用包含比對
+    const btns = [...document.querySelectorAll('[aria-label]')].filter(el => {
+        const l = el.getAttribute('aria-label') || '';
+        return /更多選項|More options|更多選擇/.test(l);
+    });
+    const out = []; const seenCard = new Set(); let idx = 0;
+    for (const b of btns) {
+        let node = b, card = null;
+        for (let i = 0; i < 12 && node; i++) {
+            node = node.parentElement;
+            if (node && /上架/.test(node.innerText || '')) { card = node; break; }
+        }
+        if (!card || seenCard.has(card)) continue;
+        seenCard.add(card);
+        card.setAttribute('data-mpdel-idx', String(idx));
+        b.setAttribute('data-mpdel-more', String(idx));
+        const label = (b.getAttribute('aria-label') || '').replace(/適用的更多選項|More options for/g, '').trim();
+        out.push({ idx, title: label, text: (card.innerText || '').trim().slice(0, 300) });
+        idx++;
+    }
+    return { cards: out, labels };
+}"""
+
+
+def _collect_cards(page: Page) -> tuple[list[dict], dict]:
+    """在目前頁面（不導航）收集卡片 + aria-label 統計。任何錯誤回空。"""
+    try:
+        res = page.evaluate(_SCAN_CARDS_JS)
+    except Exception as e:
+        print(f"[del_mp] 收集卡片失敗（頁面可能已跳轉/關閉）: {e}", flush=True)
+        return [], {}
+    cards = res.get("cards", [])
+    for c in cards:
+        c["age_days"] = _age_days_from_text(c.get("text", ""))
+    return cards, res.get("labels", {})
+
+
+def scan_selling_listings(page: Page, fbid: str, diag: bool = True) -> list[dict]:
+    """導航到賣家頁並收集每個刊登 {idx, text, age_days}。"""
+    if not _open_selling_page(page):
+        return []
+    if diag:
+        with contextlib.suppress(Exception):
+            capture_screenshot(page, "del_mp_diag", "selling_page")
+    cards, labels = _collect_cards(page)
+    if diag:
+        top = sorted(labels.items(), key=lambda kv: -kv[1])[:15]
+        print(f"[del_mp] 頁面 aria-label 樣本: {top}", flush=True)
+    print(f"[del_mp] 銷售頁共掃到 {len(cards)} 個刊登", flush=True)
+    for c in cards:
+        title = (c.get("title") or c.get("text", "").split("\n")[0])[:40]
+        print(f"  - idx={c['idx']} age={c['age_days']}天 「{title}」", flush=True)
+    return cards
+
+
+def _delete_one_listing(page: Page, idx: int) -> bool:
+    """點卡片 idx 的「⋯ → 刪除商品 → 確認」。驗證確認框關閉才算成功。"""
+    more = page.locator(f"[data-mpdel-more='{idx}']")
+    if more.count() == 0:
+        return False
+    with contextlib.suppress(Exception):
+        more.first.scroll_into_view_if_needed(timeout=2000)
+    human_sleep(0.5, 1.0)
+    simulate_human_click(page, more.first)
+
+    # 1) 選單中的「刪除商品」：選單文字改由雲端下發（FB 改版免更新客戶端），有 fallback
+    from src.served_config import get as cfg
+    menu_texts = cfg("selectors.mp_delete_menu_texts",
+                     ["刪除商品", "刪除刊登", "Delete listing", "Delete"])
+    item = None
+    for t in menu_texts:
+        for sel in (f"div[role='menu'] >> text={t}", f"text={t}", f"[role='menuitem']:has-text('{t}')"):
+            loc = page.locator(sel).first
+            try:
+                loc.wait_for(state="visible", timeout=2000)
+                item = loc
+                break
+            except Exception:
+                continue
+        if item is not None:
+            break
+    if item is None:
+        print(f"    [✗] 選單中找不到刪除選項（試過 {menu_texts}）", flush=True)
+        with contextlib.suppress(Exception):
+            page.keyboard.press("Escape")
+        return False
+    simulate_human_click(page, item)
+
+    # 2) 確認對話框 → 精確點「刪除」按鈕（文字也可由雲端下發）
+    human_sleep(0.8, 1.5)
+    confirm_text = cfg("selectors.mp_delete_confirm_text", "刪除")
+    confirm = page.get_by_role("button", name=confirm_text, exact=True)
+    clicked = False
+    try:
+        confirm.first.wait_for(state="visible", timeout=4000)
+        simulate_human_click(page, confirm.first)
+        clicked = True
+    except Exception:
+        for sel in ["div[role='dialog'] [aria-label='刪除']",
+                    "div[role='dialog'] [role='button']:has-text('刪除')"]:
+            if enhanced_click(page, sel, timeout=2500, retries=1):
+                clicked = True
+                break
+    if not clicked:
+        print("    [✗] 確認框找不到「刪除」按鈕", flush=True)
+        with contextlib.suppress(Exception):
+            page.keyboard.press("Escape")
+        return False
+
+    # 3) 驗證：等確認對話框消失（真的刪掉了）
+    try:
+        page.locator("div[role='dialog']").filter(has_text="刪除此商品").first.wait_for(
+            state="detached", timeout=6000)
+    except Exception:
+        # 對話框沒消失 → 沒刪成功
+        print("    [✗] 確認框未關閉，視為刪除失敗", flush=True)
+        with contextlib.suppress(Exception):
+            page.keyboard.press("Escape")
+        return False
+    human_sleep(1.5, 2.5)
+    return True
+
+
+def _norm_title(s: str) -> str:
+    """標題正規化供比對：去空白、取前 20 字（工具與 FB 卡片都會各自截斷）。"""
+    return "".join((s or "").split())[:20]
+
+
+def _title_is_ours(card_title: str, allowed: set) -> bool:
+    """這張卡的標題是不是本工具發的（與 allowed 任一標題同源）。
+
+    工具存的標題（item_name[:30]）與 FB 卡片顯示的標題都是同一字串的截斷，
+    所以「較短者是較長者的前綴（至少 6 字）」即視為同一筆。
+    """
+    ct = _norm_title(card_title)
+    if len(ct) < 6:
+        return False
+    for a in allowed:
+        an = _norm_title(a)
+        if len(an) < 6:
+            continue
+        short, long = (ct, an) if len(ct) <= len(an) else (an, ct)
+        if long.startswith(short):
+            return True
+    return False
+
+
+def _card_title(c: dict) -> str:
+    return (c.get("title") or c.get("text", "").split("\n")[0] or "")
+
+
+def delete_old_marketplace_listings(
+    page: Page,
+    fbid: str,
+    max_age_days: int = 7,
+    dry_run: bool = False,
+    allowed_titles=None,
+) -> dict:
+    """掃銷售頁 → 刪除**本工具發過、且**張貼超過 max_age_days 天的刊登。
+
+    ⚠️ 安全機制（2026-08-09 誤刪帳號既有商品後加）：只刪標題比對得上
+    allowed_titles（本工具上架紀錄）的刊登。allowed_titles 為空 → 一個都不刪，
+    避免無差別刪掉帳號上手動貼的、非本工具發的商品。
+    age 無法判定者保守略過（不刪）。回傳統計 dict。"""
+    import random
+    allowed = set(allowed_titles or [])
+    if not allowed:
+        print("[del_mp] 安全機制：查無本工具的上架紀錄，為避免誤刪帳號既有商品，"
+              "本次不刪除任何刊登。", flush=True)
+        return {"success": True, "scanned": 0, "candidates": [], "deleted": [],
+                "skipped_unknown": 0, "skipped_not_mine": 0,
+                "note": "no_tool_listings_recorded"}
+
+    check = perform_checks(page, fbid)
+    if check != CheckResult.OK:
+        return {"success": False, "error": f"pre-check: {check.value}", "scanned": 0,
+                "candidates": [], "deleted": [], "skipped_unknown": 0}
+
+    cards = scan_selling_listings(page, fbid)
+    mine = [c for c in cards if _title_is_ours(_card_title(c), allowed)]
+    not_mine = len(cards) - len(mine)
+    candidates = [c for c in mine if c["age_days"] >= max_age_days]
+    unknown = [c for c in mine if c["age_days"] < 0]
+    print(f"[del_mp] 掃到 {len(cards)} 個刊登，其中 {len(mine)} 個是本工具發的；"
+          f"門檻 {max_age_days} 天：待刪 {len(candidates)} 個、"
+          f"非本工具略過 {not_mine} 個、年齡未知略過 {len(unknown)} 個", flush=True)
+
+    if dry_run:
+        print("[del_mp] dry-run：僅掃描不刪除", flush=True)
+        return {"success": True, "dry_run": True, "scanned": len(cards),
+                "candidates": [(c.get("title") or c.get("text", "").split("\n")[0])[:40] for c in candidates],
+                "deleted": [], "skipped_unknown": len(unknown)}
+
+    # 實刪：留在同一頁，刪一個 → 就地重新收集 → 再刪，避免每次重新導航造成的崩潰。
+    # 刪除間偶爾重新導航一次讓列表刷新乾淨。
+    # ⚠️ 安全機制：就地重新收集後挑候選時，除了年齡，**一定要再比對 allowed 標題**，
+    #    不能只看 age——否則實刪迴圈會繞過標題白名單，把帳號手動貼的商品也刪掉
+    #    （2026-08-09：初版安全修正只擋了候選計數與 dry-run，漏了這個迴圈）。
+    def _pick(cs):
+        return next((c for c in cs
+                     if c["age_days"] >= max_age_days
+                     and _title_is_ours(_card_title(c), allowed)), None)
+
+    deleted = 0
+    fail_streak = 0
+    for i in range(80):
+        if page.is_closed():
+            print("[del_mp] 頁面已關閉，停止", flush=True)
+            break
+        cards, _ = _collect_cards(page)
+        cand = _pick(cards)
+        if not cand:
+            # 就地看不到候選：重新導航確認一次是否真的清空
+            print("[del_mp] 就地無候選，重新導航確認…", flush=True)
+            if not _open_selling_page(page):
+                break
+            cards, _ = _collect_cards(page)
+            cand = _pick(cards)
+            if not cand:
+                break
+        title = (cand.get("title") or cand.get("text", "").split("\n")[0])[:40]
+        print(f"[del_mp] 刪除中 idx={cand['idx']} (age={cand['age_days']}天)「{title}」", flush=True)
+        ok = False
+        try:
+            ok = _delete_one_listing(page, cand["idx"])
+        except Exception as e:
+            print(f"  [✗] 刪除例外: {e}", flush=True)
+        if ok:
+            deleted += 1
+            fail_streak = 0
+            print(f"  [✓] 已刪除（累計 {deleted}）", flush=True)
+            human_sleep(6, 14)  # 反偵測：刪除間隔亂速
+            # 每刪 5 個重新導航一次，保持列表乾淨
+            if deleted % 5 == 0:
+                _open_selling_page(page)
+        else:
+            fail_streak += 1
+            print(f"  [✗] 刪除失敗（連續 {fail_streak}）", flush=True)
+            if fail_streak >= 3:
+                print("[del_mp] 連續刪除失敗 3 次，停止", flush=True)
+                break
+            # 失敗時重新導航再試
+            _open_selling_page(page)
+    print(f"[del_mp] 完成：刪除 {deleted} 個（非本工具略過 {not_mine} 個）", flush=True)
+    return {"success": True, "dry_run": False, "scanned": len(candidates) + deleted,
+            "candidates": [], "deleted": [f"deleted_{i}" for i in range(deleted)],
+            "skipped_unknown": len(unknown), "skipped_not_mine": not_mine}
