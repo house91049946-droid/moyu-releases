@@ -1,0 +1,364 @@
+"""社團發文排程執行器：逐社團進入發文（非 Marketplace 轉發）。"""
+from __future__ import annotations
+
+import asyncio
+import datetime
+import random
+from pathlib import Path
+
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+from sqlalchemy import select
+
+from ..database import (
+    Account,
+    GpListing,
+    GpSchedule,
+    Group,
+    LegalInfo,
+    SyncSession,
+    TAIPEI,
+    add_daily_usage_sync,
+    as_taipei,
+    async_session_factory,
+    get_system_state_sync,
+    now_taipei,
+    set_system_pause_sync,
+)
+from ..marketplace_content import compose_post_content, legal_footer
+from .. import post_dedup
+from ..scheduler.marketplace_planner import plan_daily_times
+from ..scheduler.task_runner import task_scheduler
+
+scheduler = task_scheduler._scheduler  # 共用 APScheduler
+_GP_LOCK = asyncio.Lock()
+
+
+def _now_taipei() -> datetime.datetime:
+    return now_taipei()
+
+
+def remove_schedule_jobs(schedule_id: int) -> None:
+    if not scheduler:
+        return
+    for job in list(scheduler.get_jobs()):
+        if job.id.startswith(f"gp_{schedule_id}_"):
+            job.remove()
+
+
+def plan_and_schedule(sch: GpSchedule) -> tuple[int, list]:
+    """依排程設定，把今天剩餘的執行時間排入 APScheduler。"""
+    if not scheduler:
+        return 0, []
+    remove_schedule_jobs(sch.id)
+    base = datetime.datetime.now(TAIPEI).date()
+    cnt = sch.daily_count
+    if (sch.daily_count_min or 0) > 0 and (sch.daily_count_max or 0) >= (sch.daily_count_min or 0):
+        cnt = random.randint(sch.daily_count_min, sch.daily_count_max)
+    times = [
+        as_taipei(t) for t in plan_daily_times(
+            sch.time_mode, sch.time_points or [], sch.window_start, sch.window_end,
+            cnt, sch.random_delay, base,
+        )
+    ]
+    now = _now_taipei()
+    added = 0
+    for i, t in enumerate(times):
+        if t <= now:
+            continue
+        scheduler.add_job(
+            func=_run_job_sync_entry,
+            trigger=DateTrigger(run_date=t),
+            args=[sch.id],
+            id=f"gp_{sch.id}_{i}",
+            replace_existing=True,
+        )
+        added += 1
+    return added, times
+
+
+def _run_job_sync_entry(schedule_id: int) -> None:
+    """APScheduler 同步入口 → 丟到 event loop。"""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(run_group_post_job(schedule_id))
+        else:
+            loop.run_until_complete(run_group_post_job(schedule_id))
+    except RuntimeError:
+        asyncio.run(run_group_post_job(schedule_id))
+
+
+async def restore_group_post_schedules() -> None:
+    """重啟時：把 running 的社團發文排程重新規劃今天。"""
+    if not scheduler:
+        return
+    async with async_session_factory() as s:
+        rows = (await s.execute(
+            select(GpSchedule).where(GpSchedule.status == "running")
+        )).scalars().all()
+        for sch in rows:
+            # 單一排程還原失敗不可拖垮整個後端啟動
+            try:
+                plan_and_schedule(sch)
+            except Exception as e:
+                print(f"[gp] 排程 {sch.id} 還原失敗，已略過：{e}", flush=True)
+    # 每日 00:06 重規劃（避開 MP 的 00:05）
+    scheduler.add_job(
+        func=_daily_replan,
+        trigger=CronTrigger(hour=0, minute=6, timezone=TAIPEI),
+        id="gp_daily_replan",
+        replace_existing=True,
+    )
+
+
+def _daily_replan() -> None:
+    with SyncSession() as s:
+        rows = s.execute(select(GpSchedule).where(GpSchedule.status == "running")).scalars().all()
+        for sch in rows:
+            try:
+                plan_and_schedule(sch)
+            except Exception as e:
+                print(f"[gp] 排程 {sch.id} 重規劃失敗，已略過：{e}", flush=True)
+
+
+def _resolve_image_paths(paths: list[str]) -> list[str]:
+    from ..config import DATA_DIR
+    out = []
+    for p in paths or []:
+        if not p:
+            continue
+        if p.startswith("/uploads/"):
+            fp = DATA_DIR / "uploads" / p[len("/uploads/"):]
+        else:
+            fp = Path(p)
+        if fp.exists():
+            out.append(str(fp))
+    return out
+
+
+def _pick_content(listing: GpListing) -> tuple[str, str]:
+    titles = listing.titles or []
+    bodies = listing.bodies or []
+    if titles and bodies:
+        i = random.randrange(min(len(titles), len(bodies)))
+        return titles[i], bodies[i]
+    if bodies:
+        return listing.name or "社團發文", bodies[0]
+    return listing.name or "社團發文", listing.base_content or ""
+
+
+def _group_url_map(account_id: int) -> dict[str, str]:
+    """社團名稱 → URL（從共用 Group 表）。"""
+    with SyncSession() as s:
+        rows = s.execute(select(Group).where(Group.account_id == account_id)).scalars().all()
+    return {g.group_name: g.group_url for g in rows if g.group_name and g.group_url}
+
+
+async def run_listing_once(
+    *,
+    account_id: int,
+    listing_id: int,
+    headless: bool = True,
+    dry_run: bool = False,
+    max_groups: int | None = None,
+    sleep_min: int | None = None,
+    sleep_max: int | None = None,
+) -> None:
+    """對單一物件的目標社團逐一直發。"""
+    from ..fbauto_bridge import cookie_exists, run_group_post, create_run_log_sync, update_run_log_sync
+
+    st = get_system_state_sync()
+    if st.get("paused"):
+        print("[gp] 系統已暫停，略過", flush=True)
+        return
+
+    async with async_session_factory() as s:
+        listing = (await s.execute(
+            select(GpListing).where(GpListing.id == listing_id)
+        )).scalar_one_or_none()
+        acc = (await s.execute(
+            select(Account).where(Account.id == account_id)
+        )).scalar_one_or_none()
+        if not listing or not acc or not acc.fb_user_id:
+            return
+        fbid = acc.fb_user_id
+        acc_label = acc.email or fbid
+        bound_at = acc.fb_bound_at
+        grace_override = bool(acc.grace_override)
+        target_names = list(listing.target_groups or [])
+        images = list(listing.image_pool or [])
+        smin = sleep_min if sleep_min is not None else (listing.sleep_min_sec or 180)
+        smax = sleep_max if sleep_max is not None else (listing.sleep_max_sec or 600)
+        title, body = _pick_content(listing)
+        content = compose_post_content(title, body)
+        # 法定區塊（房仲法規強制）：AI 內文不含，這裡統一附加（與 marketplace 一致）
+        legal_row = (await s.execute(select(LegalInfo))).scalars().first()
+        legal = {
+            "footer_text": legal_row.footer_text, "agent_name": legal_row.agent_name,
+            "company": legal_row.company, "license_no": legal_row.license_no,
+            "agent_phone": legal_row.agent_phone, "extra": legal_row.extra,
+        } if legal_row else {}
+        footer = legal_footer(legal)
+        if footer:
+            content = (content + "\n\n" + footer).strip()
+
+    # 新帳號養號期：FB 綁定後前 N 天只養號、不發文（新帳號馬上狂發最容易被封）。
+    # 客戶可在帳號頁「強制解除」——那是明白風險後的決定，這裡就放行。
+    from ..database import posting_grace_remaining_sync
+    grace_left = posting_grace_remaining_sync(bound_at)
+    if grace_left > 0 and not grace_override:
+        print(f"[gp] 帳號 {acc_label} 仍在養號期（還有 {grace_left} 天），本輪不發文", flush=True)
+        return
+    if grace_left > 0 and grace_override:
+        print(f"[gp] 帳號 {acc_label} 養號期未滿（{grace_left} 天）但已強制解除，照發（風險自負）", flush=True)
+
+    if not cookie_exists(fbid):
+        print(f"[gp] cookie 不存在: {fbid}", flush=True)
+        return
+
+    url_map = _group_url_map(account_id)
+    pairs = [(n, url_map[n]) for n in target_names if n in url_map]
+    # 每輪打亂社團順序：固定順序等於每天在同樣的時間點打同一串社團，
+    # 是很容易被關聯出來的自動化特徵（真人不會每次都照同一個名單順序貼）。
+    random.shuffle(pairs)
+    if max_groups is not None:
+        pairs = pairs[: max(0, max_groups)]
+    if not pairs:
+        print("[gp] 無可用目標社團（名稱對不到 URL）", flush=True)
+        return
+
+    img_paths = _resolve_image_paths(images)
+    async with _GP_LOCK:
+        consecutive_fail = 0
+        for i, (gname, gurl) in enumerate(pairs):
+            # 每則發文前重查暫停狀態：緊急停止後不再繼續剩餘社團
+            if get_system_state_sync().get("paused"):
+                print("[gp] 系統已暫停，中止剩餘社團", flush=True)
+                break
+            if dry_run:
+                print(f"[gp] dry-run 跳過發文：{gname}", flush=True)
+                continue
+            # 同文案同社團 7 日內不重發（見 post_dedup 模組說明）
+            skip, why, gkey, chash = post_dedup.should_skip(gurl, content)
+            if skip:
+                print(f"[gp] 跳過 {gname}：{why}", flush=True)
+                continue
+            log_id = create_run_log_sync("group_post", fbid, account_id)
+            result = await run_group_post(
+                fbid=fbid,
+                group_url=gurl,
+                content=content,
+                images=img_paths or None,
+                headless=headless,
+                job_key=f"gp_{account_id}_{listing_id}",
+            )
+            update_run_log_sync(log_id, result)
+            # 健康度粗更新
+            status = getattr(result, "status", "") or ("成功" if result.success else "失敗")
+            await _update_listing_health(listing_id, status)
+            # SaaS 用量回報：社團發文成功也計入雲端聚合（與 marketplace 一致）
+            if result.success:
+                add_daily_usage_sync(posts=1)
+                post_dedup.record_post(gkey, chash, account_id, gname)
+
+            # 被 FB 登出／cookie 失效：立刻停手並全域暫停，儀表板才會跳紅橫幅。
+            # 沒有這段的話每則都在「Cookie 已失效」秒失敗，只留在執行紀錄裡沒人
+            # 看得到，客戶只知道「發不出去」（2026-08-02 客戶回報）。
+            if result.needs_relogin:
+                set_system_pause_sync(
+                    True, "logged_out",
+                    f"帳號 {acc_label} 的 FB 登入已失效（被登出或 cookie 過期），"
+                    f"請到「帳號設定」重新登入，再回儀表板按「恢復」。",
+                )
+                print(f"[gp] 偵測到已被登出（{acc_label}），中止本輪並全域暫停", flush=True)
+                break
+            # FB 保護機制（發文太頻繁／動作被封鎖…）：MP 本來就會暫停，GP 之前漏了
+            if result.needs_manual_action:
+                set_system_pause_sync(
+                    True, "fb_protection",
+                    result.manual_action_reason or f"帳號 {acc_label} 觸發 FB 保護機制",
+                )
+                print(f"[gp] 偵測到 FB 保護機制（{result.manual_action_reason}），中止本輪並全域暫停", flush=True)
+                break
+
+            # 連續失敗就收手：客戶把瀏覽器關掉（或 cookie 失效、Chrome 起不來）時，
+            # 原本會把剩下的社團一個個試完，每個之間還睡滿 1~10 分鐘——整輪拖上一
+            # 小時，期間 _GP_LOCK 一直被佔著，客戶按「立即發文」完全沒反應，看起來
+            # 就像功能壞掉（2026-08-02 客戶回報）。連兩則失敗＝環境有問題，別再耗。
+            consecutive_fail = 0 if result.success else consecutive_fail + 1
+            if consecutive_fail >= 2:
+                print(f"[gp] 連續 {consecutive_fail} 則失敗（{result.error or '未知原因'}），"
+                      f"中止剩餘 {len(pairs) - i - 1} 個社團", flush=True)
+                break
+
+            if i < len(pairs) - 1:
+                # 失敗時不必睡滿正常間隔（那是給 FB 看的節奏，沒發成就沒意義）
+                await asyncio.sleep(random.uniform(smin, smax) if result.success else 5)
+
+
+async def _update_listing_health(listing_id: int, status: str) -> None:
+    async with async_session_factory() as s:
+        row = (await s.execute(
+            select(GpListing).where(GpListing.id == listing_id)
+        )).scalar_one_or_none()
+        if not row:
+            return
+        row.last_status = status
+        row.last_status_at = datetime.datetime.utcnow()
+        if status in ("成功", "success"):
+            row.success_count = (row.success_count or 0) + 1
+            row.consecutive_review = 0
+            row.health_status = "ok"
+        elif status in ("審核", "pending_review"):
+            row.review_count = (row.review_count or 0) + 1
+            row.consecutive_review = (row.consecutive_review or 0) + 1
+            if row.consecutive_review >= 3:
+                row.health_status = "problem"
+            elif row.consecutive_review >= 1:
+                row.health_status = "watch"
+        else:
+            row.reject_count = (row.reject_count or 0) + 1
+            row.health_status = "watch"
+        await s.commit()
+
+
+async def run_group_post_job(schedule_id: int, force: bool = False) -> None:
+    """排程觸發：輪替一個物件，對其目標社團逐一發文。"""
+    st = get_system_state_sync()
+    if st.get("paused") and not force:
+        return
+
+    async with async_session_factory() as s:
+        sch = (await s.execute(
+            select(GpSchedule).where(GpSchedule.id == schedule_id)
+        )).scalar_one_or_none()
+        if not sch:
+            return
+        if not force and sch.status != "running":
+            return
+        listing_ids = list(sch.listing_ids or [])
+        if not listing_ids:
+            return
+        # 跳過 problem 物件
+        listings = (await s.execute(
+            select(GpListing).where(GpListing.id.in_(listing_ids))
+        )).scalars().all()
+        candidates = [L for L in listings if (L.health_status or "ok") != "problem"]
+        if not candidates:
+            print("[gp] 無可發物件（皆 problem）", flush=True)
+            return
+        listing = random.choice(candidates)
+        account_id = sch.account_id
+        listing_id = listing.id
+        headless = bool(sch.headless)
+        dry_run = bool(sch.dry_run)
+        groups_per_run = sch.groups_per_run or 0
+
+    await run_listing_once(
+        account_id=account_id,
+        listing_id=listing_id,
+        headless=headless,
+        dry_run=dry_run,
+        max_groups=groups_per_run or None,
+    )

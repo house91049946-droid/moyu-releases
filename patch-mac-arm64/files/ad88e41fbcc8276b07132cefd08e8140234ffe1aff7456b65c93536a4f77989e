@@ -1,0 +1,136 @@
+"""P16 內容組裝（純函式，無外部相依，可單測）。
+
+每次發送自動變裝：輪替標題/內文、附加法定欄位、圖片首頁輪替 + 隨機子集 + QR 隨機。
+"""
+import math
+import random
+
+FB_IMAGE_CAP = 10          # FB Marketplace 單則圖片保守上限
+MIN_IMAGES = 5             # 每次發送圖片下限
+
+
+def legal_footer(legal: dict) -> str:
+    """組法定欄位字串（房仲法規強制，AI 絕不改）。
+    優先用整段 footer_text；否則退回結構化欄位組合。
+
+    每個欄位都用 `or ""` 兜住：資料庫欄位是後來才加的，舊的列讀出來是 None，
+    None.strip() 會直接拋 AttributeError——而這個函式是在發文流程正中間呼叫的，
+    炸掉等於整批發文中斷。
+    """
+    legal = legal or {}
+    footer = (legal.get("footer_text") or "").strip()
+    if footer:
+        return footer
+    parts = []
+    if (legal.get("agent_name") or "").strip():
+        parts.append(f"經紀人：{legal['agent_name'].strip()}")
+    if (legal.get("agent_phone") or "").strip():
+        parts.append(f"電話：{legal['agent_phone'].strip()}")
+    if (legal.get("company") or "").strip():
+        parts.append(f"公司：{legal['company'].strip()}")
+    if (legal.get("license_no") or "").strip():
+        parts.append(f"經紀業字號：{legal['license_no'].strip()}")
+    if (legal.get("extra") or "").strip():
+        parts.append(legal["extra"].strip())
+    return "\n".join(parts)
+
+
+def pick_images(image_pool: list, cover_ids: list, cover_cursor: int,
+                qr_image: str = "", rng: random.Random | None = None) -> tuple[list, int, bool]:
+    """依規則挑本次要發的圖片清單。
+    - 首頁：從 cover_ids 輪替挑 1 張放第一張。
+    - 其餘：從 image_pool（扣掉首頁）隨機取，使總數 = max(5, ceil(2/3*池量))，上限 FB_IMAGE_CAP。
+    - QR：隨機決定放不放；放則插在非首頁的隨機位置。
+    回傳 (images, next_cover_cursor, qr_included)。池量 < MIN_IMAGES 時用全部。
+    """
+    rng = rng or random
+    pool = [p for p in (image_pool or []) if p]
+    if not pool:
+        return [], cover_cursor, False
+
+    # 首頁（隨機挑一張，避免和上一次相同；cover_cursor 記錄上次用的索引）
+    cover = None
+    next_cursor = cover_cursor
+    covers = [c for c in (cover_ids or []) if c and c in pool]
+    if covers:
+        if len(covers) == 1:
+            idx = 0
+        else:
+            idx = rng.randrange(len(covers))
+            if idx == (cover_cursor % len(covers)):      # 撞到上次 → 換下一張
+                idx = (idx + 1) % len(covers)
+        cover = covers[idx]
+        next_cursor = idx
+
+    n = len(pool)
+    if n <= MIN_IMAGES:
+        images = list(pool)
+        if cover and cover in images:               # 首頁移到最前
+            images.remove(cover)
+            images.insert(0, cover)
+    else:
+        target = max(MIN_IMAGES, math.ceil(n * 2 / 3))
+        target = min(target, FB_IMAGE_CAP, n)
+        rest_pool = [p for p in pool if p != cover]
+        rng.shuffle(rest_pool)
+        chosen_rest = rest_pool[: max(0, target - (1 if cover else 0))]
+        images = ([cover] if cover else []) + chosen_rest
+
+    # QR：隨機決定放不放，放則插在非首頁隨機位置
+    qr_included = False
+    if qr_image and rng.random() < 0.5 and len(images) < FB_IMAGE_CAP:
+        pos = rng.randint(1, len(images))            # 不放第一張（首頁）
+        images.insert(pos, qr_image)
+        qr_included = True
+
+    return images[:FB_IMAGE_CAP], next_cursor, qr_included
+
+
+def compose_post_content(title: str, body: str) -> str:
+    """標題＋內文組成一則貼文。社團發文與發文任務共用同一份規則。
+
+    為什麼要集中：兩條發文路徑原本各自組一次，結果「發文任務」那條從頭到尾
+    只取內文、標題整個被丟掉（2026-07-31 客戶回報「標題沒有一併發送」）。
+    同一件事寫兩次，遲早會有一邊漏掉。
+    """
+    title, body = (title or "").strip(), (body or "").strip()
+    return f"{title}\n\n{body}".strip() if title else body
+
+
+def assemble_content(prop: dict, legal: dict, rng: random.Random | None = None) -> dict:
+    """組裝本次發送內容。prop 為 Property 攤平的 dict。
+    回傳 {title, body, images, qr_included, cursors: {title, body, cover}}。"""
+    rng = rng or random
+    titles = prop.get("titles") or []
+    bodies = prop.get("bodies") or []
+    tc = prop.get("title_cursor", 0)
+    bc = prop.get("body_cursor", 0)
+
+    # 版本選擇改隨機（原本是游標照 v1→v2→v3 順序輪替）。固定順序本身就是一種
+    # 可被 FB 關聯出來的模式；隨機抽讓每次發文用哪一版不可預測，降低封鎖風險。
+    # title/body 用同一個索引配對，保持標題與內文的角度一致（與社團發文一致）。
+    n = min(len(titles), len(bodies))
+    if n:
+        i = rng.randrange(n)
+        title, body = titles[i], bodies[i]
+    else:
+        title = titles[tc % len(titles)] if titles else prop.get("name", "")
+        body = bodies[bc % len(bodies)] if bodies else ""
+    footer = legal_footer(legal or {})
+    full_body = (body + ("\n\n" + footer if footer else "")).strip()
+
+    images, next_cover, qr_included = pick_images(
+        prop.get("image_pool") or [], prop.get("cover_ids") or [],
+        prop.get("cover_cursor", 0), prop.get("qr_image", ""), rng)
+
+    return {
+        "title": title,
+        "body": full_body,
+        "images": images,
+        "qr_included": qr_included,
+        "cursors": {
+            "title": (tc + 1) % len(titles) if titles else 0,
+            "body": (bc + 1) % len(bodies) if bodies else 0,
+            "cover": next_cover,
+        },
+    }

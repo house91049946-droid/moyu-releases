@@ -1,0 +1,119 @@
+"""帳號養號 API：手動立即養號 + 每日自動排程設定。"""
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from pydantic import BaseModel, Field
+
+from ..database import get_session, Account, NurtureConfig
+
+router = APIRouter(prefix="/api/nurture", tags=["nurture"], redirect_slashes=False)
+
+
+class NurtureRequest(BaseModel):
+    account_id: int
+    duration_min: int = 5
+    headless: bool = False
+
+
+class NurtureConfigIn(BaseModel):
+    """自動養號設定（時長/次數皆為區間，每次執行時隨機取）。"""
+    enabled: bool = False
+    daily_count_min: int = Field(1, ge=1, le=10)
+    daily_count_max: int = Field(2, ge=1, le=10)
+    duration_min: int = Field(3, ge=1, le=60)
+    duration_max: int = Field(8, ge=1, le=60)
+    window_start: str = "09:00"
+    window_end: str = "22:00"
+    headless: bool = True
+
+
+def _cfg_out(cfg: NurtureConfig, planned: list[str]) -> dict:
+    return {
+        "enabled": cfg.enabled, "daily_count_min": cfg.daily_count_min,
+        "daily_count_max": cfg.daily_count_max, "duration_min": cfg.duration_min,
+        "duration_max": cfg.duration_max, "window_start": cfg.window_start,
+        "window_end": cfg.window_end, "headless": cfg.headless,
+        "today_planned": planned,
+    }
+
+
+class GraceIn(BaseModel):
+    days: int = Field(5, ge=0, le=14)      # 0=關閉；建議 3-7
+
+
+@router.get("/grace")
+async def get_grace():
+    """新帳號養號期天數（FB 綁定後前 N 天只養號不發文）。"""
+    from ..database import nurture_grace_days_sync
+    return {"days": nurture_grace_days_sync()}
+
+
+@router.put("/grace")
+async def put_grace(data: GraceIn, session: AsyncSession = Depends(get_session)):
+    from ..database import SystemState
+    from sqlalchemy import select as _sel
+    st = (await session.execute(_sel(SystemState))).scalars().first()
+    if not st:
+        st = SystemState()
+        session.add(st)
+    st.nurture_grace_days = data.days
+    await session.commit()
+    return {"days": data.days}
+
+
+@router.get("/config")
+async def get_config(account_id: int, session: AsyncSession = Depends(get_session)):
+    """讀自動養號設定＋今天剩餘已排時間。"""
+    from ..scheduler.nurture_runner import get_or_create_config, scheduled_times_today
+    cfg = await get_or_create_config(session, account_id)
+    await session.commit()
+    return _cfg_out(cfg, scheduled_times_today())
+
+
+@router.put("/config")
+async def put_config(account_id: int, data: NurtureConfigIn,
+                     session: AsyncSession = Depends(get_session)):
+    """存設定並立刻重排今天剩餘的場次。"""
+    if data.daily_count_max < data.daily_count_min:
+        raise HTTPException(422, "一日次數：最大值不可小於最小值")
+    if data.duration_max < data.duration_min:
+        raise HTTPException(422, "時長：最大值不可小於最小值")
+    for t in (data.window_start, data.window_end):
+        try:
+            h, m = t.split(":")
+            assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+        except Exception:
+            raise HTTPException(422, f"時段格式錯誤：{t}（應為 HH:MM）")
+
+    from ..scheduler.nurture_runner import get_or_create_config, plan_and_schedule
+    cfg = await get_or_create_config(session, account_id)
+    for k, v in data.model_dump().items():
+        setattr(cfg, k, v)
+    await session.commit()
+    planned = await plan_and_schedule()
+    return _cfg_out(cfg, planned)
+
+
+@router.post("/run")
+async def run_nurture(data: NurtureRequest, session: AsyncSession = Depends(get_session)):
+    """啟動帳號養號任務（模擬真人瀏覽行為，避免被 FB 判定為機器人）"""
+
+    # 驗證帳號存在且有 fbid
+    acc_result = await session.execute(select(Account).where(Account.id == data.account_id))
+    acc = acc_result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    if not acc.fb_user_id:
+        raise HTTPException(status_code=422, detail="此帳號尚未綁定 FB ID，請先到帳號設定頁面綁定")
+
+    from ..fbauto_bridge import start_long_op, cookie_exists
+
+    if not cookie_exists(acc.fb_user_id):
+        raise HTTPException(status_code=422, detail=f"cookie 不存在: {acc.fb_user_id}，請先用 CLI 登入")
+
+    args = ["--fbid", acc.fb_user_id, "--duration", str(data.duration_min)]
+    if data.headless:
+        args.append("--headless")
+    job_id = start_long_op("nurture", "src.run_nurture", args,
+                           account_id=acc.id, fbid=acc.fb_user_id)
+    return {"job_id": job_id, "state": "pending"}
