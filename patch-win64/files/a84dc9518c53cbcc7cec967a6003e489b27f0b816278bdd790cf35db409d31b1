@@ -1,0 +1,117 @@
+"""長時操作任務查詢/中止 API（P12）。
+
+各 `*/run` 端點 spawn 後回 {job_id}，前端輪詢 GET /api/jobs/{job_id}。
+detect 類任務在成功回收時於此完成 can_post 落庫（與帳號登入閉環同模式）。
+"""
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from ..database import get_session, Group, PostHistory
+from ..fbauto_bridge import poll_long_op, get_long_op, cancel_long_op
+
+router = APIRouter(prefix="/api/jobs", tags=["jobs"], redirect_slashes=False)
+
+
+def _result_payload(result) -> dict:
+    """把 BridgeResult 攤平成前端要的欄位。"""
+    return {
+        "success": result.success,
+        "error": result.error,
+        "item_url": result.item_url,
+        "results": result.results,
+        "data": result.data,
+        "needs_manual_action": result.needs_manual_action,
+    }
+
+
+def _detect_progress(fbid: str) -> int | None:
+    """讀 detect 即時進度檔，回傳目前收集到的社團數（無則 None）。"""
+    if not fbid:
+        return None
+    import json
+    from ..fbauto_bridge import FB_AUTO_DATA_DIR
+    p = FB_AUTO_DATA_DIR / f"detect_progress_{fbid}.json"
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f).get("count")
+    except (OSError, ValueError):
+        return None
+
+
+@router.get("/{job_id}")
+async def get_job(job_id: str, session: AsyncSession = Depends(get_session)):
+    job = get_long_op(job_id)
+    op = job.op if job else None
+    account_id = job.account_id if job else None
+    fbid = job.fbid if job else ""
+
+    poll = poll_long_op(job_id)
+    state = poll["state"]
+
+    if state in ("none", "pending"):
+        resp = {"job_id": job_id, "state": state, "op": poll.get("op", op),
+                "elapsed_sec": poll.get("elapsed_sec", 0)}
+        # detect 進行中：附上即時收集數，讓前端顯示「已收集 N 個」
+        if state == "pending" and poll.get("op") == "detect":
+            collected = _detect_progress(fbid)
+            if collected is not None:
+                resp["collected"] = collected
+        return resp
+
+    result = poll["result"]
+    payload = {"job_id": job_id, "state": state, "op": poll.get("op", op), **_result_payload(result)}
+
+    # detect-mp 成功 → 在此把 can_post 落庫（group_id 比對，名稱 fallback）
+    if state == "success" and poll.get("op") == "detect" and account_id is not None:
+        from .accounts import _normalize_mp_ids, _unresolved_names
+        mp_entries = result.groups or []
+        mp_id_set = _normalize_mp_ids(mp_entries)
+        fallback_names = _unresolved_names(mp_entries)
+        all_groups = await session.execute(select(Group).where(Group.account_id == account_id))
+        updated = 0
+        matched_by_name = 0
+        for g in all_groups.scalars().all():
+            if g.group_id and g.group_id in mp_id_set:
+                should = True
+            elif g.group_name in fallback_names:
+                should = True
+                matched_by_name += 1
+            else:
+                should = False
+            if g.can_post != should:
+                g.can_post = should
+                updated += 1
+        await session.commit()
+        payload["updated"] = updated
+        payload["matched_by_name"] = matched_by_name
+
+    # delete 成功 → 把實際刪除的貼文在 PostHistory 標記 deleted
+    if state == "success" and poll.get("op") == "delete" and account_id is not None:
+        deleted_urls = (result.data or {}).get("deleted_urls", [])
+        marked = 0
+        if deleted_urls:
+            rows = await session.execute(
+                select(PostHistory).where(
+                    PostHistory.account_id == account_id,
+                    PostHistory.post_url.in_(deleted_urls),
+                )
+            )
+            for h in rows.scalars().all():
+                if not h.deleted:
+                    h.deleted = True
+                    marked += 1
+            await session.commit()
+        payload["deleted_count"] = len(deleted_urls)
+        payload["marked"] = marked
+
+    return payload
+
+
+@router.delete("/{job_id}")
+async def cancel_job(job_id: str):
+    # 中止同時把 RunLog 收尾，否則執行紀錄會永遠停在「執行中」
+    killed = cancel_long_op(job_id)
+    if not killed:
+        raise HTTPException(status_code=404, detail="任務不存在或已結束")
+    return {"job_id": job_id, "message": "已中止"}
