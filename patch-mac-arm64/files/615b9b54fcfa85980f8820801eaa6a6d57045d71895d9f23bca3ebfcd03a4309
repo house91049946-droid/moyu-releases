@@ -1,0 +1,8 @@
+[
+  "tests/test_delete_mp_safety.py::test_FB把全形標點換成半形也要比對得出來",
+  "tests/test_delete_mp_safety.py::test_太短的標題不比對_避免誤刪",
+  "tests/test_delete_mp_safety.py::test_實刪迴圈只刪本工具_跳過手動商品",
+  "tests/test_delete_mp_safety.py::test_查無本工具紀錄_一筆都不刪",
+  "tests/test_delete_mp_safety.py::test_標題比對容忍FB截斷與加後綴",
+  "tests/test_delete_mp_safety.py::test_表情符號被FB吃掉也要比對得出來"
+]
