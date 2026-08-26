@@ -1,0 +1,101 @@
+"""擷取用瀏覽器的啟動設定：語系／UA／反偵測／找不到 Chrome 時的退路。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_scrape_browser.py -v
+
+用 stub 假裝 playwright，不真的開瀏覽器——這裡要驗的是「我們給了什麼設定」，
+不是「Chrome 能不能開」。
+"""
+import sys
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("playwright")
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import src.utils as u  # noqa: E402
+
+
+class _StubPage:
+    def __init__(self):
+        self.init_scripts = []
+
+    def add_init_script(self, s):
+        self.init_scripts.append(s)
+
+
+class _StubContext:
+    def __init__(self, **kw):
+        self.kw = kw
+        self.page = _StubPage()
+
+    def new_page(self):
+        return self.page
+
+
+class _StubBrowser:
+    def __init__(self):
+        self.ctx = None
+
+    def new_context(self, **kw):
+        self.ctx = _StubContext(**kw)
+        return self.ctx
+
+
+class _StubChromium:
+    def __init__(self, fail_times=0):
+        self.calls = []
+        self.fail_times = fail_times
+        self.browser = _StubBrowser()
+
+    def launch(self, **kw):
+        self.calls.append(kw)
+        if len(self.calls) <= self.fail_times:
+            raise RuntimeError("找不到 Chrome")
+        return self.browser
+
+
+class _StubPw:
+    def __init__(self, fail_times=0):
+        self.chromium = _StubChromium(fail_times)
+
+
+@pytest.fixture(autouse=True)
+def _no_native_chrome(monkeypatch):
+    # 測試機器有沒有裝 Chrome 不該影響結果
+    monkeypatch.setattr(u, "native_chrome_executable", lambda: None)
+    monkeypatch.setattr(u, "raise_fd_limit", lambda *a, **k: 8192)
+    monkeypatch.delenv("FB_USE_CHROMIUM", raising=False)
+
+
+def test_context_帶上台灣語系與桌機UA():
+    pw = _StubPw()
+    browser, context, page = u.launch_scrape_browser(pw)
+    assert context.kw["locale"] == "zh-TW"
+    assert context.kw["timezone_id"] == "Asia/Taipei"
+    # 預設的 HeadlessChrome UA 會被不少房產網站直接回 403
+    assert "HeadlessChrome" not in context.kw["user_agent"]
+    assert "Chrome/" in context.kw["user_agent"]
+    assert context.kw["extra_http_headers"]["accept-language"].startswith("zh-TW")
+
+
+def test_抹掉webdriver標記():
+    pw = _StubPw()
+    _, _, page = u.launch_scrape_browser(pw)
+    assert any("webdriver" in s for s in page.init_scripts)
+
+
+def test_系統chrome開不起來時退回內建chromium():
+    pw = _StubPw(fail_times=1)
+    browser, context, page = u.launch_scrape_browser(pw)
+    assert len(pw.chromium.calls) == 2           # 第一次失敗、第二次退路
+    assert "channel" not in pw.chromium.calls[1]  # 退路用內建 chromium
+
+
+def test_不吃FB的user_data_dir():
+    """去別人的網站抓公開頁面，不該帶著客戶的 FB 登入狀態出門。"""
+    pw = _StubPw()
+    u.launch_scrape_browser(pw)
+    for call in pw.chromium.calls:
+        assert "user_data_dir" not in call

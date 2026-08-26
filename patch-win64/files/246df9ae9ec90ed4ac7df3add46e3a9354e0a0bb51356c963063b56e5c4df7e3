@@ -1,0 +1,214 @@
+"""從一個物件網址找出「同一經紀人／店家」的全部出售物件清單。
+
+用途：房仲手上常是同一家店在樂屋網的二三十筆物件。貼一個物件頁進來，
+這支去找到店家頁、把清單抓回來，讓使用者在前端勾選要匯入哪幾筆。
+
+跟 run_import_url 的分工：這支**只抓清單、不下載任何圖片**（所以只要十幾秒）；
+真正的文案與圖片擷取仍然由 run_import_url 一次一筆處理。
+
+刻意用獨立的瀏覽器 profile（不吃 FB cookie）：這是去別人的網站抓公開頁面。
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import re
+import sys
+import time
+
+from playwright.sync_api import sync_playwright
+
+from src.import_parse import (
+    LINKS_JS, LIST_EXTRACT_JS, LIST_PROGRESS_JS,
+    http_error_message, next_page_url, parse_cards, pick_list_page,
+)
+from src.utils import launch_scrape_browser
+
+_JSON_PATH = None
+_RESULT = None
+
+_ERR_NO_STORE = ("這一頁找不到店家連結。你可以直接貼店鋪頁網址"
+                 "（例如 https://vip.rakuya.com.tw/…）再試一次。")
+_ERR_EMPTY = "在這個店家頁面沒抓到任何出售物件（可能全部是出租，或版面與預期不同）。"
+
+
+_TITLE_JUNK = re.compile(r"^(請稍候|載入中|loading)", re.I)
+
+
+def _store_name(page) -> str:
+    """店家名稱：頁面還在載入時 title 常是「請稍候...」，那個抓了等於沒抓。"""
+    with contextlib.suppress(Exception):
+        t = (page.title() or "").split(" - ")[0].strip()[:60]
+        if t and not _TITLE_JUNK.match(t):
+            return t
+    return ""
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+    # 失敗原因也印出來：只寫進用完就刪的結果 JSON，客戶回報問題時無從查起
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[list] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+def _settle(page, deadline_sec=25):
+    """捲到「物件連結數不再增加」為止，回傳最後的連結數。
+
+    不寫死秒數：同一台機器快慢可差十倍，固定等幾秒必然抓不到。
+
+    **0 筆不算穩定**：頁面是 JS 渲染的，剛 goto 完連續好幾輪都是 0 很正常。
+    把它當成「已經穩定」就會在頁面還沒渲染時直接收工——實測就是這樣抓到 0 筆。
+    一筆都沒有時只能等到 deadline 為止。
+    """
+    t0 = time.time()
+    last, stable, rounds = -1, 0, 0
+    while time.time() - t0 < deadline_sec:
+        try:
+            n = page.evaluate(LIST_PROGRESS_JS)
+        except Exception:
+            page.wait_for_timeout(500)
+            continue                       # 導覽中 evaluate 會短暫失敗，下一輪再問
+        stable = stable + 1 if n == last else 0
+        last = n
+        rounds += 1
+        if rounds >= 3 and stable >= 3 and last > 0:
+            break
+        page.mouse.wheel(0, 1400)
+        page.wait_for_timeout(600)
+    return last
+
+
+def _collect_page(page, url: str, already_open: bool = False) -> tuple[int | None, list[dict]]:
+    """開一頁清單頁，捲完把卡片撈回來。回 (HTTP 狀態碼, 卡片)。
+
+    already_open：使用者貼的就是清單頁時，第一頁已經開好也捲過了，
+    再 goto 一次等於整頁重載重捲，白等十幾秒。
+
+    狀態碼一定要帶回去：被擋（403）時頁面是空的，吞掉狀態碼就會顯示成
+    「這家店沒有出售物件」——把人引去查完全錯誤的方向。
+    """
+    status = None
+    if not already_open:
+        resp = page.goto(url, wait_until="commit", timeout=45000)
+        status = resp.status if resp is not None else None
+    if status and status >= 400:
+        print(f"[list] {url} → HTTP {status}", flush=True)
+        return status, []
+    n = _settle(page)
+    raw = page.evaluate(LIST_EXTRACT_JS)
+    print(f"[list] {url} → 連結 {n} 個、卡片 {len(raw)} 張", flush=True)
+    return status, raw
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    parser = argparse.ArgumentParser(description="抓同一店家的出售物件清單")
+    parser.add_argument("--url", required=True)
+    parser.add_argument("--max-pages", type=int, default=5)
+    parser.add_argument("--max-items", type=int, default=100)
+    parser.add_argument("--result-json")
+    args = parser.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {
+        "schema": 1, "success": False, "error": "未完成",
+        "data": {"store_url": "", "store_name": "", "truncated": False, "items": []},
+    }
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    if not args.url.lower().startswith(("http://", "https://")):
+        _RESULT["error"] = "網址必須以 http:// 或 https:// 開頭"
+        sys.exit(1)
+
+    pw = sync_playwright().start()
+    try:
+        browser, context, page = launch_scrape_browser(pw)
+    except Exception as e:
+        _RESULT["error"] = f"開不了瀏覽器（{e}）"
+        with contextlib.suppress(Exception):
+            pw.stop()
+        sys.exit(1)
+
+    try:
+        # 1) 先開使用者貼的那一頁
+        try:
+            resp = page.goto(args.url, wait_until="commit", timeout=45000)
+        except Exception as e:
+            _RESULT["error"] = f"打不開這個網址（{e}）"
+            sys.exit(1)
+        if resp is not None and resp.status >= 400:
+            _RESULT["error"] = f"網頁回應 HTTP {resp.status}，可能需要登入或該站擋自動擷取"
+            sys.exit(1)
+        _settle(page, deadline_sec=12)
+
+        # 2) 決定去哪一頁抓清單（優先跟店家連結，其次才是「這頁本身就是清單頁」）
+        links = page.evaluate(LINKS_JS)
+        store_url = pick_list_page(args.url, links)
+        if not store_url:
+            _RESULT["error"] = _ERR_NO_STORE
+            sys.exit(1)
+        print(f"[list] 清單頁：{store_url}"
+              f"{'（就是貼進來的這頁）' if store_url == args.url else ''}", flush=True)
+
+        # 3) 逐頁收卡片
+        raw_all, seen_href = [], set()
+        truncated = False
+        store_name = ""
+        for n in range(1, max(1, args.max_pages) + 1):
+            url = store_url if n == 1 else next_page_url(store_url, n)
+            try:
+                status, raw = _collect_page(
+                    page, url, already_open=(n == 1 and store_url == args.url))
+            except Exception as e:
+                print(f"[list] 第 {n} 頁讀取失敗（{e}），停在這裡", flush=True)
+                break
+            http_err = http_error_message(status)
+            if http_err:
+                if n == 1:
+                    _RESULT["error"] = http_err     # 第一頁就被擋＝這次什麼都沒有
+                    sys.exit(1)
+                break                                # 後面的頁被擋：前面抓到的仍然有用
+            fresh = [c for c in raw if c.get("url") not in seen_href]
+            for c in fresh:
+                seen_href.add(c.get("url"))
+            if not fresh:
+                break                      # 這一頁沒有新東西＝已經到底
+            raw_all += fresh
+            if n == 1:
+                store_name = _store_name(page)
+            if len(parse_cards(raw_all)) >= args.max_items:
+                truncated = True
+                break
+
+        items = parse_cards(raw_all)
+        if len(items) > args.max_items:
+            items = items[:args.max_items]
+            truncated = True
+        if not items:
+            _RESULT["error"] = _ERR_EMPTY
+            sys.exit(1)
+
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        _RESULT["data"].update({
+            "store_url": store_url, "store_name": store_name,
+            "truncated": truncated, "items": items,
+        })
+        print(f"清單擷取完成：{len(items)} 筆"
+              f"{'（已達上限，未列完）' if truncated else ''}", flush=True)
+    except SystemExit:
+        raise
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    finally:
+        for close in (context.close, browser.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+if __name__ == "__main__":
+    main()
