@@ -1,0 +1,90 @@
+"""批次匯入的編排邏輯（離線）：單筆失敗不拖累整批、被擋就停、進度會報。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_import_batch.py -v
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.run_import_batch import batch_import as _bi, is_blocked_error  # noqa: E402
+
+
+def batch_import(urls, fn, **kw):
+    """測試預設不真的等：sleep 記錄、rand 回固定值。"""
+    kw.setdefault("sleep", lambda s: None)
+    kw.setdefault("rand", lambda a, b: a)
+    return _bi(urls, fn, **kw)
+
+
+def _fn(fail_on=(), blocked_on=()):
+    def f(url):
+        if url in blocked_on:
+            raise RuntimeError("網頁回應 HTTP 403，可能需要登入或該站擋自動擷取")
+        if url in fail_on:
+            raise RuntimeError("這個網頁沒抓到可用的文字或圖片")
+        return {"title": f"T-{url[-1]}", "base_content": "x", "images": [f"/u/{url[-1]}.jpg"],
+                "price": 100, "site": "s", "skipped_images": []}
+    return f
+
+
+class Test編排:
+    def test_全部成功(self):
+        r = batch_import(["u1", "u2", "u3"], _fn())
+        assert r["done"] == 3 and r["failed"] == 0 and r["blocked"] is False
+        assert [i["title"] for i in r["items"]] == ["T-1", "T-2", "T-3"]
+
+    def test_單筆失敗不拖累整批(self):
+        r = batch_import(["u1", "u2", "u3"], _fn(fail_on={"u2"}))
+        assert r["done"] == 2 and r["failed"] == 1
+        bad = next(i for i in r["items"] if i["url"] == "u2")
+        assert bad["ok"] is False and "沒抓到" in bad["error"]
+        assert r["items"][2]["ok"] is True            # u3 照跑
+
+    def test_被擋先退避重試一次_再被擋才停(self):
+        """樂屋實測第 2 筆就 403：先歇 backoff 秒重試，多半就過了。"""
+        calls = []
+        def fn(url):
+            calls.append(url)
+            if url == "u2" and calls.count("u2") == 1:
+                raise RuntimeError("網頁回應 HTTP 403，擋自動擷取")
+            return {"title": url, "base_content": "x", "images": [], "price": 1, "site": "s", "skipped_images": []}
+        slept = []
+        r = batch_import(["u1", "u2", "u3"], fn, sleep=slept.append, backoff=90, pause=(8, 20))
+        assert r["done"] == 3 and r["blocked"] is False
+        assert calls.count("u2") == 2                  # 重試了一次
+        assert 90 in slept                             # 退避有等
+        assert slept.count(8) == 2                     # 筆與筆之間停了兩次（u2、u3 前）
+
+    def test_退避重試仍被擋才整批停並保留已完成(self):
+        """403 連續兩次＝真的被擋，硬撐只會讓封鎖更久；已完成的不能白做。"""
+        r = batch_import(["u1", "u2", "u3", "u4"], _fn(blocked_on={"u2"}))
+        assert r["blocked"] is True
+        assert r["done"] == 1                          # u1 保留
+        assert r["items"][1]["ok"] is False
+        assert all(not i["ok"] and "稍後再試" in i["error"] for i in r["items"][2:])
+        assert len(r["items"]) == 4                    # 沒跑的也要列，前端才知道哪些沒做
+
+    def test_不退避時被擋立刻停(self):
+        r = batch_import(["u1", "u2", "u3"], _fn(blocked_on={"u2"}), backoff=0)
+        assert r["done"] == 1 and r["blocked"] is True and len(r["items"]) == 3
+
+    def test_進度回報首尾都有(self):
+        seen = []
+        batch_import(["u1", "u2"], _fn(), progress_cb=seen.append)
+        assert seen[0] == {"done": 0, "total": 2, "current": "u1", "blocked": False}
+        assert seen[-1]["done"] == 2 and seen[-1]["current"] == ""
+
+    def test_空清單(self):
+        r = batch_import([], _fn())
+        assert r == {"items": [], "done": 0, "failed": 0, "blocked": False}
+
+
+class Test被擋判斷:
+    def test_403與429算被擋(self):
+        assert is_blocked_error("網頁回應 HTTP 403，…") is True
+        assert is_blocked_error("網頁回應 HTTP 429，…") is True
+
+    def test_404不算(self):
+        assert is_blocked_error("網頁回應 HTTP 404，…") is False
+        assert is_blocked_error("打不開這個網址（Timeout）") is False

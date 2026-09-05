@@ -1,0 +1,85 @@
+"""Threads 潛在客戶探索與追蹤的離線測試（SPEC-P29）。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_threads_lead.py -v
+
+這裡守的是「保守」：額度不能被隨手調大、自己不會被列進候選、
+已追蹤的不會被重複點（重複點＝取消追蹤）。
+"""
+import sys
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("playwright")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import run_threads_follow as fol  # noqa: E402
+from src import run_threads_search as sea  # noqa: E402
+
+
+class Test關鍵字:
+    def test_去空白去重保順序(self):
+        assert sea.parse_keywords(" 自售 , 換屋 ,自售, ") == ["自售", "換屋"]
+
+    def test_空字串(self):
+        assert sea.parse_keywords("") == []
+
+
+class Test候選整理:
+    def test_抽出帳號與連結(self):
+        raw = [{"user": "@seller01", "url": "/@seller01/post/ABC?x=1",
+                "text": "seller01\n3小時\n台中北屯自售三房，誠可議\n12", "posted_at": "2026-08-31"}]
+        out = sea.normalize(raw)
+        assert out[0]["username"] == "seller01"
+        assert out[0]["post_url"] == "https://www.threads.com/@seller01/post/ABC"
+        assert "自售三房" in out[0]["snippet"]
+
+    def test_不把自己列進候選(self):
+        """搜尋結果裡一定會有自己的貼文——追蹤自己很蠢。"""
+        raw = [{"user": "@me", "url": "/@me/post/A", "text": "我的貼文", "posted_at": ""},
+               {"user": "@other", "url": "/@other/post/B", "text": "別人的貼文內容在這裡", "posted_at": ""}]
+        out = sea.normalize(raw, me="me")
+        assert [i["username"] for i in out] == ["other"]
+
+    def test_同一個人只留一筆(self):
+        raw = [{"user": "@a", "url": "/@a/post/1", "text": "第一則貼文內容", "posted_at": ""},
+               {"user": "@a", "url": "/@a/post/2", "text": "第二則貼文內容", "posted_at": ""}]
+        assert len(sea.normalize(raw)) == 1
+
+    def test_摘要跳過雜訊行(self):
+        """卡片文字前幾行是帳號名、時間、讚數，都不是內文。"""
+        s = sea.clean_snippet("seller01\n3小時\n128\n台中西屯電梯三房自售，屋主誠售",
+                              author="seller01")
+        assert s.startswith("台中西屯")
+
+
+class Test追蹤額度:
+    def test_預設十人(self):
+        assert fol.effective_limit(None) == 10
+        assert fol.effective_limit(0) == 10
+
+    def test_不准超過硬上限(self):
+        """這是最容易被判定為機器人的動作，不該讓人隨手調到 100。"""
+        assert fol.effective_limit(100) == fol.HARD_CAP == 20
+
+    def test_合理值照收(self):
+        assert fol.effective_limit(5) == 5
+
+
+class Test帳號清單:
+    def test_去at去重(self):
+        assert fol.parse_users("@a, b ,a,") == ["a", "b"]
+
+    def test_空的(self):
+        assert fol.parse_users("") == []
+
+
+class Test安全預設:
+    def test_不是每個都按讚(self):
+        """每個都按才像腳本——機率必須小於 1。"""
+        assert 0 < fol.LIKE_PROBABILITY < 1
+
+    def test_已追蹤的標籤有涵蓋中英(self):
+        """漏判「追蹤中」會導致再點一次＝取消追蹤，比不追蹤更糟。"""
+        for lab in ("追蹤中", "Following"):
+            assert lab in fol._FOLLOWING_LABELS

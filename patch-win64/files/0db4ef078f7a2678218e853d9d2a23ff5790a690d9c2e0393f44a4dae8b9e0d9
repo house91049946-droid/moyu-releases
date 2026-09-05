@@ -1,0 +1,624 @@
+"""Instagram 自動追蹤（SPEC-P31 §3／§4：IG 版「加好友」）。
+
+行為模型沿用 P29 的 Threads 追蹤（進對方頁 → 滑一下 → 機率性點讚 → 追蹤 →
+再逛一下 → 下一個），但 IG 是三個平台裡管制最嚴的（P28 §7：自動追蹤是 IG
+最愛抓的行為），所以每個數字都比 Threads 再小一號：
+
+  - 預設每次 5 人，硬上限 10（Threads 是 10／20），設定再大也不准超過。
+  - 人與人之間 20–90 秒隨機間隔。
+  - 按讚機率 0.3——不是每個都按，每個都按才像腳本。
+  - 偵測到 action_blocked／rate_limited 立刻中止整批，已做的部分照樣回報，
+    讓 P28 的平台暫停接手。
+
+對象只找「和客戶有自然關聯」的人（§3），不掃陌生名單：
+  - own_posts：在客戶自己最近貼文下按讚／留言的人
+  - hashtags：在地房產 hashtag（#台中買房 等）最近發文的人；
+    帳號名／顯示名像房仲、代銷、經紀的直接略過（status=agency）——
+    同行追來追去沒有意義，也最像互刷。
+
+不私訊、不留言、不追蹤自己、同一個人只追一次。
+
+用法：
+    python -m src.run_ig_follow --max 5 --sources own_posts,hashtags \
+        --hashtags "台中買房,台中租屋" [--like-probability 0.3] \
+        [--exclude-file known.json] [--headless] [--dry-run] \
+        [--result-json out.json] [--profile-dir …]
+
+--exclude-file 是後端已經記錄過（之前追過）的帳號清單（JSON 陣列），
+在進對方頁**之前**就略過，計入 skipped_known，不列進 targets。
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import random
+import re
+import sys
+from pathlib import Path
+from urllib.parse import quote
+
+from src.meta_block import ACTION_BLOCKED, RATE_LIMITED, classify as classify_failure
+from src.run_ig_post import DEFAULT_PROFILE, IG_URL, _dismiss_popups, _logged_in, _my_username
+from src.run_threads_post import _debug_shot, _launch
+from src.utils import human_sleep
+
+_JSON_PATH = None
+_RESULT = None
+
+PLATFORM = "ig"
+DEFAULT_MAX = 5
+HARD_CAP = 10                        # 再怎麼設定也不准超過（SPEC-P31 §2）
+LIKE_PROBABILITY = 0.3
+GAP = (20, 90)                       # 人與人之間的秒數，連續動作最像機器
+OWN_POSTS_LIMIT = 3                  # own_posts 來源只看最近幾篇自己的貼文
+SOURCES = ("own_posts", "hashtags")  # 允許的來源，順序即優先序
+
+PROFILE_URL = "https://www.instagram.com/{user}/"
+TAG_URL = "https://www.instagram.com/explore/tags/{tag}/"
+LIKED_BY_URL = "https://www.instagram.com{post}liked_by/"
+
+# 按鈕文字中英雙語（TODO 實測校正：IG 版面常改）
+_FOLLOW_LABELS = ["追蹤", "Follow", "回追", "Follow Back"]
+_FOLLOWING_LABELS = ["追蹤中", "Following", "已追蹤"]
+_REQUESTED_LABELS = ["已要求", "Requested", "已送出要求"]
+
+# meta_block 沒收的 IG 專用句子：都是「這輪該停」的訊號
+_IG_BLOCK_EXTRA = (
+    ("動作已封鎖", ACTION_BLOCKED),
+    ("動作被封鎖", ACTION_BLOCKED),
+    ("我們會限制你在 Instagram 上執行特定動作的頻率", RATE_LIMITED),
+    ("We limit how often you can do certain things", RATE_LIMITED),
+)
+_STOP_REASONS = (ACTION_BLOCKED, RATE_LIMITED)
+
+# 同行的帳號名／顯示名關鍵字：命中就不追（便宜的啟發式，寧可漏）
+_AGENCY_HINTS = (
+    "房仲", "仲介", "代銷", "經紀", "不動產", "房屋", "建設", "地產",
+    "realty", "realtor", "agent", "agency", "estate", "property", "broker",
+    "housing", "homes", "sinyi", "yungching", "hb.com",
+)
+
+# IG 保留路徑：看起來像 /xxx/ 但不是帳號
+_RESERVED_PATHS = {
+    "explore", "p", "reel", "reels", "stories", "accounts", "direct", "about",
+    "legal", "privacy", "directory", "developer", "press", "api", "web",
+    "emails", "session", "challenge", "your_activity", "archive", "tv",
+}
+_USERNAME_RE = re.compile(r"^/([A-Za-z0-9._]{1,30})/?(?:[?#].*)?$")
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[ig-follow] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+# ---------- 純函式（可離線測試） ----------
+
+def effective_limit(requested: int | None) -> int:
+    """把設定值夾到合理範圍。上限是硬的——IG 是最容易被判機器人的平台。"""
+    n = DEFAULT_MAX if not requested or requested <= 0 else requested
+    return max(1, min(HARD_CAP, n))
+
+
+def parse_sources(arg: str) -> list[str]:
+    """逗號分隔 → 去空白、去重、保留順序；不認得的來源直接報錯（設定打錯不該默默跑）。"""
+    out = []
+    for raw in (arg or "").split(","):
+        s = raw.strip().lower()
+        if not s:
+            continue
+        if s not in SOURCES:
+            raise ValueError(f"不認得的來源「{s}」，只接受：{', '.join(SOURCES)}")
+        if s not in out:
+            out.append(s)
+    return out
+
+
+def parse_hashtags(arg: str) -> list[str]:
+    """逗號分隔 → 去 #、去空白（含 tag 內部空白）、去重、保留順序。"""
+    out = []
+    for raw in (arg or "").split(","):
+        t = raw.strip().lstrip("#").replace(" ", "").strip()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def looks_like_agency(username: str, name: str = "") -> bool:
+    """帳號名或顯示名像同行（房仲／代銷／經紀）？便宜的啟發式，寧可漏判。"""
+    blob = f"{username or ''} {name or ''}".lower()
+    return any(h in blob for h in _AGENCY_HINTS)
+
+
+def make_target(key: str, source: str, name: str = "") -> dict:
+    return {"key": key, "name": name or "", "source": source,
+            "url": PROFILE_URL.format(user=key), "liked": False, "status": ""}
+
+
+def dedupe_targets(targets: list[dict], me: str = "") -> list[dict]:
+    """跨來源去重（同一人只留第一次出現的來源），並且絕不把自己列進去。"""
+    seen, out = set(), []
+    me_l = _norm_key(me)
+    for t in targets:
+        k = _norm_key(t.get("key"))
+        if not k or k == me_l or k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
+
+
+def _norm_key(k: str) -> str:
+    return (k or "").strip().lstrip("@").lower()
+
+
+def load_exclude(path: str | Path | None) -> set[str]:
+    """讀後端給的「已追過」清單（JSON 陣列的帳號名）。
+
+    寬容處理：沒給、檔案不存在、JSON 壞掉 → 空集合，不能因為這個檔讓整輪掛掉。
+    """
+    if not path:
+        return set()
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    if isinstance(data, dict):                # 也接受 {"keys": [...]} 這種包法
+        data = data.get("keys") or data.get("targets") or []
+    if not isinstance(data, list):
+        return set()
+    out = set()
+    for item in data:
+        k = item.get("key") if isinstance(item, dict) else item
+        if isinstance(k, str) and _norm_key(k):
+            out.add(_norm_key(k))
+    return out
+
+
+def apply_exclude(targets: list[dict], exclude: set[str] | None) -> tuple[list[dict], int]:
+    """把已追過的帳號在進頁面前就剔掉。回 (留下的, 剔掉幾個)。"""
+    if not exclude:
+        return list(targets), 0
+    kept = [t for t in targets if _norm_key(t.get("key")) not in exclude]
+    return kept, len(targets) - len(kept)
+
+
+def usernames_from_hrefs(hrefs: list[str]) -> list[str]:
+    """把一堆 href 過濾成帳號名（去重、保序），排除 /explore/ /p/ 之類的保留路徑。"""
+    out = []
+    for h in hrefs or []:
+        m = _USERNAME_RE.match((h or "").strip())
+        if not m:
+            continue
+        u = m.group(1)
+        if u.lower() in _RESERVED_PATHS or u in out:
+            continue
+        out.append(u)
+    return out
+
+
+def block_reason(page_text: str = "", error_text: str = "") -> str:
+    """頁面文字是不是「這輪該停」的訊號？回 action_blocked／rate_limited，否則空字串。
+
+    IG 的「動作已封鎖」彈窗同時會寫「請稍後再試」——重的要先判，
+    所以先看 IG 專用的封鎖句，再走 meta_block（跟 P28 同一套），最後才補節流句。
+    """
+    blob = f"{page_text}\n{error_text}".lower()
+    for phrase, reason in _IG_BLOCK_EXTRA:
+        if reason == ACTION_BLOCKED and phrase.lower() in blob:
+            return reason
+    r = classify_failure(page_text=page_text, error_text=error_text)
+    if r in _STOP_REASONS:
+        return r
+    for phrase, reason in _IG_BLOCK_EXTRA:
+        if phrase.lower() in blob:
+            return reason
+    return ""
+
+
+def summarize(targets: list[dict]) -> dict:
+    """結果 JSON 的計數欄位。"""
+    st = [t.get("status") for t in targets]
+    return {"sent": st.count("sent"),
+            "skipped_existing": st.count("existing"),
+            "skipped_pending": st.count("pending")}
+
+
+# ---------- 瀏覽器動作 ----------
+
+def _body_text(page) -> str:
+    with contextlib.suppress(Exception):
+        return page.evaluate("()=>document.body.innerText")[:4000]
+    return ""
+
+
+def _page_blocked(page) -> str:
+    """頁面上出現平台的封鎖／節流警告？回 reason 或空字串。"""
+    return block_reason(page_text=_body_text(page))
+
+
+def _human_browse(page, rounds: tuple[int, int] = (2, 4)) -> None:
+    """滑一滑再動作——直接進頁面就按追蹤，時間軸上太乾淨了。"""
+    for _ in range(random.randint(*rounds)):
+        with contextlib.suppress(Exception):
+            page.mouse.wheel(0, random.randint(200, 600))
+        human_sleep(0.8, 2.0)
+
+
+def _post_links(page, limit: int) -> list[str]:
+    """頁面上的貼文連結（/p/CODE/ 或 /reel/CODE/），去重保序。"""
+    hrefs = []
+    with contextlib.suppress(Exception):
+        hrefs = page.evaluate(
+            """()=>[...document.querySelectorAll("a[href*='/p/'],a[href*='/reel/']")]
+                  .map(a=>a.getAttribute("href")).filter(Boolean)""") or []
+    out = []
+    for h in hrefs:
+        # 自己個人頁的貼文連結長 /<username>/p/CODE/，hashtag 頁是 /p/CODE/——
+        # 兩種都要吃（2026-09-02 實測：只認後者，自己貼文一個都抓不到）。
+        m = re.match(
+            r"^(?:https?://www\.instagram\.com)?(?:/[A-Za-z0-9._]+)?(/(?:p|reel)/[A-Za-z0-9_-]+/)",
+            h or "")
+        if m and m.group(1) not in out:
+            out.append(m.group(1))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _hrefs_in(page, root_sel: str) -> list[str]:
+    with contextlib.suppress(Exception):
+        return page.evaluate(
+            """(sel)=>{const root=document.querySelector(sel);if(!root)return[];
+                 return [...root.querySelectorAll("a[href^='/']")].map(a=>a.getAttribute("href"))}""",
+            root_sel) or []
+    return []
+
+
+def _close_dialog(page) -> None:
+    with contextlib.suppress(Exception):
+        page.keyboard.press("Escape")
+    human_sleep(0.6, 1.2)
+
+
+def _maybe_like(page, probability: float) -> bool:
+    """依機率打開對方一篇貼文按個讚再關掉。找不到就算了，不是必要動作。
+
+    IG 個人頁的九宮格沒有讚按鈕，得點進貼文（會開成對話框）。
+    """
+    if random.random() > probability:
+        return False
+    posts = _post_links(page, 6)
+    if not posts:
+        return False
+    with contextlib.suppress(Exception):
+        page.locator(f'a[href*="{random.choice(posts)}"]').first.click()
+        human_sleep(1.5, 3.0)
+        # TODO 實測校正：讚按鈕的 aria-label 與對話框結構
+        btns = page.locator('div[role="dialog"] svg[aria-label="讚"], div[role="dialog"] svg[aria-label="Like"], '
+                            'article svg[aria-label="讚"], article svg[aria-label="Like"]')
+        liked = False
+        if btns.count() > 0 and btns.first.is_visible():
+            btns.first.click()
+            human_sleep(0.8, 1.6)
+            liked = True
+        _close_dialog(page)
+        if "/p/" in (page.url or "") or "/reel/" in (page.url or ""):
+            page.go_back()                     # 沒開成對話框而是整頁：退回個人頁
+            human_sleep(1.0, 2.0)
+        return liked
+    return False
+
+
+def _display_name(page) -> str:
+    """個人頁標題長這樣：「王小明 (@some_user) • Instagram」→ 取括號前的名字。"""
+    with contextlib.suppress(Exception):
+        m = re.match(r"^(.*?)\s*\(@", page.title() or "")
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _button_present(page, labels) -> bool:
+    for lab in labels:
+        with contextlib.suppress(Exception):
+            if page.get_by_role("button", name=lab, exact=True).first.count() > 0:
+                return True
+    return False
+
+
+def _follow_one(page, target: dict, probability: float) -> str:
+    """回 sent / existing / pending / failed / blocked。"""
+    page.goto(target["url"], wait_until="commit", timeout=45000)
+    human_sleep(2.0, 4.0)
+    _dismiss_popups(page)
+    if not target.get("name"):
+        target["name"] = _display_name(page)
+
+    if _page_blocked(page):
+        return "blocked"
+
+    # 已追蹤／已送出要求的別再點——會變成取消
+    # TODO 實測校正：IG 個人頁的「追蹤中」是 button 還是 div[role=button]
+    if _button_present(page, _FOLLOWING_LABELS):
+        return "existing"
+    if _button_present(page, _REQUESTED_LABELS):
+        return "pending"
+
+    _human_browse(page)
+    if _maybe_like(page, probability):
+        target["liked"] = True
+        human_sleep(1.0, 2.5)
+
+    btn = None
+    for lab in _FOLLOW_LABELS:
+        with contextlib.suppress(Exception):
+            cand = page.get_by_role("button", name=lab, exact=True).first
+            if cand.count() > 0 and cand.is_visible():
+                btn = cand
+                break
+    if btn is None:
+        return "failed"
+
+    btn.click()
+    human_sleep(1.5, 3.0)
+    if _page_blocked(page):
+        return "blocked"
+
+    # 確認真的追蹤了（按鈕變成「追蹤中」或「已要求」）
+    if _button_present(page, _FOLLOWING_LABELS):
+        _human_browse(page, (1, 2))            # 追蹤完再逛一下才離開
+        return "sent"
+    if _button_present(page, _REQUESTED_LABELS):
+        return "pending"
+    return "failed"
+
+
+# ---------- 對象來源 ----------
+
+def _collect_own_posts(page, me: str, want: int) -> list[dict]:
+    """在自己最近幾篇貼文下按讚／留言的人。"""
+    out = []
+    page.goto(PROFILE_URL.format(user=me), wait_until="commit", timeout=45000)
+    human_sleep(2.5, 4.0)
+    _dismiss_popups(page)
+    if _page_blocked(page):
+        raise _Blocked(_page_blocked(page))
+    posts = _post_links(page, OWN_POSTS_LIMIT)
+    for post in posts:
+        if len(out) >= want:
+            break
+        # 按讚名單：/p/CODE/liked_by/ 是一整頁，不是對話框（2026-09-02 mini 實測，
+        # 原本抓 div[role="dialog"] 永遠是空的）。連結就在 main 裡。
+        page.goto(LIKED_BY_URL.format(post=post), wait_until="commit", timeout=45000)
+        human_sleep(2.0, 3.5)
+        if _page_blocked(page):
+            raise _Blocked(_page_blocked(page))
+        for u in usernames_from_hrefs(_hrefs_in(page, "main")):
+            out.append(make_target(u, "own_posts"))
+        # 留言的人：貼文頁沒有 article/ul 結構，一樣讀 main（保留路徑會被過濾掉）
+        page.goto("https://www.instagram.com" + post, wait_until="commit", timeout=45000)
+        human_sleep(2.0, 3.5)
+        for u in usernames_from_hrefs(_hrefs_in(page, "main")):
+            out.append(make_target(u, "own_posts"))
+        human_sleep(1.5, 3.0)
+    return dedupe_targets(out, me=me)[:want]
+
+
+def _collect_hashtag(page, tag: str, want: int) -> list[dict]:
+    """某個 hashtag 頁最近貼文的作者。"""
+    out = []
+    page.goto(TAG_URL.format(tag=quote(tag)), wait_until="commit", timeout=45000)
+    human_sleep(2.5, 4.0)
+    _dismiss_popups(page)
+    if _page_blocked(page):
+        raise _Blocked(_page_blocked(page))
+    _human_browse(page, (1, 2))
+    for post in _post_links(page, want * 2):
+        if len(out) >= want:
+            break
+        page.goto("https://www.instagram.com" + post, wait_until="commit", timeout=45000)
+        human_sleep(2.0, 3.5)
+        if _page_blocked(page):
+            raise _Blocked(_page_blocked(page))
+        # 貼文頁沒有 article header；作者是 main 裡第一個帳號連結（實測 2026-09-02）
+        authors = usernames_from_hrefs(_hrefs_in(page, "main"))
+        if authors:
+            out.append(make_target(authors[0], "hashtags"))
+        human_sleep(1.0, 2.5)
+    return out
+
+
+class _Blocked(Exception):
+    """收集對象時就被擋了——整批停。"""
+    def __init__(self, reason: str):
+        super().__init__(reason or ACTION_BLOCKED)
+        self.reason = reason or ACTION_BLOCKED
+
+
+def collect_targets(page, me: str, sources: list[str], hashtags: list[str], want: int) -> list[dict]:
+    """依來源優先序收集候選，跨來源去重、排除自己、標記同行。"""
+    raw = []
+    for src in sources:
+        if len(dedupe_targets(raw, me)) >= want:
+            break
+        if src == "own_posts":
+            raw.extend(_collect_own_posts(page, me, want))
+        elif src == "hashtags":
+            for tag in hashtags:
+                raw.extend(_collect_hashtag(page, tag, want))
+                if len(dedupe_targets(raw, me)) >= want:
+                    break
+    targets = dedupe_targets(raw, me)
+    for t in targets:
+        if looks_like_agency(t["key"], t.get("name")):
+            t["status"] = "agency"
+    return targets
+
+
+def do_follow(profile_dir: Path, sources: list[str], hashtags: list[str], max_follow: int,
+              headless: bool, dry_run: bool = False,
+              like_probability: float = LIKE_PROBABILITY,
+              exclude: set[str] | None = None) -> dict:
+    from playwright.sync_api import sync_playwright
+
+    pw = sync_playwright().start()
+    ctx, page = _launch(pw, profile_dir, headless=headless)
+    targets: list[dict] = []
+    blocked, reason = False, ""
+    skipped_known = 0
+    try:
+        page.goto(IG_URL, wait_until="commit", timeout=60000)
+        human_sleep(3.0, 5.0)
+        _dismiss_popups(page)
+        if not _logged_in(page):
+            raise RuntimeError("尚未登入 Instagram——先到帳號設定連結一次")
+        me = _my_username(page)
+        if not me and "own_posts" in sources:
+            raise RuntimeError("找不到自己的帳號名，無法讀取自己的貼文互動者")
+
+        # 多收一些候選：已追蹤的會被略過，不多收會湊不到額度
+        want = max_follow * 2 + 2
+        try:
+            targets = collect_targets(page, me, sources, hashtags, want)
+        except _Blocked as b:
+            blocked, reason = True, b.reason
+            _debug_shot(page, "ig_follow_blocked_collect")
+            print("[ig-follow] ⚠ 收集對象時就偵測到限制，這輪不追任何人", flush=True)
+            return {"targets": targets, "blocked": blocked, "block_reason": reason,
+                    "skipped_known": skipped_known}
+        # 後端已記錄過的人：進頁面前就剔掉，不算進 targets
+        targets, skipped_known = apply_exclude(targets, exclude)
+        print(f"[ig-follow] 收集到 {len(targets)} 個候選（來源：{','.join(sources)}"
+              f"{f'，另略過 {skipped_known} 個已追過' if skipped_known else ''}）", flush=True)
+
+        if dry_run:
+            for t in targets:
+                if t["status"] != "agency":
+                    t["status"] = "dry_run"
+                print(f"[ig-follow] dry-run 候選 @{t['key']}（{t['source']}）{t['status']}", flush=True)
+            return {"targets": targets, "blocked": False, "block_reason": "",
+                    "skipped_known": skipped_known}
+
+        sent = 0
+        pending = [t for t in targets if t["status"] != "agency"]
+        for i, t in enumerate(pending):
+            if sent >= max_follow:
+                break
+            try:
+                r = _follow_one(page, t, like_probability)
+            except Exception as e:
+                t["status"] = "failed"
+                t["error"] = str(e)[:80]
+                # 不印出來的話，紀錄只會寫「追蹤 0 人」，完全不知道卡在哪（2026-09-03 實測）
+                print(f"[ig-follow] ⚠ @{t['key']} 失敗：{str(e)[:120]}", flush=True)
+                continue
+
+            if r == "blocked":
+                t["status"] = "failed"
+                blocked, reason = True, _page_blocked(page) or ACTION_BLOCKED
+                print("[ig-follow] ⚠ 偵測到動作被限制，立即中止整批", flush=True)
+                _debug_shot(page, "ig_follow_blocked")
+                break
+            t["status"] = r
+            if r == "sent":
+                sent += 1
+                print(f"[ig-follow] 已追蹤 @{t['key']}（{sent}/{max_follow}）", flush=True)
+
+            if sent < max_follow and i < len(pending) - 1:
+                human_sleep(*GAP)
+        # 沒輪到的候選不進結果——沒動過的人明天再收一次就好
+        done = [t for t in targets if t["status"]]
+        return {"targets": done, "blocked": blocked, "block_reason": reason,
+                "skipped_known": skipped_known}
+    except Exception as e:
+        e.reason = classify_failure(page_text=_body_text(page), error_text=str(e))
+        # 已追蹤的部分不能白做，附在例外上讓上層記錄
+        e.partial = {"targets": [t for t in targets if t.get("status")],
+                     "blocked": blocked, "block_reason": reason,
+                     "skipped_known": skipped_known}
+        raise
+    finally:
+        for close in (ctx.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser(description="Instagram 自動追蹤（SPEC-P31）")
+    ap.add_argument("--max", type=int, default=DEFAULT_MAX, help=f"這輪最多追幾人（硬上限 {HARD_CAP}）")
+    ap.add_argument("--sources", default="own_posts,hashtags",
+                    help="逗號分隔，優先序即順序：own_posts,hashtags")
+    ap.add_argument("--hashtags", default="", help="逗號分隔，例：台中買房,台中租屋")
+    ap.add_argument("--like-probability", type=float, default=LIKE_PROBABILITY)
+    ap.add_argument("--exclude-file", default="",
+                    help="後端已記錄過的帳號清單（JSON 陣列），進頁面前就略過")
+    ap.add_argument("--profile-dir", default=str(DEFAULT_PROFILE))
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="只收集候選並列出，不追蹤不按讚")
+    ap.add_argument("--result-json")
+    args = ap.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {"success": False, "platform": PLATFORM,
+               "sent": 0, "skipped_existing": 0, "skipped_pending": 0, "skipped_known": 0,
+               "blocked": False, "block_reason": "", "error": "未完成", "targets": []}
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    try:
+        sources = parse_sources(args.sources)
+    except ValueError as e:
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    if not sources:
+        _RESULT["error"] = "沒有指定對象來源（--sources）"
+        sys.exit(1)
+    hashtags = parse_hashtags(args.hashtags)
+    if sources == ["hashtags"] and not hashtags:
+        _RESULT["error"] = "來源只有 hashtags 但沒有給 --hashtags"
+        sys.exit(1)
+    prob = max(0.0, min(1.0, args.like_probability))
+    exclude = load_exclude(args.exclude_file)
+
+    def _fill(r: dict):
+        _RESULT["targets"] = r.get("targets", [])
+        _RESULT["blocked"] = bool(r.get("blocked"))
+        _RESULT["block_reason"] = r.get("block_reason", "") or ""
+        _RESULT["skipped_known"] = int(r.get("skipped_known") or 0)
+        _RESULT.update(summarize(_RESULT["targets"]))
+
+    try:
+        r = do_follow(Path(args.profile_dir).expanduser(), sources, hashtags,
+                      effective_limit(args.max), args.headless,
+                      dry_run=args.dry_run, like_probability=prob, exclude=exclude)
+        _fill(r)
+        if _RESULT["blocked"]:
+            _RESULT["error"] = f"動作被限制，已中止（已追蹤 {_RESULT['sent']} 人）"
+            sys.exit(1)
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        if args.dry_run:
+            print(f"[ig-follow] dry-run：{len(_RESULT['targets'])} 個候選，未追蹤", flush=True)
+        else:
+            print(f"[ig-follow] ✅ 追蹤 {_RESULT['sent']} 人、略過 {_RESULT['skipped_existing']} 個已追蹤、"
+                  f"{_RESULT['skipped_pending']} 個待對方同意、{_RESULT['skipped_known']} 個已追過",
+                  flush=True)
+    except SystemExit:
+        raise
+    except Exception as e:
+        _fill(getattr(e, "partial", {}) or {})
+        _RESULT["error"] = str(e)
+        reason = getattr(e, "reason", None) or classify_failure(error_text=str(e))
+        if reason in _STOP_REASONS:
+            _RESULT["blocked"] = True
+            _RESULT["block_reason"] = reason
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

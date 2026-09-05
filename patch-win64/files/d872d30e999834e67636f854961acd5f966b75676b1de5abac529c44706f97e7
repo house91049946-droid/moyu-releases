@@ -1,0 +1,67 @@
+"""Threads / IG 養號的離線測試：行為池以逛為主、按讚有上限、被擋會停。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_meta_nurture.py -v
+"""
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("playwright")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import run_meta_nurture as m  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class Test保守預設:
+    def test_行為池以逛為主(self):
+        """自動按讚是最容易被判機器人的動作：按讚機率不能是主流。"""
+        probs = dict(m.ACTIONS)
+        assert probs["like"] <= 0.10
+        assert probs["scroll"] + probs["stay"] + probs["open_post"] >= 0.85
+        assert abs(sum(probs.values()) - 1.0) < 1e-9
+
+    def test_一次最多三個讚(self):
+        assert m.MAX_LIKES_PER_RUN == 3 and m.LIKE_PROBABILITY <= 0.15
+
+    def test_選行為依機率(self):
+        assert m.pick_action(0.0) == "scroll"
+        assert m.pick_action(0.99) == "like"
+        assert m.pick_action(0.5) == "stay"
+
+
+class Test被擋:
+    def test_被擋回reason並exit1_但保留已做的動作(self, tmp_path):
+        out = tmp_path / "r.json"
+        code = (
+            "import sys; sys.argv=['x','--platform','ig','--duration','1','--result-json',r'%s']\n"
+            "import src.run_meta_nurture as m\n"
+            "m.do_nurture=lambda p,plat,d,h:{'actions_performed':4,'likes':1,'duration_sec':20,'aborted_reason':'action_blocked'}\n"
+            "try: m.main()\n"
+            "except SystemExit as e: assert e.code==1, e.code\n"
+        ) % out
+        r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        d = json.loads(out.read_text())
+        assert d["success"] is False and d["data"]["reason"] == "action_blocked"
+        assert d["data"]["actions_performed"] == 4        # 已做的不能白做
+
+    def test_時長夾在1到30分鐘(self, tmp_path):
+        out = tmp_path / "r.json"
+        code = (
+            "import sys; sys.argv=['x','--platform','threads','--duration','999','--result-json',r'%s']\n"
+            "import src.run_meta_nurture as m\n"
+            "seen={}\n"
+            "def fake(p,plat,d,h): seen['d']=d; return {'actions_performed':1,'likes':0,'duration_sec':5,'aborted_reason':''}\n"
+            "m.do_nurture=fake\n"
+            "try: m.main()\n"
+            "except SystemExit as e: assert e.code==0, e.code\n"
+            "assert seen['d']==30, seen\n"
+        ) % out
+        r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        assert json.loads(out.read_text())["success"] is True

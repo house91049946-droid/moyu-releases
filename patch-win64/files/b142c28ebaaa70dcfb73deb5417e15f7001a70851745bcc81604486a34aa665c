@@ -1,0 +1,54 @@
+"""手機綁定的電腦端 API（SPEC-P30 v2）：產 QR、看／解除手機、同步狀態。全部轉發雲端。"""
+import asyncio
+
+from fastapi import APIRouter, HTTPException
+
+router = APIRouter(prefix="/api/mobile", tags=["mobile"], redirect_slashes=False)
+
+
+@router.post("/pair-code")
+async def pair_code():
+    from ..cloud_client import cloud_enabled, mobile_pair_code, CloudError
+    if not cloud_enabled():
+        raise HTTPException(status_code=422, detail="尚未啟用授權——手機綁定要透過雲端，請先到授權管理啟用")
+    try:
+        return await asyncio.to_thread(mobile_pair_code)
+    except CloudError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/phones")
+async def phones():
+    from ..cloud_client import cloud_enabled, mobile_phones, CloudError
+    if not cloud_enabled():
+        return []
+    try:
+        return await asyncio.to_thread(mobile_phones)
+    except CloudError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.delete("/phones/{phone_id}")
+async def revoke(phone_id: int):
+    from ..cloud_client import mobile_revoke, CloudError
+    try:
+        ok = await asyncio.to_thread(mobile_revoke, phone_id)
+    except CloudError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if not ok:
+        raise HTTPException(status_code=404, detail="找不到這支手機")
+    return {"revoked": True}
+
+
+@router.get("/status")
+async def status():
+    from ..scheduler.mobile_sync import status as _st
+    from ..cloud_client import cloud_enabled
+    return {"cloud": cloud_enabled(), **_st()}
+
+
+@router.post("/sync-now")
+async def sync_now():
+    """立刻同步一次（測試／想馬上看到手機撥的開關套用）。"""
+    from ..scheduler.mobile_sync import sync_once
+    return await sync_once()

@@ -1,0 +1,185 @@
+"""批次網址匯入：一批物件頁 → 逐筆擷取文案＋圖片，共用同一個瀏覽器。
+
+老闆定調（2026-09-02）：貼一個樂屋網址進來，同店家全部案件一次列出、勾選、
+一鍵變成可上架物件——不是一筆一筆按、每筆等 20～60 秒。
+
+設計：
+  - **共用一個瀏覽器**：每筆重開 Chrome 要 3～5 秒又吃記憶體，20 筆就多等
+    一兩分鐘。這裡開一次，換分頁逐筆跑。
+  - **單筆失敗不拖累整批**：打不開、沒內容的那筆記下原因，繼續下一筆。
+  - **被擋就停**：HTTP 403/429 是網站在擋自動擷取，硬撐只會讓封鎖更久，
+    剩下的全部標「暫時被擋」讓使用者晚點重試——已完成的照樣回傳。
+  - **邊跑邊寫進度檔**：後端輪詢時讀它顯示「第 3／12 筆」，
+    十幾分鐘只轉圈使用者會以為當掉。
+
+用法：
+    python -m src.run_import_batch --urls-file urls.txt --out-dir … --url-prefix /uploads/ \\
+        --name-prefix mp_ --max-images 20 --progress-file p.json --result-json r.json
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import random
+import re
+import sys
+import time
+from pathlib import Path
+
+_JSON_PATH = None
+_RESULT = None
+
+_BLOCKED_RE = re.compile(r"HTTP (403|429)\b")
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[batch] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+def is_blocked_error(msg: str) -> bool:
+    """403/429＝網站在擋自動擷取，不是這一筆的問題，是整批該停。"""
+    return bool(_BLOCKED_RE.search(msg or ""))
+
+
+def batch_import(urls: list[str], import_fn, progress_cb=None,
+                 pause=(8.0, 20.0), backoff=90.0, sleep=time.sleep,
+                 rand=random.uniform) -> dict:
+    """純編排邏輯（可離線測試）：逐筆呼叫 import_fn(url) → dict，
+    例外的訊息當失敗原因。
+
+    樂屋對連續抓詳情頁很敏感——2026-09-02 實測第 2 筆就 403。所以：
+      - 筆與筆之間停 pause 秒（隨機），像人一頁一頁看。
+      - 遇到 403/429 先退避 backoff 秒再**重試一次**；再被擋才視為整批該停，
+        剩下的一次標掉讓使用者晚點再來，已完成的照樣回傳。
+    sleep/rand 可注入，測試不用真的等。
+    回 {items:[{url, ok, error, …data}], done, failed, blocked}
+    """
+    items, done, failed, blocked = [], 0, 0, False
+    total = len(urls)
+    for i, url in enumerate(urls):
+        if progress_cb:
+            progress_cb({"done": i, "total": total, "current": url, "blocked": False})
+        if i > 0 and pause:
+            sleep(rand(*pause))
+        try:
+            data = import_fn(url)
+        except Exception as e:
+            msg = str(e) or e.__class__.__name__
+            if is_blocked_error(msg) and backoff:
+                # 退避後重試一次：多半是連續請求太密，歇一下就好
+                print(f"[batch] 被擋（{msg[:40]}），等 {int(backoff)} 秒後重試一次", flush=True)
+                sleep(backoff)
+                try:
+                    data = import_fn(url)
+                except Exception as e2:
+                    msg = str(e2) or e2.__class__.__name__
+                    data = None
+            else:
+                data = None
+            if data is None:
+                items.append({"url": url, "ok": False, "error": msg})
+                failed += 1
+                if is_blocked_error(msg):
+                    blocked = True
+                    for rest in urls[i + 1:]:
+                        items.append({"url": rest, "ok": False,
+                                      "error": "網站暫時擋住自動擷取，請稍後再試"})
+                        failed += 1
+                    break
+                continue
+        items.append({"url": url, "ok": True, "error": "", **data})
+        done += 1
+    if progress_cb:
+        progress_cb({"done": total, "total": total, "current": "", "blocked": blocked})
+    return {"items": items, "done": done, "failed": failed, "blocked": blocked}
+
+
+def _progress_writer(path: str | None):
+    if not path:
+        return None
+    p = Path(path)
+
+    def cb(state: dict):
+        with contextlib.suppress(OSError):
+            p.write_text(json.dumps({**state, "ts": time.time()}, ensure_ascii=False),
+                         encoding="utf-8")
+    return cb
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser(description="批次網址匯入")
+    ap.add_argument("--urls-file", required=True, help="一行一個網址")
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--url-prefix", required=True)
+    ap.add_argument("--name-prefix", default="imp_")
+    ap.add_argument("--max-images", type=int, default=20)
+    ap.add_argument("--progress-file")
+    ap.add_argument("--result-json")
+    args = ap.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {"schema": 1, "success": False, "error": "未完成",
+               "data": {"items": [], "done": 0, "failed": 0, "blocked": False}}
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    urls = [u.strip() for u in Path(args.urls_file).read_text(encoding="utf-8").splitlines()
+            if u.strip().lower().startswith(("http://", "https://"))]
+    if not urls:
+        _RESULT["error"] = "沒有可匯入的網址"
+        sys.exit(1)
+
+    from playwright.sync_api import sync_playwright
+    from src.run_import_url import import_one
+    from src.utils import launch_scrape_browser, scrape_context
+
+    pw = sync_playwright().start()
+    try:
+        browser, context, page = launch_scrape_browser(pw)
+    except Exception as e:
+        _RESULT["error"] = f"開不了瀏覽器（{e}）"
+        with contextlib.suppress(Exception):
+            pw.stop()
+        sys.exit(1)
+
+    with contextlib.suppress(Exception):
+        context.close()               # 開瀏覽器附帶的那個 context 用不到
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def one(url: str) -> dict:
+        # 每筆用**全新 context**（新 cookie jar），不是只換分頁：樂屋認的是
+        # context 層的 session，同一個 context 抓完一筆再打下一頁就 403
+        # （2026-09-02 mini 實測與探針）。瀏覽器本體共用，省下每筆重開的 3～5 秒。
+        ctx, pg = scrape_context(browser)
+        try:
+            print(f"[batch] 擷取 {url}", flush=True)
+            return import_one(ctx, pg, url, out_dir, args.name_prefix,
+                              args.url_prefix, args.max_images)
+        finally:
+            with contextlib.suppress(Exception):
+                ctx.close()
+
+    try:
+        r = batch_import(urls, one, _progress_writer(args.progress_file))
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        _RESULT["data"].update(r)
+        print(f"[batch] ✅ 完成 {r['done']} 筆、失敗 {r['failed']} 筆"
+              f"{'（中途被擋）' if r['blocked'] else ''}", flush=True)
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    finally:
+        for close in (browser.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+if __name__ == "__main__":
+    main()

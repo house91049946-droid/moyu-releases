@@ -1,0 +1,714 @@
+"""Threads / IG 備份模式自動刪文（SPEC-P32 §2）。
+
+**為什麼要另一套**：既有的「發文後 N 天自動刪除」是拿我們自己的發文紀錄去刪，
+知道貼文網址才刪得到。紀錄不見（重灌、換電腦、還原備份失敗）或那則根本不是用摸魚發的，
+它就管不到。備份模式**不看資料庫**，直接上平台掃自己個人頁上的貼文，超過 N 天的一律刪，
+當作第二道保險。兩套同時開也不衝突——既有那套先刪，這邊掃到的就是漏網的。
+
+刪除是不可逆的，所以每一條保守規則都寫死，設定再大也不准放寬：
+  - 天數最少 7 天（給更小的值會被提高到 7 並在紀錄裡講明白）。
+  - 一輪最多 20 則、硬上限 50；刪完的下一輪（明天）繼續。
+  - 每則之間 10–30 秒——連續刪最像腳本。
+  - 只動登入帳號**自己**個人頁上的貼文；IG 只刪一般貼文，Reels／限時動態一律不碰。
+  - 置頂／釘選貼文不刪（那通常是客戶刻意留在最上面的）。
+  - **日期讀不到就跳過**，寧可留著也不誤刪，並計入 skipped_undated 讓客戶看得到。
+  - 偵測到平台限制立刻中止整輪，已刪的照樣回報，讓 P28 的平台暫停接手。
+
+用法：
+    python -m src.run_meta_cleanup --platform threads|ig --older-than 30 \
+        [--max 20] [--headless] [--dry-run] [--result-json out.json] [--profile-dir …]
+
+--dry-run 只列出「會刪哪些」（網址 + 幾天前），不刪任何東西——真的動手前先跑這個。
+"""
+import argparse
+import atexit
+import contextlib
+import datetime
+import json
+import re
+import sys
+from pathlib import Path
+
+from src.delete_club_post import calculate_post_age_in_days, convert_text_to_post_date
+from src.meta_block import ACTION_BLOCKED, RATE_LIMITED, classify as classify_failure
+from src.run_threads_post import DEFAULT_PROFILE, THREADS_URL, _debug_shot, _launch
+from src.utils import human_sleep
+
+_JSON_PATH = None
+_RESULT = None
+
+IG_URL = "https://www.instagram.com/"
+THREADS_PROFILE_URL = "https://www.threads.com/@{user}"
+IG_PROFILE_URL = "https://www.instagram.com/{user}/"
+
+DEFAULT_OLDER_THAN = 30       # 老闆定的預設值（SPEC-P32 §2）
+MIN_OLDER_THAN = 7            # 再小就等於「剛發就刪」，不准
+DEFAULT_MAX = 20              # 一輪最多刪幾則，剩下的明天繼續
+HARD_CAP = 50                 # 設定再大也不准超過
+DELETE_GAP = (10, 30)         # 每則之間的秒數（SPEC-P32 §2）
+SCAN_SLACK = 20               # 要掃的貼文數＝上限 * 3 + 這個，前面幾則通常都還太新
+
+# meta_block 沒收的 IG／Threads 專用句子：都是「這輪該停」的訊號（沿用 P31 的做法）
+_BLOCK_EXTRA = (
+    ("動作已封鎖", ACTION_BLOCKED),
+    ("動作被封鎖", ACTION_BLOCKED),
+    ("我們會限制你在 Instagram 上執行特定動作的頻率", RATE_LIMITED),
+    ("We limit how often you can do certain things", RATE_LIMITED),
+)
+_STOP_REASONS = (ACTION_BLOCKED, RATE_LIMITED)
+
+# 中英雙語標籤（TODO 實測校正：IG／Threads 版面常改，這幾組要在 mini 上對過）
+_MORE_LABELS = {
+    "threads": ["更多", "More", "更多選項", "More options"],
+    "ig": ["更多選項", "More options", "更多", "More"],
+}
+_DELETE_TEXTS = ["刪除貼文", "Delete post", "刪除", "Delete"]
+_CONFIRM_TEXTS = ["刪除", "Delete"]
+_DELETED_MARKS = ["貼文已刪除", "已刪除貼文", "Post deleted", "已刪除", "Deleted"]
+_GONE_MARKS = ["這個頁面目前無法使用", "找不到這個頁面", "isn't available", "not available",
+               "Sorry, this page"]
+
+# 個人頁上的釘選／置頂標記（TODO 實測校正）
+_PINNED_HINTS = "釘選|置頂|已固定|Pinned"
+
+# ---- page.evaluate 用的 JS ----
+# ⚠️ 絕不在這些字串裡寫 \n：Python 三引號會把它變成真的換行，塞進 JS 字串常值就是
+#    SyntaxError，而 evaluate 包在 suppress 裡會安靜地回空——這個坑本專案踩過兩次。
+#    要換行一律用 String.fromCharCode(10)。
+_HREFS_JS = """(sel)=>[...document.querySelectorAll(sel)]
+    .map(a=>a.getAttribute('href')).filter(Boolean)"""
+_TIMES_JS = """()=>[...document.querySelectorAll('time')]
+    .map(t=>((t.getAttribute('datetime')||'')+' '+(t.textContent||'')).trim())
+    .filter(Boolean).join(String.fromCharCode(10))"""
+_PINNED_JS = """(arg)=>{const re=new RegExp(arg.hint);const out=[];
+    document.querySelectorAll(arg.sel).forEach(a=>{let n=a,hit=false;
+      for(let i=0;i<6&&n;i++){
+        if(re.test(n.innerText||''))hit=true;
+        if(n.querySelector&&n.querySelector('svg[aria-label*="釘選"],svg[aria-label*="固定"],svg[aria-label*="Pinned"]'))hit=true;
+        n=n.parentElement;}
+      if(hit)out.push(a.getAttribute('href'));});
+    return out}"""
+
+_ISO_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?")
+_CJK_DATE_RE = re.compile(r"(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*日")
+# IG／Threads 的短格式：3d / 2w / 5h / 45m / 1y（貼文卡片上就長這樣）
+_SHORT_RE = re.compile(r"(?<![A-Za-z0-9])(\d{1,3})\s*([ydwhms])(?![A-Za-z0-9])")
+_SHORT_DAYS = {"y": 365.0, "d": 1.0, "w": 7.0, "h": 1 / 24, "m": 1 / 1440, "s": 0.0}
+# 中文相對時間。delete_club_post 那份收的是 FB 的講法（「2星期前」），
+# Threads／IG 寫「2週」「3天」——沒有「前」也沒有「星期」，所以這裡補一份。
+_REL_DAYS = {"秒": 0.0, "分鐘": 1 / 1440, "分": 1 / 1440, "小時": 1 / 24, "時": 1 / 24,
+             "天": 1.0, "日": 1.0, "週": 7.0, "周": 7.0, "星期": 7.0,
+             "個月": 30.0, "月": 30.0, "年": 365.0}
+_REL_RE = re.compile(r"(\d{1,4})\s*(個月|分鐘|小時|星期|秒|分|時|天|日|週|周|月|年)\s*前")
+# 沒有「前」的裸寫法只認短單位——「7月」是日期不是七個月
+_REL_BARE_RE = re.compile(r"(\d{1,4})\s*(分鐘|小時|星期|天|週|周)(?![一-鿿\d])")
+
+
+def _write():
+    """任何離開路徑都要留下結果——被擋、例外、Ctrl-C 都算。
+
+    後端橋接（fbauto_bridge._result_from_raw）只讀 raw["data"]，但人／舊工具是看頂層，
+    所以寫檔時把同一份內容鏡到 data 底下，兩邊永遠一致。
+    """
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(envelope(_RESULT), f, ensure_ascii=False, indent=2)
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[cleanup] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+# ---------- 純函式（可離線測試） ----------
+
+# ── 只刪摸魚發的（老闆 2026-09-05）──────────────────────────────────────────────
+# 掃到的貼文要「對得上我們自己的紀錄」才刪：網址在白名單裡，或內文含我們固定附加的
+# 法定資訊／某個物件標題。兩種都對不上就跳過（記成 not_ours），寧可留著客戶手動發的。
+def load_only(path: str) -> dict:
+    """讀白名單檔。壞檔／不存在 → 回 None，代表「沒有白名單」。
+
+    注意這裡回 None 而不是空 dict：兩者語意不同。
+    None＝呼叫端沒給白名單（舊行為）；空的白名單＝有給但裡面沒東西，
+    那就一則都不該刪——不然「紀錄是空的」會變成「全部都刪」。
+    """
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        print("[cleanup] ⚠ 白名單讀不到，這輪不刪任何東西（保守處理）", flush=True)
+        return {"urls": [], "phrases": []}
+    if isinstance(raw, dict):
+        return {"urls": [str(u) for u in (raw.get("urls") or [])],
+                "phrases": [str(p) for p in (raw.get("phrases") or [])]}
+    return {"urls": [], "phrases": []}
+
+
+def _norm_url(u: str) -> str:
+    return (u or "").split("?")[0].rstrip("/").lower()
+
+
+def is_ours(url: str, text: str, only: dict | None) -> bool:
+    """這則是不是摸魚發的？沒有白名單就一律當成是（維持舊行為）。"""
+    if only is None:
+        return True
+    nu = _norm_url(url)
+    if nu and any(nu == _norm_url(u) or (u and _norm_url(u) in nu) for u in only.get("urls") or []):
+        return True
+    body = (text or "")
+    return any(p and p in body for p in only.get("phrases") or [])
+
+
+def envelope(result: dict) -> dict:
+    """結果 dict → 寫進檔案的樣子：頂層照舊，另鏡一份到 data。"""
+    body = {k: v for k, v in result.items() if k != "data"}
+    out = dict(body)
+    out["data"] = body
+    return out
+
+
+def effective_older_than(requested: int | None) -> int:
+    """把天數夾到合理範圍。下限是硬的——刪文不可逆，太短會刪到還在曝光的貼文。"""
+    n = DEFAULT_OLDER_THAN if not requested or requested <= 0 else int(requested)
+    return max(MIN_OLDER_THAN, n)
+
+
+def effective_max(requested: int | None) -> int:
+    """一輪的刪除上限。剩下的明天繼續刪，不要一次刪光——量太大最容易被判機器人。"""
+    n = DEFAULT_MAX if not requested or requested <= 0 else int(requested)
+    return max(1, min(HARD_CAP, n))
+
+
+def should_delete(age_days, older_than: int) -> bool:
+    """這則該不該刪？日期讀不到（None／負數）一律不刪——寧可留著。"""
+    if age_days is None:
+        return False
+    try:
+        age = int(age_days)
+    except (TypeError, ValueError):
+        return False
+    return age >= 0 and age >= older_than
+
+
+def parse_age_days(text: str, now: datetime.datetime | None = None) -> int | None:
+    """從時間標記算出貼文幾天前發的；判不出來回 None（呼叫端要跳過，不是當成 0）。
+
+    now 可注入：不注入的話測試會寫死日期，過幾個月自己爆炸。
+
+    吃四種格式，由可靠到不可靠排：
+      1. <time datetime="2026-07-12T08:30:00Z"> 的 ISO 值——最準，優先。
+      2. 中文絕對日期「2026年7月12日」「7月12日」（沒寫年份＝今年，未來日期視為去年）。
+      3. 中英相對時間「3天前」「2 weeks ago」——沿用 delete_club_post 的同一套解析。
+      4. IG／Threads 卡片的短格式「3d」「2w」「5h」。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    now = now or datetime.datetime.now()
+
+    m = _ISO_RE.search(text)
+    if m:
+        y, mo, d = (int(x) for x in m.group(1, 2, 3))
+        hh, mm = int(m.group(4) or 0), int(m.group(5) or 0)
+        with contextlib.suppress(ValueError):
+            return max(0, (now - datetime.datetime(y, mo, d, hh, mm)).days)
+
+    m = _CJK_DATE_RE.search(text)
+    if m:
+        year, mon, day = m.group(1), int(m.group(2)), int(m.group(3))
+        with contextlib.suppress(ValueError):
+            d = datetime.datetime(int(year) if year else now.year, mon, day)
+            if not year and d > now:            # 沒寫年份又落在未來 → 是去年的貼文
+                d = d.replace(year=now.year - 1)
+            return max(0, (now - d).days)
+
+    # 以下都是相對時間，不吃注入的 now——「3天前」本來就是相對於「讀到它的當下」，
+    # 換算成絕對日期再減注入的 now 反而會算錯。
+    m = _REL_RE.search(text) or _REL_BARE_RE.search(text)
+    if m:
+        return max(0, int(int(m.group(1)) * _REL_DAYS[m.group(2)]))
+
+    # 英文與「剛剛」交給 delete_club_post 的字串表（同一套語系，沒必要維護兩份）
+    dstr = convert_text_to_post_date(text)
+    if dstr:
+        return max(0, calculate_post_age_in_days(dstr + " 00:00:00"))
+
+    m = _SHORT_RE.search(text)
+    if m:
+        return max(0, int(int(m.group(1)) * _SHORT_DAYS[m.group(2)]))
+    return None
+
+
+def own_post_hrefs(hrefs: list, platform: str, me: str = "") -> list[str]:
+    """把個人頁上的連結濾成「這個帳號自己的一般貼文」，去重保序。
+
+    擋掉三種東西：
+      - IG 的 /reel/ 與 /stories/——老闆說連動都不要動。
+      - Threads 上轉發別人的串文（連結是 /@別人/post/…），那不是我們的貼文。
+      - 同一則重複出現（九宮格的圖與時間各自是一個 <a>）。
+    """
+    me = (me or "").strip().lstrip("@").lower()
+    out = []
+    for raw in hrefs or []:
+        h = (raw or "").strip()
+        if not h:
+            continue
+        h = re.sub(r"^https?://(?:www\.)?(?:instagram|threads)\.(?:com|net)", "", h).split("?")[0]
+        if platform == "threads":
+            m = re.match(r"^/@([A-Za-z0-9._]+)/post/([A-Za-z0-9_-]+)/?$", h)
+            if not m:
+                continue
+            if me and m.group(1).lower() != me:      # 轉發別人的：不是我們的貼文
+                continue
+            url = f"/@{m.group(1)}/post/{m.group(2)}"
+        else:
+            m = re.match(r"^(?:/([A-Za-z0-9._]+))?/p/([A-Za-z0-9_-]+)/?$", h)
+            if not m:                                # /reel/、/stories/、其他路徑都在這裡被擋掉
+                continue
+            if m.group(1) and me and m.group(1).lower() != me:
+                continue
+            url = f"/p/{m.group(2)}/"
+        if url not in out:
+            out.append(url)
+    return out
+
+
+def post_url(platform: str, href: str) -> str:
+    base = "https://www.threads.com" if platform == "threads" else "https://www.instagram.com"
+    return base + href if href.startswith("/") else href
+
+
+def block_reason(page_text: str = "", error_text: str = "") -> str:
+    """頁面文字是不是「這輪該停」的訊號？回 action_blocked／rate_limited，否則空字串。
+
+    IG 的「動作已封鎖」彈窗同時會寫「請稍後再試」——重的要先判，否則會被降級成節流。
+    """
+    blob = f"{page_text}\n{error_text}".lower()
+    for phrase, reason in _BLOCK_EXTRA:
+        if reason == ACTION_BLOCKED and phrase.lower() in blob:
+            return reason
+    r = classify_failure(page_text=page_text, error_text=error_text)
+    if r in _STOP_REASONS:
+        return r
+    for phrase, reason in _BLOCK_EXTRA:
+        if phrase.lower() in blob:
+            return reason
+    return ""
+
+
+def summarize(posts: list) -> dict:
+    """結果 JSON 的計數欄位。dry-run 的那些算「本來要刪的」，不算已刪。"""
+    st = [p.get("status") for p in posts or []]
+    return {"deleted": st.count("deleted"),
+            "skipped_undated": st.count("undated"),
+            "skipped_recent": st.count("recent")}
+
+
+def describe(result: dict) -> str:
+    """給客戶看的一行紀錄：動詞＋對象＋數量，不能只寫「成功」。"""
+    name = "Threads" if result.get("platform") == "threads" else "IG"
+    older = result.get("older_than", DEFAULT_OLDER_THAN)
+    undated = result.get("skipped_undated", 0)
+    tail = f"（另 {undated} 則日期讀不到，留著）" if undated else ""
+    if result.get("dry_run"):
+        n = sum(1 for p in result.get("posts", []) if p.get("status") == "dry_run")
+        return f"{name} 備份刪文試跑：找到 {n} 則超過 {older} 天的貼文（沒有真的刪）{tail}"
+    return f"{name} 備份刪文：清掉 {result.get('deleted', 0)} 則超過 {older} 天的貼文{tail}"
+
+
+# ---------- 瀏覽器動作 ----------
+
+def _body_text(page) -> str:
+    with contextlib.suppress(Exception):
+        return page.evaluate("()=>document.body.innerText")[:4000]
+    return ""
+
+
+def _page_blocked(page) -> str:
+    return block_reason(page_text=_body_text(page))
+
+
+def _dismiss_popups(page) -> None:
+    """「稍後再說」之類的攔路彈窗：能關就關，關不掉不影響主流程。"""
+    for t in ("稍後再說", "Not Now", "以後再說", "現在不要"):
+        with contextlib.suppress(Exception):
+            loc = page.get_by_text(t, exact=True)
+            if loc.count() and loc.first.is_visible():
+                loc.first.click()
+                human_sleep(0.8, 1.5)
+                return
+
+
+def _logged_in(page) -> bool:
+    """登入頁的痕跡（兩個平台的登入連結長得不一樣，兩種都認）。"""
+    with contextlib.suppress(Exception):
+        if page.locator('a[href*="/accounts/login"], a[href*="/login"], '
+                        'input[name="username"]').first.is_visible():
+            return False
+    return True
+
+
+def _my_handle(page, platform: str) -> str:
+    """自己的帳號名。Threads 讀導覽列的 /@handle，IG 讀大頭貼那個連結。"""
+    if platform == "threads":
+        with contextlib.suppress(Exception):
+            hrefs = page.evaluate(_HREFS_JS, "a[href^='/@']") or []
+            for h in hrefs:
+                m = re.match(r"^/@([A-Za-z0-9._]+)/?$", (h or "").split("?")[0])
+                if m:
+                    return m.group(1)
+        return ""
+    from src.run_ig_post import _my_username
+    return _my_username(page)
+
+
+def _scroll_profile(page, rounds: int) -> None:
+    """個人頁要往下滑才會載出舊貼文——要刪的正是最舊的那批。"""
+    for _ in range(rounds):
+        with contextlib.suppress(Exception):
+            page.mouse.wheel(0, 1400)
+        human_sleep(1.0, 2.2)
+
+
+def _collect_while_scrolling(page, platform: str, me: str, want: int,
+                             rounds: int) -> tuple[list[str], set]:
+    """邊捲邊收，不是捲完才收。
+
+    2026-09-03 mini 實測：IG 個人頁的九宮格是虛擬清單——捲下去以後，上面那幾列會被
+    從 DOM 拿掉。原本「捲 10 次再抓」的寫法，把 6 則抓成 1 則。Threads 也一樣穩妥。
+    """
+    links: list[str] = []
+    pinned: set = set()
+    seen_rounds_without_new = 0
+    for i in range(max(1, rounds)):
+        got, pin = _collect_own_posts(page, platform, me, want * 3)
+        before = len(links)
+        for h in got:
+            if h not in links:
+                links.append(h)
+        pinned |= pin
+        if len(links) >= want:
+            break
+        seen_rounds_without_new = seen_rounds_without_new + 1 if len(links) == before else 0
+        if seen_rounds_without_new >= 3:
+            break                       # 連捲三次沒有新東西：到底了
+        with contextlib.suppress(Exception):
+            page.mouse.wheel(0, 1400)
+        human_sleep(1.0, 2.2)
+    return links[:want], pinned
+
+
+def _collect_own_posts(page, platform: str, me: str, want: int) -> tuple[list[str], set]:
+    """回 (自己的貼文連結, 釘選的連結集合)。"""
+    sel = "a[href*='/post/']" if platform == "threads" else "a[href*='/p/']"
+    hrefs, pinned_raw = [], []
+    with contextlib.suppress(Exception):
+        hrefs = page.evaluate(_HREFS_JS, sel) or []
+    with contextlib.suppress(Exception):
+        pinned_raw = page.evaluate(_PINNED_JS, {"sel": sel, "hint": _PINNED_HINTS}) or []
+    links = own_post_hrefs(hrefs, platform, me)
+    pinned = set(own_post_hrefs(pinned_raw, platform, me))
+    return links[:want], pinned
+
+
+def _post_age_days(page) -> int | None:
+    """貼文頁上的時間標記 → 幾天前。留言的時間也在這頁，但它一定比貼文新，
+    最壞情況是把老貼文看成新的而跳過——保守方向，可以接受。"""
+    blob = ""
+    with contextlib.suppress(Exception):
+        blob = page.evaluate(_TIMES_JS) or ""
+    for line in blob.splitlines():
+        age = parse_age_days(line)
+        if age is not None:
+            return age
+    return None
+
+
+def _find_by_texts(page, texts, roles=("menuitem", "button")):
+    """依中英文字找可點的元素；找不到回 None。"""
+    for t in texts:
+        for role in roles:
+            with contextlib.suppress(Exception):
+                loc = page.get_by_role(role, name=t, exact=True).first
+                if loc.count() > 0 and loc.is_visible():
+                    return loc
+    for t in texts:
+        with contextlib.suppress(Exception):
+            loc = page.get_by_text(t, exact=True).first
+            if loc.count() > 0 and loc.is_visible():
+                return loc
+    return None
+
+
+# 貼文本體的容器：⋯ 一定要在這裡面找。
+# 2026-09-03 mini 實測：Threads 的側邊欄也有一顆 aria-label="更多"（外觀／設定那個選單），
+# 不限定範圍就會點到它——選單開出來全是「外觀」「設定」，程式判定「選單裡找不到刪除」，
+# 一則都刪不掉。IG 同理（頁尾也有 More）。
+_POST_SCOPES = {
+    "threads": ("div[data-pressable-container='true']", "main", ""),
+    "ig": ("article", "div[role='dialog']", "main", ""),
+}
+
+
+def _find_more_button(page, platform: str):
+    """貼文右上角的「⋯」：**先在貼文容器裡找**，找不到才放寬到整頁。
+
+    svg 本身不可點，要點它外層的按鈕；沒有外層按鈕時才退回點 svg。
+    """
+    labels = _MORE_LABELS.get(platform, [])
+    for scope in _POST_SCOPES.get(platform, ("",)):
+        prefix = f"{scope} " if scope else ""
+        for lab in labels:
+            for sel in (f'{prefix}svg[aria-label="{lab}"]', f'{prefix}[aria-label="{lab}"]'):
+                with contextlib.suppress(Exception):
+                    loc = page.locator(sel)
+                    n = min(loc.count(), 8)
+                    for i in range(n):
+                        el = loc.nth(i)
+                        if not el.is_visible():
+                            continue
+                        with contextlib.suppress(Exception):
+                            btn = el.locator(
+                                "xpath=ancestor-or-self::*[@role='button'][1]").first
+                            if btn.count() > 0 and btn.is_visible():
+                                return btn
+                        return el
+    return _find_by_texts(page, labels, roles=("button",))
+
+
+def _deleted_ok(page, url: str) -> bool:
+    """真的刪掉了嗎？先看有沒有「已刪除」提示，沒有就重開這則看是不是變成找不到。
+
+    不能只憑「按了確認」就算成功——按鈕點空了、對話框卡住都不會報錯，
+    數字灌水比少刪一則糟糕得多。
+    """
+    for _ in range(8):
+        body = _body_text(page)
+        if any(k in body for k in _DELETED_MARKS):
+            return True
+        human_sleep(0.8, 1.4)
+    with contextlib.suppress(Exception):
+        page.goto(url, wait_until="commit", timeout=45000)
+        human_sleep(2.0, 3.5)
+        body = _body_text(page)
+        return any(k.lower() in body.lower() for k in _GONE_MARKS)
+    return False
+
+
+def _delete_one(page, platform: str, url: str) -> bool:
+    """在已開啟的貼文頁上：⋯ → 刪除 → 確認 → 驗證。任何一步找不到就放棄這則。"""
+    more = _find_more_button(page, platform)
+    if more is None:
+        print("[cleanup] ⚠ 找不到「更多」按鈕，跳過這則", flush=True)
+        return False
+    more.click()
+    human_sleep(1.0, 2.0)
+
+    item = _find_by_texts(page, _DELETE_TEXTS)
+    if item is None:
+        with contextlib.suppress(Exception):
+            page.keyboard.press("Escape")
+        print("[cleanup] ⚠ 選單裡找不到「刪除」，跳過這則", flush=True)
+        return False
+    item.click()
+    human_sleep(1.0, 2.0)
+
+    # 確認框：優先在 dialog 裡找，避免點到頁面上其他同名文字
+    confirm = None
+    for t in _CONFIRM_TEXTS:
+        with contextlib.suppress(Exception):
+            loc = page.locator(f'div[role="dialog"] [role="button"]:has-text("{t}")').first
+            if loc.count() > 0 and loc.is_visible():
+                confirm = loc
+                break
+    confirm = confirm or _find_by_texts(page, _CONFIRM_TEXTS, roles=("button",))
+    if confirm is None:
+        with contextlib.suppress(Exception):
+            page.keyboard.press("Escape")
+        print("[cleanup] ⚠ 確認框沒有「刪除」按鈕，跳過這則", flush=True)
+        return False
+    confirm.click()
+    human_sleep(1.5, 3.0)
+    return _deleted_ok(page, url)
+
+
+def do_cleanup(profile_dir: Path, platform: str, older_than: int, max_delete: int,
+               headless: bool, dry_run: bool = False, only: dict | None = None) -> dict:
+    from playwright.sync_api import sync_playwright
+
+    home = THREADS_URL if platform == "threads" else IG_URL
+    pw = sync_playwright().start()
+    ctx, page = _launch(pw, profile_dir, headless=headless)
+    posts: list[dict] = []
+    blocked, reason, pinned_skipped = False, "", 0
+    try:
+        page.goto(home, wait_until="commit", timeout=60000)
+        human_sleep(3.0, 5.0)
+        _dismiss_popups(page)
+        if not _logged_in(page):
+            raise RuntimeError(f"尚未登入 {platform}——先到帳號設定連結一次")
+        me = _my_handle(page, platform)
+        if not me:
+            raise RuntimeError("找不到自己的帳號名，無法確認要掃誰的個人頁")
+
+        profile = (THREADS_PROFILE_URL if platform == "threads" else IG_PROFILE_URL).format(user=me)
+        page.goto(profile, wait_until="commit", timeout=60000)
+        human_sleep(3.0, 5.0)
+        _dismiss_popups(page)
+        reason = _page_blocked(page)
+        if reason:
+            _debug_shot(page, f"cleanup_{platform}_blocked_profile")
+            print("[cleanup] ⚠ 一進個人頁就偵測到限制，這輪不刪任何東西", flush=True)
+            return {"posts": [], "blocked": True, "block_reason": reason, "skipped_pinned": 0}
+
+        # 要刪的是最舊的那批，得先滑到夠深才看得到
+        want = max_delete * 3 + SCAN_SLACK
+        links, pinned = _collect_while_scrolling(page, platform, me, want,
+                                                 rounds=min(40, max_delete * 3 + 10))
+        pinned_skipped = len([h for h in links if h in pinned])
+        links = [h for h in links if h not in pinned]
+        print(f"[cleanup] @{me} 個人頁掃到 {len(links)} 則自己的貼文"
+              f"{f'（另 {pinned_skipped} 則置頂不動）' if pinned_skipped else ''}", flush=True)
+
+        deleted = 0
+        for href in links:
+            if deleted >= max_delete:
+                print(f"[cleanup] 已達本輪上限 {max_delete} 則，其餘下一輪再刪", flush=True)
+                break
+            url = post_url(platform, href)
+            with contextlib.suppress(Exception):
+                page.goto(url, wait_until="commit", timeout=45000)
+            human_sleep(2.0, 4.0)
+            if _page_blocked(page):
+                blocked, reason = True, _page_blocked(page) or ACTION_BLOCKED
+                _debug_shot(page, f"cleanup_{platform}_blocked")
+                print("[cleanup] ⚠ 偵測到動作被限制，立即中止整輪", flush=True)
+                break
+
+            age = _post_age_days(page)
+            if age is None:
+                posts.append({"url": url, "age_days": None, "status": "undated"})
+                print(f"[cleanup] 日期讀不到，留著：{url}", flush=True)
+                continue
+            if not should_delete(age, older_than):
+                posts.append({"url": url, "age_days": age, "status": "recent"})
+                continue
+            if only is not None:
+                # 要判斷「是不是摸魚發的」就得看內文，所以這裡一定要開貼文頁（dry-run 也要）
+                with contextlib.suppress(Exception):
+                    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    human_sleep(2.0, 3.5)
+                if not is_ours(url, _body_text(page), only):
+                    posts.append({"url": url, "age_days": age, "status": "not_ours"})
+                    print(f"[cleanup] 不是摸魚發的，留著：{url}", flush=True)
+                    continue
+            if dry_run:
+                # 清單留給 main 一次列完（依天數排序比較好看），這裡只留個進度
+                posts.append({"url": url, "age_days": age, "status": "dry_run"})
+                deleted += 1
+                continue
+
+            ok = False
+            try:
+                ok = _delete_one(page, platform, url)
+            except Exception as e:
+                print(f"[cleanup] 刪除例外：{e}", flush=True)
+            if _page_blocked(page):
+                posts.append({"url": url, "age_days": age, "status": "failed"})
+                blocked, reason = True, _page_blocked(page) or ACTION_BLOCKED
+                _debug_shot(page, f"cleanup_{platform}_blocked_delete")
+                print("[cleanup] ⚠ 刪除後偵測到限制，立即中止整輪", flush=True)
+                break
+            posts.append({"url": url, "age_days": age, "status": "deleted" if ok else "failed"})
+            if ok:
+                deleted += 1
+                print(f"[cleanup] 已刪除 {url}（{age} 天前，{deleted}/{max_delete}）", flush=True)
+                if deleted < max_delete:
+                    human_sleep(*DELETE_GAP)     # 連續刪最像腳本，一定要拉開
+        return {"posts": posts, "blocked": blocked, "block_reason": reason,
+                "skipped_pinned": pinned_skipped}
+    except Exception as e:
+        e.reason = classify_failure(page_text=_body_text(page), error_text=str(e))
+        # 已刪的不能白刪——附在例外上讓上層照樣記錄
+        e.partial = {"posts": posts, "blocked": blocked, "block_reason": reason,
+                     "skipped_pinned": pinned_skipped}
+        raise
+    finally:
+        for close in (ctx.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser(description="Threads / IG 備份模式自動刪文（SPEC-P32 §2）")
+    ap.add_argument("--platform", choices=("threads", "ig"), required=True)
+    ap.add_argument("--older-than", type=int, default=DEFAULT_OLDER_THAN,
+                    help=f"刪超過幾天的貼文（預設 {DEFAULT_OLDER_THAN}，最少 {MIN_OLDER_THAN}）")
+    ap.add_argument("--max", type=int, default=DEFAULT_MAX,
+                    help=f"這輪最多刪幾則（硬上限 {HARD_CAP}）")
+    ap.add_argument("--profile-dir", default=str(DEFAULT_PROFILE))
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="只列出會刪哪些，不刪任何東西")
+    ap.add_argument("--only-file", default="",
+                    help="白名單 JSON：只刪對得上的貼文（摸魚自己發的）")
+    ap.add_argument("--result-json")
+    args = ap.parse_args()
+
+    older_than = effective_older_than(args.older_than)
+    max_delete = effective_max(args.max)
+
+    _JSON_PATH = args.result_json
+    _RESULT = {"success": False, "platform": args.platform,
+               "older_than": older_than, "max": max_delete, "dry_run": bool(args.dry_run),
+               "deleted": 0, "skipped_undated": 0, "skipped_recent": 0, "skipped_pinned": 0,
+               "blocked": False, "block_reason": "", "error": "未完成", "posts": []}
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    # 夾住要講明白，不然客戶以為設定 3 天就真的 3 天
+    if args.older_than and args.older_than < MIN_OLDER_THAN:
+        print(f"[cleanup] --older-than {args.older_than} 太小，已提高到最少 {MIN_OLDER_THAN} 天",
+              flush=True)
+    if args.max and args.max > HARD_CAP:
+        print(f"[cleanup] --max {args.max} 超過硬上限，已夾到 {HARD_CAP} 則", flush=True)
+
+    def _fill(r: dict):
+        _RESULT["posts"] = r.get("posts", []) or []
+        _RESULT["blocked"] = bool(r.get("blocked"))
+        _RESULT["block_reason"] = r.get("block_reason", "") or ""
+        _RESULT["skipped_pinned"] = int(r.get("skipped_pinned") or 0)
+        _RESULT.update(summarize(_RESULT["posts"]))
+
+    try:
+        r = do_cleanup(Path(args.profile_dir).expanduser(), args.platform,
+                       older_than, max_delete, args.headless, dry_run=args.dry_run,
+                       only=load_only(args.only_file))
+        _fill(r)
+        if _RESULT["blocked"]:
+            _RESULT["error"] = f"動作被限制，已中止（已刪 {_RESULT['deleted']} 則）"
+            sys.exit(1)
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        if args.dry_run:
+            # 這份清單是老闆真的動手前唯一的依據：網址 + 幾天前，最舊的排前面
+            cands = sorted((p for p in _RESULT["posts"] if p.get("status") == "dry_run"),
+                           key=lambda p: -(p.get("age_days") or 0))
+            for p in cands:
+                print(f"[cleanup] dry-run 會刪：{p['url']}（{p['age_days']} 天前）", flush=True)
+            for p in (p for p in _RESULT["posts"] if p.get("status") == "undated"):
+                print(f"[cleanup] dry-run 日期讀不到，會留著：{p['url']}", flush=True)
+        print("[cleanup] ✅ " + describe(_RESULT), flush=True)
+    except SystemExit:
+        raise
+    except Exception as e:
+        _fill(getattr(e, "partial", {}) or {})
+        _RESULT["error"] = str(e)
+        reason = getattr(e, "reason", None) or classify_failure(error_text=str(e))
+        if reason in _STOP_REASONS:
+            _RESULT["blocked"] = True
+            _RESULT["block_reason"] = reason
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,188 @@
+"""執行紀錄摘要：把 result_json 組成一句人話（NOTE-runlog-summary，1.0.47）。
+
+老闆回饋（2026-08-27）：「紀錄只會寫成功，應該要寫什麼東西成功」。
+規則：動詞＋對象＋數量——「上架〈大安區電梯三房〉，提交 12 個社團」，
+不是光禿禿的「成功」。組不出來就回空字串，前端 fallback 舊顯示，
+所以這裡永遠不准丟例外。
+"""
+from __future__ import annotations
+
+
+def _first_line(text: str) -> str:
+    return (text or "").strip().splitlines()[0][:120] if (text or "").strip() else ""
+
+
+def _quote(name: str) -> str:
+    return f"〈{name}〉" if name else "物件"
+
+
+def compose_summary(task_type: str, status: str, data: dict | None,
+                    error: str = "", context: dict | None = None) -> str:
+    """result_json ＋ 呼叫端補充的 context（物件標題、社團名）→ 一句摘要。
+
+    context 是必要之惡：CLI 的 result JSON 沒有物件標題（它只拿到暫存檔路徑），
+    「〈哪個物件〉」只有 runner 知道。
+    """
+    try:
+        return _compose(task_type, status, data or {}, error or "", context or {})
+    except Exception:
+        return ""            # 摘要是錦上添花，絕不能讓收尾入庫炸掉
+
+
+def _compose(t: str, status: str, d: dict, error: str, ctx: dict) -> str:
+    ok = status == "success"
+    err = _first_line(error)
+    title = ctx.get("title", "")
+    gname = ctx.get("group_name", "")
+
+    if t in ("nurture", "nurture_threads", "nurture_ig"):
+        plat = {"nurture_threads": "Threads ", "nurture_ig": "IG "}.get(t, "")
+        mins = round((d.get("duration_sec") or 0) / 60) or d.get("duration_min") or 0
+        acts = d.get("actions_performed") or 0
+        if ok:
+            return f"{plat}養號 {mins} 分鐘，做了 {acts} 個互動"
+        return f"{plat}養號中斷：{err or '未知原因'}"
+
+    if t == "marketplace":
+        n = d.get("groups_submitted")
+        if ok:
+            share = f"，提交 {n} 個社團" if n else ""
+            return f"上架{_quote(title)}{share}"
+        return f"上架{_quote(title)}失敗：{err or '未知原因'}"
+
+    if t in ("group_post", "post"):    # post＝舊排程路徑，同一種發文
+        where = f"「{gname}」" if gname else "社團"
+        if status == "needs_manual":
+            return f"{_quote(title)}發到{where}——需要人工處理"
+        if ok:
+            return f"{_quote(title)}發到{where}"
+        return f"{_quote(title)}發到{where}失敗：{err or '未知原因'}"
+
+    if t == "sync_groups":
+        n = d.get("total_groups") or len(d.get("groups") or [])
+        if ok:
+            return f"抓到 {n} 個社團"
+        return f"抓取社團失敗：{err or '未知原因'}"
+
+    if t in ("import_url", "import_list"):
+        if t == "import_list":
+            n = len(d.get("items") or [])
+            return f"找到 {n} 筆同店物件" if ok else f"抓清單失敗：{err or '未知原因'}"
+        return "匯入 1 筆物件資料" if ok else f"匯入失敗：{err or '未知原因'}"
+
+    if t in ("threads_login", "threads_check", "ig_check"):
+        plat = "IG" if t == "ig_check" else "Threads"
+        user = d.get("username", "")
+        at = f"@{user}" if user else plat
+        if d.get("logged_in"):
+            return (f"連結 Threads {at}" if t == "threads_login"
+                    else f"{plat} 登入有效：{at}")
+        if t.endswith("_check") and ok:
+            return f"{plat} 登入態已失效"
+        return f"{plat} 連結失敗：{err or '未知原因'}"
+
+    if t in ("threads_open", "ig_open"):
+        plat = "Threads" if t == "threads_open" else "IG"
+        if ok:
+            how = "使用者關閉" if d.get("closed_by_user") else "時間到自動關閉"
+            return f"開啟 {plat} 登入視窗 {d.get('minutes', 0)} 分鐘（{how}）"
+        return f"開啟 {plat} 登入視窗失敗：{err or '未知原因'}"
+
+    if t in ("threads_post", "ig_post"):
+        plat = "Threads" if t == "threads_post" else "IG"
+        n = d.get("images") or 0
+        pics = f"（{n} 張圖）" if n else ""
+        if d.get("paused"):
+            return d.get("note") or f"{plat} 暫停中，這一輪略過"
+        if d.get("skipped"):
+            return f"{_quote(title)}沒有圖片，{plat} 略過"
+        if ok:
+            return f"{_quote(title)}發到 {plat}{pics}"
+        return f"{_quote(title)}發到 {plat} 失敗：{err or '未知原因'}"
+
+    if t in ("friend_fb", "friend_ig"):
+        plat = "FB" if t == "friend_fb" else "IG"
+        verb = "送出" if t == "friend_fb" else "追蹤"
+        unit = "個好友邀請" if t == "friend_fb" else "人"
+        sent = d.get("sent") or 0
+        if d.get("pending_over_limit"):
+            return f"{plat} 未回應邀請 {d['pending_over_limit']} 個，今天先不送"
+        extra = []
+        if d.get("skipped_existing"):
+            extra.append(f"略過 {d['skipped_existing']} 個已是好友" if t == "friend_fb"
+                         else f"略過 {d['skipped_existing']} 個已追蹤")
+        if d.get("skipped_known"):
+            extra.append(f"{d['skipped_known']} 個邀過")
+        tail = f"，{'、'.join(extra)}" if extra else ""
+        if d.get("blocked"):
+            return f"{plat} 加好友中斷：動作被限制（已{verb} {sent} {unit}）"
+        if ok:
+            return f"{plat} {verb} {sent} {unit}{tail}"
+        return f"{plat} 加好友失敗：{err or '未知原因'}"
+
+    if t == "leads_follow":
+        n = len(d.get("followed") or [])
+        if d.get("blocked"):
+            return f"Threads 追蹤中斷：動作被限制（已追蹤 {n} 人）"
+        return f"Threads 追蹤 {n} 人" if ok else f"Threads 追蹤失敗：{err or '未知原因'}"
+
+    if t == "leads_search":
+        n = len(d.get("items") or [])
+        return f"Threads 找到 {n} 個潛在客戶" if ok else f"Threads 探索失敗：{err or '未知原因'}"
+
+    if t in ("cleanup_fb", "cleanup_threads", "cleanup_ig"):
+        plat = {"cleanup_fb": "FB", "cleanup_threads": "Threads", "cleanup_ig": "IG"}[t]
+        n = d.get("deleted") or 0
+        undated = d.get("skipped_undated") or 0
+        not_ours = sum(1 for p in (d.get("posts") or []) if (p or {}).get("status") == "not_ours")
+        bits = []
+        if not_ours:
+            bits.append(f"{not_ours} 則不是摸魚發的")
+        if undated:
+            bits.append(f"{undated} 則日期讀不到")
+        tail = f"（另 {'、'.join(bits)}，都留著）" if bits else ""
+        if d.get("dry_run") or d.get("dry_run_count"):
+            # posts 裡也有「太新、留著」的那些——只數真的會刪的（實測寫成 31 則，其實 20）
+            can = sum(1 for p in (d.get("posts") or []) if (p or {}).get("status") == "dry_run")
+            return f"{plat} 備份刪文試跑：{can} 則可清，{d.get('skipped_recent') or 0} 則還太新"
+        if d.get("blocked"):
+            return f"{plat} 備份刪文中斷：動作被限制（已清 {n} 則）"
+        if ok:
+            return f"{plat} 備份刪文：清掉 {n} 則舊貼文{tail}"
+        return f"{plat} 備份刪文失敗：{err or '未知原因'}"
+
+    if t == "gjoin_search":
+        n = len(d.get("groups") or [])
+        return f"找到 {n} 個可加入的社團" if ok else f"找社團失敗：{err or '未知原因'}"
+
+    if t == "gjoin_join":
+        joined = d.get("joined") or 0
+        req = d.get("requested") or 0
+        q = d.get("question") or 0
+        parts = [f"加入 {joined} 個社團"] if joined else []
+        if req:
+            parts.append(f"送出 {req} 個申請")
+        if q:
+            parts.append(f"{q} 個要回答問題，請自己去答")
+        if d.get("blocked"):
+            return f"加入社團中斷：被 FB 限制（已{'、'.join(parts) or '加入 0 個'}）"
+        if d.get("existing") and not parts:
+            return f"{d['existing']} 個社團你本來就是成員，這輪沒有新加入"
+        if ok:
+            return "、".join(parts) or "這輪沒有可加入的社團"
+        return f"加入社團失敗：{err or '未知原因'}"
+
+    if t == "mobile_toggle":
+        what = "的 Marketplace 發文" if d.get("channel") == "marketplace" else "的社團發文"
+        return f"手機{'開啟' if d.get('enabled') else '關閉'}{_quote(title)}{what}"
+
+    if t in ("delete_mp", "delete_marketplace", "mp_cleanup"):
+        # mp_cleanup 是排程清理實際用的 task_type，之前沒接上，紀錄一片空白（2026-09-05 實測）
+        n = d.get("deleted") or d.get("deleted_count") or len(d.get("results") or [])
+        if d.get("dry_run"):
+            return f"清理過期上架試跑：{len(d.get('candidates') or [])} 則可清"
+        if ok:
+            return f"清理 {n} 則過期上架"
+        return f"清理過期上架失敗：{err or '未知原因'}"
+
+    return ""                # 其他類型：沒把握就不硬掰，前端走舊顯示

@@ -1,0 +1,183 @@
+"""Threads / IG 養號（老闆 2026-09-02：三個平台都要有養號）。
+
+跟 FB 養號同一個目的——別讓帳號看起來只發文不互動——但**行為刻意比 FB 保守**：
+IG／Threads 對自動化的容忍度低得多，自動按讚正是最容易被判機器人的動作。
+所以這裡以「逛」為主：滑動態、停留、偶爾點進一則貼文看看；按讚機率壓低、
+一次最多按幾下；完全不追蹤、不留言、不私訊。
+
+一偵測到平台的封鎖警告（meta_block.classify）就立刻停手並回報 reason，
+讓 P28 的平台暫停接手；已做的動作照樣回報。
+
+用法：
+    python -m src.run_meta_nurture --platform threads|ig --duration 3 --headless
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import random
+import sys
+import time
+from pathlib import Path
+
+from src.meta_block import ACTION_BLOCKED, classify as classify_failure
+from src.run_threads_post import DEFAULT_PROFILE, THREADS_URL, _launch, _debug_shot
+from src.utils import human_sleep
+
+_JSON_PATH = None
+_RESULT = None
+
+IG_URL = "https://www.instagram.com/"
+LIKE_PROBABILITY = 0.15        # 不高於 FB 的 0.15
+MAX_LIKES_PER_RUN = 3          # 一次養號最多按幾個讚，再多就像腳本
+
+# 行為池：以「逛」為主
+ACTIONS = [("scroll", 0.45), ("stay", 0.25), ("open_post", 0.20), ("like", 0.10)]
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[nurture] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+def pick_action(r: float | None = None) -> str:
+    """依機率選行為；r 可注入方便測試。"""
+    r = random.random() if r is None else r
+    acc = 0.0
+    for name, p in ACTIONS:
+        acc += p
+        if r <= acc:
+            return name
+    return "stay"
+
+
+def _page_blocked(page) -> bool:
+    with contextlib.suppress(Exception):
+        body = page.evaluate("()=>document.body.innerText")[:4000]
+        return classify_failure(page_text=body) == ACTION_BLOCKED
+    return False
+
+
+def _like_one(page) -> bool:
+    with contextlib.suppress(Exception):
+        btns = page.locator('svg[aria-label="讚"], svg[aria-label="Like"]')
+        n = btns.count()
+        if n == 0:
+            return False
+        el = btns.nth(random.randrange(min(n, 6)))
+        if el.is_visible():
+            el.click()
+            return True
+    return False
+
+
+def _open_random_post(page, platform: str) -> bool:
+    """點進一則貼文看幾秒再回來——只發文不看別人的，最像機器人。"""
+    sel = "a[href*='/post/']" if platform == "threads" else "a[href*='/p/']"
+    with contextlib.suppress(Exception):
+        links = page.locator(sel)
+        n = links.count()
+        if n == 0:
+            return False
+        links.nth(random.randrange(min(n, 8))).click()
+        human_sleep(3.0, 7.0)
+        page.go_back()
+        human_sleep(1.5, 3.0)
+        return True
+    return False
+
+
+def do_nurture(profile_dir: Path, platform: str, duration_min: int, headless: bool) -> dict:
+    from playwright.sync_api import sync_playwright
+    url = THREADS_URL if platform == "threads" else IG_URL
+    pw = sync_playwright().start()
+    ctx, page = _launch(pw, profile_dir, headless=headless)
+    actions = likes = 0
+    aborted = ""
+    t0 = time.time()
+    try:
+        page.goto(url, wait_until="commit", timeout=60000)
+        human_sleep(2.5, 4.5)
+        if page.locator('a[href*="/login"], input[name="username"]').first.is_visible():
+            raise RuntimeError(f"尚未登入 {platform}——先到帳號設定連結一次")
+        deadline = t0 + duration_min * 60
+        while time.time() < deadline:
+            if _page_blocked(page):
+                aborted = ACTION_BLOCKED
+                _debug_shot(page, f"nurture_{platform}_blocked")
+                print("[nurture] ⚠ 偵測到動作被限制，立即停手", flush=True)
+                break
+            act = pick_action()
+            if act == "scroll":
+                page.mouse.wheel(0, random.randint(300, 900))
+                human_sleep(1.5, 4.0)
+                actions += 1
+            elif act == "stay":
+                human_sleep(4.0, 10.0)
+            elif act == "open_post":
+                if _open_random_post(page, platform):
+                    actions += 1
+            elif act == "like":
+                if likes < MAX_LIKES_PER_RUN and random.random() < LIKE_PROBABILITY and _like_one(page):
+                    likes += 1
+                    actions += 1
+                human_sleep(1.0, 2.5)
+        return {"actions_performed": actions, "likes": likes,
+                "duration_sec": int(time.time() - t0), "aborted_reason": aborted}
+    except Exception as e:
+        body = ""
+        with contextlib.suppress(Exception):
+            body = page.evaluate("()=>document.body.innerText")[:4000]
+        e.reason = classify_failure(page_text=body, error_text=str(e))
+        e.partial = {"actions_performed": actions, "likes": likes,
+                     "duration_sec": int(time.time() - t0)}
+        raise
+    finally:
+        for close in (ctx.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser(description="Threads / IG 養號")
+    ap.add_argument("--platform", choices=("threads", "ig"), required=True)
+    ap.add_argument("--duration", type=int, default=3, help="分鐘（1～30）")
+    ap.add_argument("--profile-dir", default=str(DEFAULT_PROFILE))
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--result-json")
+    args = ap.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {"schema": 1, "success": False, "error": "未完成",
+               "data": {"platform": args.platform, "duration_min": args.duration,
+                        "actions_performed": 0, "likes": 0, "duration_sec": 0, "reason": ""}}
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    try:
+        r = do_nurture(Path(args.profile_dir).expanduser(), args.platform,
+                       max(1, min(30, args.duration)), args.headless)
+        _RESULT["data"].update(r)
+        if r.get("aborted_reason") == ACTION_BLOCKED:
+            _RESULT["error"] = "動作被限制，已停手"
+            _RESULT["data"]["reason"] = ACTION_BLOCKED
+            sys.exit(1)
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        print(f"[nurture] ✅ {args.platform} 養號 {r['duration_sec'] // 60} 分鐘，"
+              f"{r['actions_performed']} 個互動（讚 {r['likes']}）", flush=True)
+    except SystemExit:
+        raise
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        _RESULT["data"].update(getattr(e, "partial", {}) or {})
+        _RESULT["data"]["reason"] = getattr(e, "reason", None) or classify_failure(error_text=str(e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,417 @@
+"""Threads / IG 備份刪文的離線測試（SPEC-P32 §2）。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_meta_cleanup.py -v
+
+刪文不可逆，所以這裡守的全是「不該刪的絕對不刪」：
+天數下限夾得住、一輪上限夾得住、日期讀不到一律跳過、Reels／限時動態／
+別人的貼文根本不會進清單、被擋要停但已刪的照樣回報、dry-run 一則都不動。
+全部不開真瀏覽器。
+"""
+import datetime
+import json
+import subprocess
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("playwright")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import meta_block as mb  # noqa: E402
+from src import run_meta_cleanup as cl  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+NOW = datetime.datetime(2026, 9, 2, 12, 0, 0)      # 注入用的假現在，免得測試變成時間炸彈
+
+
+class Test天數與數量上限:
+    def test_預設三十天(self):
+        assert cl.effective_older_than(None) == cl.DEFAULT_OLDER_THAN == 30
+        assert cl.effective_older_than(0) == 30
+
+    def test_太小的天數被提高到七天(self):
+        """老闆設 1 天也不能真的照做——那等於發完就刪。"""
+        assert cl.effective_older_than(3) == cl.MIN_OLDER_THAN == 7
+        assert cl.effective_older_than(-5) == 30      # 負數當沒設定，回預設
+
+    def test_合理天數照收(self):
+        assert cl.effective_older_than(45) == 45
+
+    def test_每輪上限預設二十硬上限五十(self):
+        assert cl.effective_max(None) == cl.DEFAULT_MAX == 20
+        assert cl.effective_max(999) == cl.HARD_CAP == 50
+        assert cl.effective_max(5) == 5
+
+    def test_每則之間十到三十秒(self):
+        """連續刪最像腳本，間隔不能被改小。"""
+        assert cl.DELETE_GAP == (10, 30)
+
+
+class Test年齡解析:
+    def test_ISO時間戳最準(self):
+        assert cl.parse_age_days("2026-07-12T08:30:00.000Z", now=NOW) == 52
+        assert cl.parse_age_days("2026-08-30", now=NOW) == 3
+
+    def test_中文絕對日期(self):
+        assert cl.parse_age_days("2026年7月12日", now=NOW) == 52
+        assert cl.parse_age_days("8月30日 上午10:15", now=NOW) == 3
+
+    def test_沒寫年份又在未來就當去年(self):
+        """個人頁上「12月3日」是去年的貼文，不能算成負的。"""
+        assert cl.parse_age_days("12月3日", now=NOW) == 273
+
+    @pytest.mark.parametrize("text,days", [
+        ("3天前", 3), ("2週前", 14), ("2 星期前", 14), ("1個月前", 30),
+        ("3天", 3), ("5小時", 0), ("45分鐘", 0),
+        ("3d", 3), ("2w", 14), ("5h", 0), ("1y", 365),
+        ("3 days ago", 3), ("2 weeks ago", 14), ("剛剛", 0),
+    ])
+    def test_相對時間中英短碼都吃(self, text, days):
+        assert cl.parse_age_days(text) == days
+
+    @pytest.mark.parametrize("text", ["", None, "貼文", "追蹤中", "查看更多"])
+    def test_判不出來回None而不是零(self, text):
+        """回 0 會被當成「今天發的」而留著看似無害，但一旦反過來就會誤刪——一律 None。"""
+        assert cl.parse_age_days(text) is None
+
+
+class Test該不該刪:
+    def test_剛好等於門檻就刪(self):
+        assert cl.should_delete(30, 30) is True
+        assert cl.should_delete(41, 30) is True
+
+    def test_還沒到門檻不刪(self):
+        assert cl.should_delete(29, 30) is False
+        assert cl.should_delete(0, 7) is False
+
+    def test_日期讀不到絕不刪(self):
+        assert cl.should_delete(None, 30) is False
+        assert cl.should_delete(-1, 30) is False
+        assert cl.should_delete("不知道", 30) is False
+
+
+class Test只認自己的一般貼文:
+    def test_IG不碰Reels與限時動態(self):
+        """老闆硬規則：IG 只刪一般貼文。"""
+        hrefs = ["/p/ABC123/", "/reel/XYZ99/", "/stories/me/123/", "/p/ABC123/?img_index=2"]
+        assert cl.own_post_hrefs(hrefs, "ig", "me") == ["/p/ABC123/"]
+
+    def test_IG別人的貼文不算(self):
+        hrefs = ["/me/p/AAA/", "/someone_else/p/BBB/", "/p/CCC/"]
+        assert cl.own_post_hrefs(hrefs, "ig", "me") == ["/p/AAA/", "/p/CCC/"]
+
+    def test_Threads轉發別人的不算(self):
+        """個人頁上會混進轉發，那不是我們的貼文，刪不得也不該試。"""
+        hrefs = ["/@me/post/AAA", "/@other/post/BBB",
+                 "https://www.threads.com/@me/post/CCC", "/@me/post/AAA/"]
+        assert cl.own_post_hrefs(hrefs, "threads", "me") == ["/@me/post/AAA", "/@me/post/CCC"]
+
+    def test_雜訊連結全部濾掉(self):
+        assert cl.own_post_hrefs(["", None, "/explore/", "/accounts/login/"], "ig", "me") == []
+
+    def test_組出絕對網址(self):
+        assert cl.post_url("threads", "/@me/post/AAA") == "https://www.threads.com/@me/post/AAA"
+        assert cl.post_url("ig", "/p/AAA/") == "https://www.instagram.com/p/AAA/"
+
+
+class Test被擋判斷:
+    @pytest.mark.parametrize("text,reason", [
+        ("很抱歉，你的動作已遭封鎖", mb.ACTION_BLOCKED),
+        ("Action Blocked", mb.ACTION_BLOCKED),
+        ("動作已封鎖\n請稍後再試", mb.ACTION_BLOCKED),          # IG 專用句，meta_block 沒收
+        ("你的動作太快，請稍後再試", mb.RATE_LIMITED),
+        ("We limit how often you can do certain things", mb.RATE_LIMITED),
+    ])
+    def test_封鎖與節流都要停(self, text, reason):
+        assert cl.block_reason(page_text=text) == reason
+
+    def test_正常頁面不會被判成封鎖(self):
+        assert cl.block_reason(page_text="貼文 12\n粉絲 340\n台中買房分享") == ""
+        assert cl.block_reason(error_text="Timeout 30000ms exceeded") == ""
+
+
+class Test摘要與結果封裝:
+    def test_計數欄位(self):
+        posts = [dict(status="deleted"), dict(status="deleted"), dict(status="undated"),
+                 dict(status="recent"), dict(status="recent"), dict(status="failed"),
+                 dict(status="dry_run")]
+        assert cl.summarize(posts) == {"deleted": 2, "skipped_undated": 1, "skipped_recent": 2}
+
+    def test_結果鏡到data給後端橋接讀(self):
+        """fbauto_bridge 只讀 raw["data"]，頂層與 data 必須一模一樣。"""
+        env = cl.envelope({"success": True, "platform": "ig", "deleted": 6})
+        assert env["deleted"] == 6 and env["data"]["deleted"] == 6
+        assert "data" not in env["data"]
+
+    def test_紀錄文字講清楚做了什麼(self):
+        line = cl.describe({"platform": "threads", "older_than": 30,
+                            "deleted": 6, "skipped_undated": 2})
+        assert "6" in line and "30" in line and "2" in line and "留著" in line
+
+
+class TestJS字串沒有換行地雷:
+    """踩過兩次：Python 三引號裡的 \\n 會變成真的換行，塞進 JS 字串常值就是 SyntaxError，
+    而 evaluate 包在 suppress 裡會安靜回空——功能整個失效卻沒有任何錯誤訊息。"""
+
+    @pytest.mark.parametrize("js", [cl._HREFS_JS, cl._TIMES_JS, cl._PINNED_JS])
+    def test_每一行的引號都成對(self, js):
+        for line in js.splitlines():
+            assert line.count("'") % 2 == 0, line
+            assert line.count('"') % 2 == 0, line
+
+    def test_換行用fromCharCode而不是跳脫字元(self):
+        assert "String.fromCharCode(10)" in cl._TIMES_JS
+
+
+# ---------- 假頁面：走瀏覽器流程但不開瀏覽器 ----------
+
+class _Loc:
+    def __init__(self, n=0, on_click=None):
+        self.n, self.on_click, self.clicks = n, on_click, 0
+
+    @property
+    def first(self):
+        return self
+
+    def nth(self, i):
+        return self
+
+    def locator(self, sel):
+        # 真實碼會從 svg 往上找可點的按鈕（xpath ancestor）；假物件回一個沒命中的，
+        # 讓它退回點 svg 本身——測的是流程，不是 xpath。
+        return _Loc(0)
+
+    def count(self):
+        return self.n
+
+    def is_visible(self):
+        return self.n > 0
+
+    def click(self):
+        self.clicks += 1
+        if self.on_click:
+            self.on_click()
+
+
+class FakePage:
+    """只模擬 _post_age_days / _delete_one 會碰到的介面。"""
+
+    def __init__(self, times="", body="", has_more=True, has_menu_item=True, has_confirm=True):
+        self.times, self.body = times, body
+        self.has_more, self.has_menu_item, self.has_confirm = has_more, has_menu_item, has_confirm
+        self.url = "https://www.instagram.com/p/AAA/"
+        self.steps, self.gotos = [], []
+        self.keyboard = types.SimpleNamespace(press=lambda k: self.steps.append("escape"))
+        self.mouse = types.SimpleNamespace(wheel=lambda x, y: None)
+
+    def goto(self, url, **kw):
+        self.gotos.append(url)
+
+    def evaluate(self, js, *a):
+        if "body.innerText" in js:
+            return self.body
+        if "querySelectorAll('time')" in js:
+            return self.times
+        return []
+
+    def locator(self, sel):
+        if "aria-label" in sel and self.has_more:
+            return _Loc(1, lambda: self.steps.append("more"))
+        if 'role="dialog"' in sel and self.has_confirm:
+            def _confirm():
+                self.steps.append("confirm")
+                self.body = "貼文已刪除"
+            return _Loc(1, _confirm)
+        return _Loc(0)
+
+    def get_by_role(self, role, name=None, exact=False):
+        if self.has_menu_item and name in ("刪除貼文", "Delete post", "刪除", "Delete"):
+            return _Loc(1, lambda: self.steps.append("menu"))
+        return _Loc(0)
+
+    def get_by_text(self, t, exact=False):
+        return _Loc(0)
+
+
+@pytest.fixture
+def quiet(monkeypatch):
+    monkeypatch.setattr(cl, "human_sleep", lambda a, b: None)
+
+
+class Test貼文頁年齡:
+    def test_取第一個讀得懂的時間(self, quiet):
+        pg = FakePage(times="2026-07-12T08:30:00.000Z 52週\n1天前")
+        assert cl._post_age_days(pg) == cl.parse_age_days("2026-07-12T08:30:00.000Z")
+
+    def test_都讀不懂就是None(self, quiet):
+        assert cl._post_age_days(FakePage(times="剛才看過\n已編輯")) is None
+
+
+class Test單則刪除:
+    def test_完整走完才算刪掉(self, quiet):
+        pg = FakePage()
+        assert cl._delete_one(pg, "ig", pg.url) is True
+        assert pg.steps == ["more", "menu", "confirm"]
+
+    def test_找不到更多按鈕就跳過(self, quiet):
+        pg = FakePage(has_more=False)
+        assert cl._delete_one(pg, "ig", pg.url) is False
+        assert pg.steps == []
+
+    def test_選單裡沒有刪除就跳過並關掉選單(self, quiet):
+        pg = FakePage(has_menu_item=False)
+        assert cl._delete_one(pg, "ig", pg.url) is False
+        assert "escape" in pg.steps
+
+    def test_按了確認但沒有任何刪除跡象就不算成功(self, quiet, monkeypatch):
+        """數字灌水比少刪一則糟糕得多。"""
+        pg = FakePage()
+        monkeypatch.setattr(pg, "locator", lambda sel: (
+            _Loc(1, lambda: pg.steps.append("more")) if "aria-label" in sel
+            else _Loc(1, lambda: pg.steps.append("confirm")) if 'role="dialog"' in sel
+            else _Loc(0)))
+        assert cl._delete_one(pg, "ig", pg.url) is False
+
+
+# ---------- 主程式與結果 JSON ----------
+
+class Test主程式結果JSON:
+    def _run(self, out, argv, fake_body):
+        code = (
+            "import sys; sys.argv=%r\n"
+            "import src.run_meta_cleanup as m\n"
+            "%s\n"
+            "try: m.main()\n"
+            "except SystemExit as e: print('EXIT', e.code)\n"
+        ) % (argv, fake_body)
+        r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        return r.stdout, json.loads(out.read_text(encoding="utf-8"))
+
+    def test_dry_run只列不刪(self, tmp_path):
+        out = tmp_path / "r.json"
+        fake = (
+            "def fake(p,platform,older,mx,h,dry_run=False,only=None):\n"
+            "    assert dry_run is True\n"
+            "    return {'posts':[{'url':'https://www.threads.com/@me/post/A','age_days':41,'status':'dry_run'},"
+            "{'url':'https://www.threads.com/@me/post/B','age_days':None,'status':'undated'},"
+            "{'url':'https://www.threads.com/@me/post/C','age_days':3,'status':'recent'}],"
+            "'blocked':False,'block_reason':'','skipped_pinned':1}\n"
+            "m.do_cleanup=fake"
+        )
+        argv = ["x", "--platform", "threads", "--older-than", "30", "--dry-run",
+                "--result-json", str(out)]
+        stdout, d = self._run(out, argv, fake)
+        assert "EXIT" not in stdout
+        assert d["success"] is True and d["deleted"] == 0
+        assert d["skipped_undated"] == 1 and d["skipped_recent"] == 1 and d["skipped_pinned"] == 1
+        assert d["posts"][0]["age_days"] == 41 and d["posts"][0]["status"] == "dry_run"
+        assert d["data"]["deleted"] == 0 and d["data"]["platform"] == "threads"
+        assert "41" in stdout and "post/A" in stdout          # dry-run 清單要看得出網址與天數
+
+    def test_被擋中止但保留已刪的(self, tmp_path):
+        out = tmp_path / "r.json"
+        fake = (
+            "def fake(p,platform,older,mx,h,dry_run=False,only=None):\n"
+            "    assert (older,mx)==(7,50),(older,mx)\n"       # 3 天被提高、99 則被夾住
+            "    return {'posts':[{'url':'u1','age_days':41,'status':'deleted'},"
+            "{'url':'u2','age_days':60,'status':'deleted'},"
+            "{'url':'u3','age_days':None,'status':'undated'},"
+            "{'url':'u4','age_days':55,'status':'failed'}],"
+            "'blocked':True,'block_reason':'action_blocked','skipped_pinned':0}\n"
+            "m.do_cleanup=fake"
+        )
+        argv = ["x", "--platform", "ig", "--older-than", "3", "--max", "99",
+                "--result-json", str(out)]
+        stdout, d = self._run(out, argv, fake)
+        assert "EXIT 1" in stdout
+        assert "最少 7" in stdout and "50" in stdout           # 夾住要講明白
+        assert d["success"] is False and d["platform"] == "ig"
+        assert d["blocked"] is True and d["block_reason"] == "action_blocked"
+        assert d["deleted"] == 2 and d["skipped_undated"] == 1
+        assert len(d["posts"]) == 4                            # 已刪的不能白刪
+        assert d["data"]["blocked"] is True
+
+    def test_例外也留下結果檔(self, tmp_path):
+        out = tmp_path / "r.json"
+        fake = ("def fake(p,platform,older,mx,h,dry_run=False,only=None):\n"
+                "    raise RuntimeError('尚未登入 ig——先到帳號設定連結一次')\n"
+                "m.do_cleanup=fake")
+        argv = ["x", "--platform", "ig", "--result-json", str(out)]
+        stdout, d = self._run(out, argv, fake)
+        assert "EXIT 1" in stdout
+        assert d["success"] is False and "尚未登入" in d["error"]
+        assert d["older_than"] == 30 and d["max"] == 20 and d["data"]["posts"] == []
+
+
+class Test邊捲邊收:
+    """2026-09-03 mini 實測：IG 九宮格是虛擬清單，捲完再抓會把 6 則抓成 1 則。"""
+
+    def test_累積多輪的連結而不是只看最後一屏(self, monkeypatch):
+        import src.run_meta_cleanup as m
+        screens = [["/p/a/"], ["/p/b/"], ["/p/c/"], []]      # 每捲一次就換一屏
+        calls = {"i": 0}
+
+        def fake_collect(page, platform, me, want):
+            i = min(calls["i"], len(screens) - 1)
+            calls["i"] += 1
+            return list(screens[i]), set()
+
+        monkeypatch.setattr(m, "_collect_own_posts", fake_collect)
+        monkeypatch.setattr(m, "human_sleep", lambda *a, **k: None)
+
+        class P:
+            class mouse:
+                @staticmethod
+                def wheel(*a): pass
+
+        links, _ = m._collect_while_scrolling(P(), "ig", "me", want=10, rounds=6)
+        assert links == ["/p/a/", "/p/b/", "/p/c/"]
+
+    def test_連續幾輪沒有新東西就停(self, monkeypatch):
+        import src.run_meta_cleanup as m
+        monkeypatch.setattr(m, "_collect_own_posts", lambda *a, **k: (["/p/x/"], set()))
+        monkeypatch.setattr(m, "human_sleep", lambda *a, **k: None)
+
+        class P:
+            class mouse:
+                @staticmethod
+                def wheel(*a): pass
+
+        links, _ = m._collect_while_scrolling(P(), "ig", "me", want=99, rounds=50)
+        assert links == ["/p/x/"]        # 沒有新東西就早早收手，不會空捲 50 次
+
+
+class Test只刪摸魚發的:
+    """老闆 2026-09-05：備份刪文只能刪摸魚發的，不能碰客戶手動發的舊文。"""
+
+    def test_網址對得上就是我們的(self):
+        import src.run_meta_cleanup as cl
+        only = {"urls": ["https://www.threads.com/@me/post/AAA"], "phrases": []}
+        assert cl.is_ours("https://www.threads.com/@me/post/AAA?x=1", "", only)
+        assert not cl.is_ours("https://www.threads.com/@me/post/BBB", "", only)
+
+    def test_內文含法定資訊就是我們的(self):
+        import src.run_meta_cleanup as cl
+        only = {"urls": [], "phrases": ["方舟不動產 經紀業字號 (110)", "台中東區三房"]}
+        assert cl.is_ours("u", "好房出售\n台中東區三房\n歡迎來電", only)
+        assert not cl.is_ours("u", "今天天氣真好", only)
+
+    def test_沒有白名單維持舊行為(self):
+        import src.run_meta_cleanup as cl
+        assert cl.is_ours("u", "隨便什麼", None)
+
+    def test_白名單是空的就一則都不刪(self):
+        """紀錄空的≠全部都刪——這是最危險的誤解，用測試釘住。"""
+        import src.run_meta_cleanup as cl
+        assert not cl.is_ours("u", "隨便什麼", {"urls": [], "phrases": []})
+
+    def test_檔案壞掉或不存在也不會變成全刪(self, tmp_path):
+        import src.run_meta_cleanup as cl
+        bad = tmp_path / "bad.json"
+        bad.write_text("{壞掉的 json")
+        assert cl.load_only(str(bad)) == {"urls": [], "phrases": []}
+        assert cl.load_only(str(tmp_path / "沒這個檔.json")) == {"urls": [], "phrases": []}
+        assert cl.load_only("") is None          # 沒給檔＝沒有白名單

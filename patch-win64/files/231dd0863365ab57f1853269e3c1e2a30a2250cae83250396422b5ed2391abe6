@@ -1,0 +1,223 @@
+"""Threads 潛在客戶 API（SPEC-P29）。
+
+設計上刻意分成「探索」與「追蹤」兩個動作：探索只是列名單，追蹤才會真的
+對別人的帳號動作。客戶要先看得到名單，才決定追誰。
+
+預設關閉：這是最容易被平台判定為機器人的動作類型，不能安裝完就自己開始跑。
+"""
+import datetime
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, field_validator
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..database import get_session, ThreadsLead, ThreadsLeadConfig
+
+router = APIRouter(prefix="/api/leads", tags=["leads"], redirect_slashes=False)
+
+HARD_DAILY_CAP = 20        # 與 FB_Auto/src/run_threads_follow.HARD_CAP 一致
+
+
+class ConfigIn(BaseModel):
+    enabled: bool = False
+    keywords: str = ""
+    region: str = ""
+    daily_limit: int = 10
+    window_start: str = "10:00"
+    window_end: str = "21:00"
+
+    @field_validator("daily_limit")
+    @classmethod
+    def _cap(cls, v: int) -> int:
+        """夾在 1–20：這種動作不該讓人隨手調到 100。"""
+        return max(1, min(HARD_DAILY_CAP, v or 10))
+
+
+async def _get_config(session: AsyncSession) -> ThreadsLeadConfig:
+    row = (await session.execute(select(ThreadsLeadConfig))).scalars().first()
+    if row is None:
+        row = ThreadsLeadConfig()
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+    return row
+
+
+def _cfg_out(c: ThreadsLeadConfig) -> dict:
+    return {
+        "enabled": bool(c.enabled), "keywords": c.keywords or "", "region": c.region or "",
+        "daily_limit": c.daily_limit or 10, "hard_cap": HARD_DAILY_CAP,
+        "window_start": c.window_start, "window_end": c.window_end,
+        "last_run_date": c.last_run_date or "",
+    }
+
+
+def _lead_out(r: ThreadsLead) -> dict:
+    return {
+        "id": r.id, "username": r.username, "post_url": r.post_url,
+        "snippet": r.snippet, "posted_at": r.posted_at, "keyword": r.keyword,
+        "status": r.status,
+        "followed_at": (r.followed_at.replace(tzinfo=datetime.timezone.utc).isoformat()
+                        if r.followed_at else None),
+    }
+
+
+@router.get("/config")
+async def get_config(session: AsyncSession = Depends(get_session)):
+    return _cfg_out(await _get_config(session))
+
+
+@router.put("/config")
+async def put_config(data: ConfigIn, session: AsyncSession = Depends(get_session)):
+    c = await _get_config(session)
+    for k, v in data.model_dump().items():
+        setattr(c, k, v)
+    await session.commit()
+    await session.refresh(c)
+    print(f"[leads] 設定更新：{'啟用' if c.enabled else '停用'}，每日上限 {c.daily_limit}",
+          flush=True)
+    return _cfg_out(c)
+
+
+@router.get("")
+@router.get("/")
+async def list_leads(status: str | None = None, limit: int = 200,
+                     session: AsyncSession = Depends(get_session)):
+    q = select(ThreadsLead).order_by(ThreadsLead.created_at.desc())
+    if status:
+        q = q.where(ThreadsLead.status == status)
+    rows = (await session.execute(q.limit(max(1, min(1000, limit))))).scalars().all()
+    counts = dict((await session.execute(
+        select(ThreadsLead.status, func.count(ThreadsLead.id)).group_by(ThreadsLead.status)
+    )).all())
+    return {"items": [_lead_out(r) for r in rows], "counts": counts}
+
+
+@router.put("/{lead_id}/status")
+async def set_status(lead_id: int, status: str,
+                     session: AsyncSession = Depends(get_session)):
+    """客戶手動改狀態——主要用途是把同業、機器人帳號標成 excluded。"""
+    if status not in ("new", "followed", "skipped", "excluded"):
+        raise HTTPException(status_code=422, detail="狀態只收 new/followed/skipped/excluded")
+    row = (await session.execute(
+        select(ThreadsLead).where(ThreadsLead.id == lead_id))).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="找不到這筆候選")
+    row.status = status
+    await session.commit()
+    await session.refresh(row)
+    return _lead_out(row)
+
+
+@router.post("/search")
+async def run_search(session: AsyncSession = Depends(get_session)):
+    """立即探索一次（不追蹤）。回 job_id，前端輪詢 /api/leads/jobs/{id}。"""
+    c = await _get_config(session)
+    if not (c.keywords or "").strip():
+        raise HTTPException(status_code=422, detail="請先設定關鍵字")
+    from ..fbauto_bridge import start_long_op, browser_busy_reason
+    busy = browser_busy_reason()
+    if busy:
+        raise HTTPException(status_code=409,
+            detail=f"目前有「{busy}」正在使用瀏覽器，先等它跑完再探索。")
+    args = ["--keywords", c.keywords, "--max-results", "50", "--headless"]
+    if (c.region or "").strip():
+        args += ["--region", c.region.strip()]
+    return {"job_id": start_long_op("leads_search", "src.run_threads_search", args),
+            "state": "pending"}
+
+
+@router.post("/follow")
+async def run_follow(session: AsyncSession = Depends(get_session)):
+    """對待追蹤名單執行追蹤（額度內）。回 job_id。"""
+    from .. import platform_block
+    from ..database import ThreadsAccount
+    acc = (await session.execute(select(ThreadsAccount))).scalars().first()
+    if platform_block.is_blocked(acc, "threads"):
+        raise HTTPException(status_code=409,
+            detail=platform_block.block_note(acc, "threads") or "Threads 暫停中")
+
+    c = await _get_config(session)
+    pending = (await session.execute(
+        select(ThreadsLead).where(ThreadsLead.status == "new")
+        .order_by(ThreadsLead.created_at.desc()).limit(c.daily_limit or 10)
+    )).scalars().all()
+    if not pending:
+        raise HTTPException(status_code=422, detail="沒有待追蹤的候選——先執行一次探索")
+
+    from ..fbauto_bridge import start_long_op, browser_busy_reason
+    busy = browser_busy_reason()
+    if busy:
+        raise HTTPException(status_code=409,
+            detail=f"目前有「{busy}」正在使用瀏覽器，先等它跑完再追蹤。")
+    users = ",".join(r.username for r in pending)
+    return {"job_id": start_long_op("leads_follow", "src.run_threads_follow",
+                                    ["--users", users,
+                                     "--max-follow", str(c.daily_limit or 10),
+                                     "--headless"]),
+            "state": "pending"}
+
+
+@router.get("/jobs/{job_id}")
+async def leads_job(job_id: str, session: AsyncSession = Depends(get_session)):
+    """探索／追蹤共用的輪詢端點：成功時就地落庫。"""
+    from ..fbauto_bridge import get_long_op, poll_long_op
+    job = get_long_op(job_id)
+    op = job.op if job else None
+    poll = poll_long_op(job_id)
+    if poll["state"] in ("none", "pending"):
+        return {"state": poll["state"], "elapsed_sec": poll.get("elapsed_sec", 0)}
+
+    result = poll["result"]
+    d = result.data or {}
+    added = followed = 0
+
+    if op == "leads_search" and result.success:
+        for it in d.get("items", []):
+            u = (it.get("username") or "").strip()
+            if not u:
+                continue
+            exists = (await session.execute(
+                select(ThreadsLead).where(ThreadsLead.username == u))).scalar_one_or_none()
+            if exists:
+                continue          # 已經在名單上（含已排除的）就不重複加
+            session.add(ThreadsLead(
+                username=u, post_url=it.get("post_url", ""),
+                snippet=it.get("snippet", ""), posted_at=it.get("posted_at", "")))
+            added += 1
+        await session.commit()
+
+    elif op == "leads_follow":
+        # 即使整批中途被中止，已完成的部分也要記下來——不然下次會重追
+        for u in d.get("followed", []):
+            row = (await session.execute(
+                select(ThreadsLead).where(ThreadsLead.username == u))).scalar_one_or_none()
+            if row:
+                row.status = "followed"
+                row.followed_at = datetime.datetime.utcnow()
+                followed += 1
+        for sk in d.get("skipped", []):
+            u = sk.get("username") if isinstance(sk, dict) else sk
+            row = (await session.execute(
+                select(ThreadsLead).where(ThreadsLead.username == u))).scalar_one_or_none()
+            if row and row.status == "new":
+                row.status = "skipped"
+        c = await _get_config(session)
+        c.last_run_date = datetime.date.today().isoformat()
+        await session.commit()
+
+        # 被限制 → 交給 P28 的平台暫停機制處理
+        if d.get("blocked") or d.get("reason") == "action_blocked":
+            from .. import platform_block
+            from ..database import ThreadsAccount
+            acc = (await session.execute(select(ThreadsAccount))).scalars().first()
+            if acc is not None:
+                hours = platform_block.mark_blocked(acc, "threads", "追蹤時動作被限制")
+                await session.commit()
+                print(f"[leads] ⚠ 追蹤被限制，Threads 暫停 {hours} 小時", flush=True)
+
+    return {"state": poll["state"], "op": op, "error": result.error,
+            "added": added, "followed": followed,
+            "blocked": bool(d.get("blocked")),
+            "elapsed_sec": poll.get("elapsed_sec", 0)}

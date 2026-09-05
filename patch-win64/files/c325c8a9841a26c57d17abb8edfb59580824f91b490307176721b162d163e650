@@ -1,0 +1,94 @@
+"""同意書 API：查目前是否已同意最新版、記錄同意。
+
+設計重點（法律效力來自這幾件事，不是來自程式碼多漂亮）：
+  - 同意必須是「主動」的：前端不預先勾選，且要捲到文件底部才能勾。
+  - 同意必須「留紀錄」：版本、時間、當時的軟體版本；姓名若申請表單有填就一併記下。
+  - 勾選即確認，不另外要求打名字（老闆定調 2026-08-31）——click-wrap 的效力來自
+    「主動勾選 + 留下紀錄」，多打一次名字增加的是摩擦不是證據力。
+  - 文件改版 → 版本對不上 → 再問一次，不是預設沿用舊同意。
+  - 紀錄只增不刪：撤回同意也是新增一筆狀態，不是把舊的抹掉。
+"""
+import datetime
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, field_validator
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..config import settings
+from ..database import get_session, UserConsent
+from ..legal import CONSENT_VERSION
+
+router = APIRouter(prefix="/api/consent", tags=["consent"], redirect_slashes=False)
+
+
+class ConsentIn(BaseModel):
+    doc_version: str
+    signer_name: str = ""
+
+    @field_validator("signer_name")
+    @classmethod
+    def _trim(cls, v: str) -> str:
+        return (v or "").strip()[:255]
+
+
+def _payload(row: UserConsent | None) -> dict:
+    return {
+        "required_version": CONSENT_VERSION,
+        "agreed": row is not None,
+        "agreed_version": row.doc_version if row else "",
+        "signer_name": row.signer_name if row else "",
+        "agreed_at": (row.agreed_at.replace(tzinfo=datetime.timezone.utc).isoformat()
+                      if row and row.agreed_at else None),
+    }
+
+
+async def _current(session: AsyncSession) -> UserConsent | None:
+    """目前這一版的同意紀錄（沒有＝還沒同意，或同意的是舊版）。"""
+    return (await session.execute(
+        select(UserConsent)
+        .where(UserConsent.doc_version == CONSENT_VERSION)
+        .order_by(UserConsent.agreed_at.desc())
+    )).scalars().first()
+
+
+@router.get("/status")
+async def consent_status(session: AsyncSession = Depends(get_session)):
+    return _payload(await _current(session))
+
+
+@router.post("/agree")
+async def consent_agree(data: ConsentIn, session: AsyncSession = Depends(get_session)):
+    """記錄同意。版本必須與後端要求的一致——避免舊畫面殘留在瀏覽器裡，
+    使用者同意的其實是已經被取代的舊文字。"""
+    if data.doc_version != CONSENT_VERSION:
+        raise HTTPException(
+            status_code=409,
+            detail=f"條款已更新（目前版本 {CONSENT_VERSION}），請重新整理頁面後再確認一次。")
+    row = UserConsent(
+        doc_version=CONSENT_VERSION,
+        signer_name=data.signer_name,
+        app_version=settings.app_version,
+        agreed_at=datetime.datetime.utcnow(),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    print(f"[consent] {row.signer_name} 已同意 {CONSENT_VERSION} 版條款", flush=True)
+    return _payload(row)
+
+
+@router.get("/history")
+async def consent_history(session: AsyncSession = Depends(get_session)):
+    """歷次同意紀錄（含舊版本）——爭議時要拿得出來。"""
+    rows = (await session.execute(
+        select(UserConsent).order_by(UserConsent.agreed_at.desc())
+    )).scalars().all()
+    return [{
+        "id": r.id,
+        "doc_version": r.doc_version,
+        "signer_name": r.signer_name,
+        "app_version": r.app_version,
+        "agreed_at": (r.agreed_at.replace(tzinfo=datetime.timezone.utc).isoformat()
+                      if r.agreed_at else None),
+    } for r in rows]

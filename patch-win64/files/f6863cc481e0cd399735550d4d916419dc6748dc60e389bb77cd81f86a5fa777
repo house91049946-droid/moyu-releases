@@ -1,0 +1,513 @@
+"""FB 自動加入社團——按加入鈕（SPEC-P32 §3）。
+
+**這是整個系統最保守的一支**。老闆定調：「加入社團是 FB 對新帳號最敏感的行為之一，
+要非常小心謹慎，速度跟量要非常注意」。所以 §3.1 的每一條都是硬規則，程式裡不留放寬的口子：
+
+  - 每輪預設 2 個、**硬上限 3**（`effective_max`）。設定填 100 也只做 3 個。
+  - 兩次加入之間至少 30 分鐘——那是**後端排程**的事（把一天的額度分散到時段內）。
+    這支 CLI 只保證同一輪內每個社團間隔 60–180 秒；它不知道今天已經加過幾個，
+    額度與 30 分鐘間隔一律由後端把關，這裡不做第二套判斷以免兩邊打架。
+  - 每個社團只做一件事：進頁 → 滑 1–2 屏 → 按加入 → **有入社問題就跳過不答** → 離開。
+    答錯比不答糟，而且自動答題等於冒充客戶回答；記 status=question，UI 再叫客戶自己去答。
+  - 不自動退出社團、不自動回答問題、不自動留言（§3.1 紅線）。
+  - 被擋立刻中止整批，已加入的照樣回報（後端才知道今天用掉幾個額度）。
+
+加入後 10 天內不可對該社團發文（老闆硬規則）——那是靠 `joined_at` 在發文清單那邊擋，
+不在這支的職責範圍；這支只負責把 joined_at 的來源（status=joined/requested）如實回報。
+
+用法：
+    python -m src.run_fb_group_join --fbid <id> --urls <u1,u2> --max 2 \
+        [--headless] [--dry-run] [--exclude-file known.json] [--result-json out.json]
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import random
+import sys
+
+from src.meta_block import ACTION_BLOCKED
+from src.run_fb_group_search import (            # 同一個領域的知識只寫一份：
+    _blocked_reason,                             # 社團網址正規化、封鎖字樣、卡片解析
+    _body_text,
+    classify_fb_block,
+    dedupe_groups,
+    group_key_from_url,
+    normalize_group_url,
+)
+from src.utils import human_sleep
+
+_JSON_PATH: str | None = None
+_RESULT: dict | None = None
+
+PLATFORM = "fb"
+DEFAULT_MAX = 2
+HARD_CAP = 3
+_CLICKED = 0        # 這一輪按過幾次「加入社團」——額度看這個，不看驗證結果                        # §3.1：每日上限 2、硬上限 3。再怎麼設定也不准超過
+GAP = (60, 180)                     # 同一輪內社團之間的秒數（跨輪的 30 分鐘由後端排程管）
+
+# 加入鈕的三種狀態（aria-label／文字，中英）。
+# 比對順序有意義，見 `join_button_status`：「已要求加入」「已加入」都含「加入」。
+_JOIN_LABELS = ("加入社團", "加入", "Join group", "Join Group", "Join")
+_REQUESTED_LABELS = ("已要求加入", "已送出要求", "取消要求", "待審核", "審核中",
+                     "Cancel request", "Cancel Request", "Requested", "Request sent",
+                     "Pending")
+_MEMBER_LABELS = ("已加入", "你已加入", "會員", "已是成員", "Joined", "Member",
+                  "Leave group", "退出社團")
+
+# 入社問題對話框的字樣。命中就**關掉走人**，一個字都不填。
+_QUESTION_PHRASES = (
+    "回答問題", "請回答", "回答以下問題", "管理員想了解", "社團管理員要求",
+    "需要回答問題", "問題（", "問題 (",
+    "Answer question", "Answer Questions", "Membership questions",
+    "answer these questions", "The admins want to know",
+)
+# 關閉對話框的按鈕（先試按鈕，再退回 Escape）
+_CLOSE_LABELS = ("關閉", "取消", "稍後再說", "Close", "Cancel", "Not now")
+
+
+# ---------------------------------------------------------------- 純函式（可離線測）
+
+def _write():
+    """atexit：不管怎麼結束都要把結果寫出去（例外時保留已做的部分）。
+
+    這支特別重要：加入社團是**不可逆**的，程式炸掉也一定要讓後端知道加了哪幾個，
+    否則後端會以為額度沒用掉，明天又加一輪。
+    """
+    if _JSON_PATH and _RESULT is not None:
+        # 後端 bridge 的 `_result_from_raw` 只讀 raw["data"]（envelope v2），
+        # 平面欄位是 SPEC-P32 §3.4 的契約——兩邊都給，各取所需。
+        _RESULT["data"] = {k: v for k, v in _RESULT.items() if k != "data"}
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[gjoin] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+def effective_max(requested: int | None) -> int:
+    """把這輪的數量夾到 1–3。上限是硬的——§3.1 不准放寬，設定值不該能把它調大。"""
+    n = DEFAULT_MAX if not requested or requested <= 0 else requested
+    return max(1, min(HARD_CAP, n))
+
+
+def parse_urls(arg: str) -> list[dict]:
+    """逗號分隔的社團網址 → [{key, url, name}]，去重、保留順序。
+
+    順序＝優先序：後端已依成員數由大到小排好（§3.2 人數多的優先），這裡不再重排。
+    認不出來的網址直接丟掉並記一行——寧可少加，不要對著莫名其妙的網址亂按。
+    """
+    out: list[dict] = []
+    for raw in (arg or "").split(","):
+        u = raw.strip()
+        if not u:
+            continue
+        url = normalize_group_url(u)
+        if not url:
+            print(f"[gjoin] 不是社團網址，略過：{u[:80]}", flush=True)
+            continue
+        out.append({"key": group_key_from_url(url), "url": url, "name": ""})
+    return dedupe_groups(out)
+
+
+def load_exclude_keys(path: str | None) -> set[str]:
+    """讀後端給的「已加入／已申請／已排除」社團鍵清單（JSON 字串陣列）。
+
+    檔案不在、格式壞掉一律回空集合：這是避免重複加入的輔助，不該讓整輪跑不起來。
+    社團網址也吃——後端存的可能是整串網址，這裡統一轉成鍵。
+    """
+    if not path:
+        return set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[gjoin] 排除清單讀取失敗（當作空的）：{str(e)[:120]}", flush=True)
+        return set()
+    if not isinstance(raw, list):
+        print("[gjoin] 排除清單不是陣列（當作空的）", flush=True)
+        return set()
+    out: set[str] = set()
+    for item in raw:
+        if not isinstance(item, (str, int)):
+            continue
+        s = str(item).strip()
+        if not s:
+            continue
+        out.add(group_key_from_url(s) or s.lower())
+    return out
+
+
+def drop_known(targets: list[dict], known: set[str]) -> tuple[list[dict], int]:
+    """把後端已記錄加過／申請過／排除過的社團在開頁面之前就剔掉。回 (剩下的, 剔掉幾個)。"""
+    if not known:
+        return list(targets), 0
+    kept = [t for t in targets if (t.get("key") or "").lower() not in known]
+    return kept, len(targets) - len(kept)
+
+
+def join_button_status(label: str) -> str:
+    """按鈕文字 → 'requested'（已送出申請）／'existing'（已是成員）／'join'（可加）／''。
+
+    順序是重點：「已要求加入」「已加入」都含「加入」，先比這兩個才不會誤判成可加。
+    誤判的代價很實在——對著「取消要求」再按一次就是把申請撤掉。
+    """
+    s = (label or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    if any(p.lower() in low for p in _REQUESTED_LABELS):
+        return "requested"
+    if any(p.lower() in low for p in _MEMBER_LABELS):
+        return "existing"
+    if any(p.lower() in low for p in _JOIN_LABELS):
+        return "join"
+    return ""
+
+
+def looks_like_question_dialog(text: str) -> bool:
+    """對話框文字看起來是「入社問題」嗎？是就關掉走人，一個字都不填（§3.1）。"""
+    blob = (text or "").lower()
+    return any(p.lower() in blob for p in _QUESTION_PHRASES)
+
+
+def counts_toward_quota(status: str) -> bool:
+    """這個結果要不要算掉一次額度？
+
+    除了「本來就已是成員」（沒動到任何東西）以外**全算**，包含 failed 與 question：
+    只要頁面開了、鈕按了，FB 那邊就看得到動作。寧可今天少加一個，也不要超量。
+    """
+    return status != "existing"
+
+
+def summarize(groups: list[dict]) -> dict:
+    """依 status 計數，給結果 JSON 與紀錄摘要用（SPEC-P32 §3.4 的欄位）。"""
+    c = {"joined": 0, "requested": 0, "question": 0, "existing": 0, "failed": 0, "dry_run": 0}
+    for g in groups:
+        st = g.get("status", "")
+        if st in c:
+            c[st] += 1
+    return c
+
+
+# ---------------------------------------------------------------- 瀏覽器動作
+
+def _human_browse(page, rounds: tuple[int, int] = (1, 2)) -> None:
+    """滑 1–2 屏再按加入（§3.1「進社團頁 → 看一下 → 按加入」）。
+
+    直接進頁面就按加入，在 FB 眼裡的時間軸太乾淨了——真人一定會先看一下這社團在幹嘛。
+    """
+    for _ in range(random.randint(*rounds)):
+        with contextlib.suppress(Exception):
+            page.mouse.wheel(0, random.randint(500, 900))
+        human_sleep(1.5, 3.5)
+
+
+_SKIP_HEADINGS = ("通知", "Notifications", "Facebook", "動態消息", "News Feed")
+
+
+def _group_name(page) -> str:
+    """社團名稱。2026-09-03 實測：整頁抓第一個 h1 會抓到**通知面板**的「通知」，
+    紀錄就變成「加入社團『通知』失敗」。限定在 main 裡找，並跳過已知的面板標題。"""
+    js = """() => {
+        const roots = [document.querySelector("div[role='main']"), document.body].filter(Boolean);
+        const skip = %s;
+        for (const r of roots) {
+            for (const h of r.querySelectorAll("h1, span[dir='auto']")) {
+                const t = (h.innerText || '').trim().split(String.fromCharCode(10))[0];
+                if (t && t.length < 80 && !skip.includes(t)) return t;
+            }
+        }
+        return '';
+    }""" % (list(_SKIP_HEADINGS),)
+    with contextlib.suppress(Exception):
+        return (page.evaluate(js) or "").strip()[:120]
+    return ""
+
+
+def _find_join_button(page):
+    """找社團頁上的加入鈕，回 (狀態, locator)。狀態見 join_button_status。
+
+    先找 requested／existing 再找 join：漏判會變成「再按一次取消申請」，比沒加更糟。
+    """
+    # TODO 實測校正：www 版是 div[role='button'] 帶 aria-label；「加入」exact 可能撞到
+    # 側欄的「加入的社團」之類，所以中文用完整的「加入社團」優先。
+    # **限定 div[role=main]**：通知面板常駐 DOM，裡面也有一堆按鈕（2026-09-03 實測，
+    # 社團名字被讀成「通知」就是同一個病灶）。掃 aria-label／文字交給 join_button_status 判斷，
+    # 因為 FB 會把名字塞進 label 中間，exact 比對對不上。
+    with contextlib.suppress(Exception):
+        main = page.locator("div[role='main']")
+        root = main if main.count() > 0 else page
+        loc = root.locator("div[role='button'], a[role='button'], button")
+        best = None
+        for i in range(min(loc.count(), 60)):
+            el = loc.nth(i)
+            with contextlib.suppress(Exception):
+                if not el.is_visible():
+                    continue
+                lab = (el.get_attribute("aria-label") or el.inner_text() or "").strip()
+                st = join_button_status(lab)
+                if st in ("requested", "existing"):
+                    return st, el          # 已申請／已是成員：立刻回，絕不能再按（會取消）
+                if st == "join" and best is None:
+                    best = ("join", el)
+        if best is not None:
+            return best
+    for labels, st in ((_REQUESTED_LABELS, "requested"),
+                       (_MEMBER_LABELS, "existing"),
+                       (_JOIN_LABELS, "join")):
+        for lab in labels:
+            with contextlib.suppress(Exception):
+                cand = page.get_by_role("button", name=lab, exact=True).first
+                if cand.count() > 0 and cand.is_visible():
+                    return st, cand
+    return "", None
+
+
+def _dialog_text(page) -> str:
+    """目前畫面上的對話框文字（沒有對話框回空字串）。"""
+    with contextlib.suppress(Exception):
+        js = ("()=>{const d=document.querySelector(\"div[role='dialog']\");"
+              "return d ? (d.innerText||'').slice(0,1200) : '';}")
+        return page.evaluate(js) or ""
+    return ""
+
+
+def _close_dialog(page) -> None:
+    """關掉對話框。先找關閉鈕，找不到就按 Escape——不管怎樣都不能留在填答畫面。"""
+    for lab in _CLOSE_LABELS:
+        with contextlib.suppress(Exception):
+            btn = page.get_by_role("button", name=lab, exact=True).first
+            if btn.count() > 0 and btn.is_visible():
+                btn.click(timeout=4000)
+                human_sleep(0.8, 1.6)
+                return
+    with contextlib.suppress(Exception):
+        page.keyboard.press("Escape")
+    human_sleep(0.8, 1.6)
+
+
+def _join_one(page, fbid: str, target: dict, dry_run: bool) -> tuple[str, str, str]:
+    """加入一個社團。回 (status, name, reason)。
+
+    status：joined / requested / question / existing / failed / dry_run / blocked
+    """
+    if dry_run:
+        # dry-run 只是「給我看會加哪幾個」，連社團頁都不必開——
+        # 慢，而且會在 FB 那邊留下沒有意義的瀏覽足跡（加好友那支 2026-09-02 實測過的結論）。
+        return "dry_run", target.get("name", ""), ""
+
+    page.goto(target["url"], wait_until="domcontentloaded", timeout=45000)
+    human_sleep(3.0, 5.0)
+
+    why = _blocked_reason(page, fbid)
+    if why:
+        return "blocked", "", why
+
+    name = _group_name(page) or target.get("name", "")
+    st, btn = _find_join_button(page)
+    if st in ("existing", "requested"):
+        # 已是成員／已送過申請——再點下去就是退出社團／取消申請，絕對不能碰
+        return st, name, ""
+
+    _human_browse(page)                      # §3.1：看一下（滑 1–2 屏）再按
+
+    if btn is None:
+        with contextlib.suppress(Exception):
+            page.mouse.wheel(0, -3000)       # 有些版面要捲回頂端才看得到加入鈕
+        human_sleep(0.8, 1.6)
+        st, btn = _find_join_button(page)
+        if st in ("existing", "requested"):
+            return st, name, ""
+        if btn is None:
+            return "failed", name, "找不到加入社團按鈕（可能社團已關閉、或版面改了）"
+
+    btn.click(timeout=8000)
+    human_sleep(2.5, 4.5)
+
+    why = _blocked_reason(page, fbid)
+    if why:
+        return "blocked", name, why
+
+    dlg = _dialog_text(page)
+    if dlg and looks_like_question_dialog(dlg):
+        # §3.1：有入社問題就跳過不答。關掉、離開，讓 UI 顯示「請自己去答」
+        _close_dialog(page)
+        return "question", name, "社團要求回答入社問題，已跳過不答"
+    if dlg:
+        # 是別的對話框（規則確認之類）——一樣不亂按，關掉後看按鈕狀態說話
+        _close_dialog(page)
+
+    # 2026-09-03 實測：按下去其實加成功了（FB 通知寫著「你現在可以在○○…」），
+    # 但當下那顆按鈕的文字沒變，於是被記成失敗、下次還會再按一次。
+    # 所以驗證分兩段：先原地等幾輪，再重新載入社團頁看一次——重載後的狀態才是真的。
+    global _CLICKED
+    _CLICKED += 1                            # 按下去就算一次額度，驗證誤判也不准多加
+    for _ in range(5):
+        st2, _ = _find_join_button(page)
+        if st2 == "existing":
+            return "joined", name, ""        # 公開社團：按完直接就是成員
+        if st2 == "requested":
+            return "requested", name, ""     # 私密社團：送出申請，等管理員審核
+        human_sleep(1.5, 2.5)
+    with contextlib.suppress(Exception):
+        page.goto(target["url"], wait_until="domcontentloaded", timeout=45000)
+        human_sleep(3.0, 5.0)
+        st3, _ = _find_join_button(page)
+        if st3 == "existing":
+            return "joined", name, ""
+        if st3 == "requested":
+            return "requested", name, ""
+    return "failed", name, "按了但重新載入後仍不是成員，不確定有沒有加到"
+
+
+def process_groups(page, fbid: str, targets: list[dict], max_join: int, dry_run: bool,
+                   join_one=_join_one, gap: tuple[int, int] = GAP) -> dict:
+    """逐一處理，直到用掉 max_join 次額度。被擋立刻停，已做的照樣回報。
+
+    join_one／gap 可注入，離線測試用。
+    """
+    done: list[dict] = []
+    blocked, reason = False, ""
+    used = 0
+    for i, t in enumerate(targets):
+        if used >= max_join or _CLICKED >= max_join:
+            break
+        rec = dict(t)
+        try:
+            st, name, why = join_one(page, fbid, t, dry_run)
+        except Exception as e:
+            st, name, why = "failed", t.get("name", ""), str(e)[:120]
+        if name:
+            rec["name"] = name
+        rec["status"] = st
+        if why:
+            rec["reason"] = why
+            # 後端 `record_joins` 落庫時讀的是 note（候選清單那欄），UI 就是靠它顯示
+            # 「這個社團要回答問題，請自己去答」。兩個欄位都給，別讓客戶看到空白。
+            rec["note"] = why
+
+        if st == "blocked":
+            blocked, reason = True, why or ACTION_BLOCKED
+            rec["status"] = "failed"
+            done.append(rec)
+            print(f"[gjoin] ⚠ 偵測到被擋（{reason}），立即中止整批", flush=True)
+            break
+
+        done.append(rec)
+        label = rec.get("name") or t.get("key") or t.get("url", "")
+        if counts_toward_quota(st):
+            used += 1
+        verb = {"joined": "已加入", "requested": "已送出加入申請", "question": "有入社問題，跳過不答",
+                "failed": "加入失敗", "dry_run": "將加入", "existing": "已經是成員，略過"}.get(st, st)
+        print(f"[gjoin] {label}：{verb}（{used}/{max_join}）"
+              f"{'，' + why if why and st != 'question' else ''}", flush=True)
+
+        if used < max_join and i < len(targets) - 1:
+            human_sleep(*gap)                # 同一輪內的間隔；跨輪 30 分鐘由後端排程管
+    return {"groups": done, "blocked": blocked, "block_reason": reason}
+
+
+def do_join(fbid: str, targets: list[dict], max_join: int, headless: bool, dry_run: bool,
+            profile_dir: str | None, known: set[str] | None = None) -> dict:
+    from src.login import _try_cookie_login
+    from src.utils import capture_screenshot, launch_browser
+
+    browser, context, page = launch_browser(fbid=fbid, headless=headless, user_data_dir=profile_dir)
+    out: dict = {"groups": [], "blocked": False, "block_reason": "", "skipped_known": 0}
+    try:
+        if not _try_cookie_login(page, context, fbid):
+            raise RuntimeError("Cookie 登入失敗，請先用 CLI 登入一次")
+
+        why = _blocked_reason(page, fbid)
+        if why:
+            # 開場就看到限制字樣：這輪一個都不加。被擋還硬加只會把禁令拉長
+            out.update(blocked=True, block_reason=why)
+            capture_screenshot(page, fbid, "gjoin_blocked")
+            return out
+
+        targets, out["skipped_known"] = drop_known(targets, known or set())
+        print(f"[gjoin] 候選 {len(targets)} 個社團（另剔除 {out['skipped_known']} 個加過／排除過的），"
+              f"這輪最多做 {max_join} 個", flush=True)
+        if dry_run:
+            for t in targets[:max_join]:
+                print(f"[gjoin] (dry-run) 會加入 {t.get('name') or t['key']} {t['url']}", flush=True)
+
+        r = process_groups(page, fbid, targets, max_join, dry_run)
+        out.update(r)
+        if r["blocked"]:
+            with contextlib.suppress(Exception):
+                capture_screenshot(page, fbid, "gjoin_blocked")
+        return out
+    except Exception as e:
+        e.reason = classify_fb_block(page_text=_body_text(page), error_text=str(e))
+        e.partial = out                      # 已加入的不能白加——後端要知道額度用掉了
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            context.close()                  # persistent context：browser 與 context 同物件
+
+
+def _apply(result: dict, r: dict) -> None:
+    result["groups"] = r.get("groups", [])
+    result.update(summarize(result["groups"]))
+    result["blocked"] = bool(r.get("blocked"))
+    result["block_reason"] = r.get("block_reason", "")
+    result["skipped_known"] = r.get("skipped_known", 0) or 0
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser(description="FB 自動加入社團（每輪硬上限 3）")
+    ap.add_argument("--fbid", required=True)
+    ap.add_argument("--urls", required=True, help="逗號分隔的社團網址（依優先序）")
+    ap.add_argument("--max", type=int, default=DEFAULT_MAX,
+                    help=f"這輪最多做幾個（硬上限 {HARD_CAP}）")
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="只印出會加哪幾個，不開頁面、不點任何東西")
+    ap.add_argument("--result-json")
+    ap.add_argument("--profile-dir", default=None, help="瀏覽器設定檔目錄（預設 user_data/<fbid>）")
+    ap.add_argument("--exclude-file", default=None,
+                    help="JSON 字串陣列：後端已加入／已申請／已排除的社團網址或鍵")
+    args = ap.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {
+        "schema": 2, "success": False, "fbid": args.fbid, "platform": PLATFORM,
+        "joined": 0, "requested": 0, "question": 0, "existing": 0, "failed": 0, "dry_run": 0,
+        "skipped_known": 0, "blocked": False, "block_reason": "",
+        "error": "未完成", "reason": "", "groups": [],
+    }
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    targets = parse_urls(args.urls)
+    if not targets:
+        _RESULT["error"] = "沒有可用的社團網址"
+        sys.exit(1)
+
+    try:
+        r = do_join(args.fbid, targets, effective_max(args.max), args.headless, args.dry_run,
+                    args.profile_dir, known=load_exclude_keys(args.exclude_file))
+        _apply(_RESULT, r)
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        if _RESULT["blocked"]:
+            _RESULT["reason"] = _RESULT["block_reason"]
+            print(f"[gjoin] ⚠ 中斷：{_RESULT['block_reason']}"
+                  f"（已加入 {_RESULT['joined']} 個、送出申請 {_RESULT['requested']} 個）", flush=True)
+        else:
+            print(f"[gjoin] ✅ 加入 {_RESULT['joined']} 個社團、送出 {_RESULT['requested']} 個申請，"
+                  f"{_RESULT['question']} 個要回答問題（已跳過，請自己去答）、"
+                  f"{_RESULT['existing']} 個原本就是成員", flush=True)
+    except KeyboardInterrupt:
+        _RESULT["error"] = "使用者中斷"
+        sys.exit(0)
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        _apply(_RESULT, getattr(e, "partial", {}) or {})
+        _RESULT["reason"] = getattr(e, "reason", None) or classify_fb_block(error_text=str(e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
