@@ -1,0 +1,214 @@
+"""Threads 潛在客戶探索（SPEC-P29）。
+
+依關鍵字搜尋 Threads，找出近期發文提到買賣租房的帳號。**只列，不做任何動作**
+——探索與追蹤刻意分成兩支，客戶要先看得到名單才決定追誰，而不是系統看了就追。
+
+參考 mini 上「thread 龍蝦」的任務設計（關鍵字、地區、候選概念），
+但程式自己寫：龍蝦依賴外部 agent-browser session，那正是它失敗 91 次的原因；
+這裡用摸魚自己的 Playwright 持久化 profile（發文用的那份，登入態現成）。
+
+只抽公開資訊（帳號、貼文連結、摘要、時間），不進私人頁面、不抓聯絡方式。
+
+用法：
+    python -m src.run_threads_search --keywords "自售,換屋" --region 台中 \
+        --max-results 50 --days 7 --headless --result-json out.json
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import re
+import sys
+from pathlib import Path
+from urllib.parse import quote
+
+from playwright.sync_api import sync_playwright
+
+from src.meta_block import classify as classify_failure
+from src.run_threads_post import _debug_shot, _launch, DEFAULT_PROFILE, parse_username
+from src.utils import human_sleep
+
+_JSON_PATH = None
+_RESULT = None
+
+SEARCH_URL = "https://www.threads.com/search?q={q}&serp_type=default"
+
+# 從搜尋結果頁抽貼文：每則取 作者連結／貼文連結／文字／時間
+POSTS_JS = """
+() => {
+  const out = [];
+  document.querySelectorAll("a[href*='/post/']").forEach(a => {
+    const href = a.getAttribute('href') || '';
+    // 貼文連結長這樣：/@username/post/XXXX
+    const m = href.match(/^\\/(@[^/]+)\\/post\\//);
+    if (!m) return;
+    const card = a.closest('div[role="button"], article') || a.parentElement?.parentElement;
+    const text = card ? (card.innerText || '').slice(0, 400) : '';
+    const t = card ? card.querySelector('time') : null;
+    out.push({
+      user: m[1],
+      url: href.split('?')[0],
+      text: text,
+      posted_at: t ? (t.getAttribute('datetime') || '') : '',
+    });
+  });
+  return out;
+}
+"""
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[search] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+def parse_keywords(arg: str) -> list[str]:
+    """逗號分隔 → 去空白去重，保留順序。"""
+    seen, out = set(), []
+    for raw in (arg or "").split(","):
+        k = raw.strip()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def clean_snippet(text: str, author: str = "", limit: int = 120) -> str:
+    """卡片 innerText 含帳號名、時間、按讚數等雜訊，取最像內文的一段。
+
+    關鍵是**用作者名精準排除**而不是猜長度：卡片第一行就是帳號名，
+    而帳號名長度不固定（"seller01" 剛好 8 字，任何長度門檻都會漏）。
+    """
+    a = (author or "").lstrip("@").strip().lower()
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if a and s.lower() == a:
+            continue                     # 作者名那一行
+        if s.startswith("@"):
+            continue
+        if re.fullmatch(r"[\d,\.]+", s):
+            continue                     # 讚數／留言數
+        if re.fullmatch(r"\d+\s*(秒|分鐘|小時|天|週|月|年)前?", s):
+            continue                     # 相對時間
+        if len(s) < 4:
+            continue                     # 「讚」「分享」這種按鈕字
+        return s[:limit]
+    return (text or "").strip().replace("\n", " ")[:limit]
+
+
+def dedupe(items: list[dict]) -> list[dict]:
+    """同一個帳號只留最早撈到的一則——我們要的是「人」，不是貼文清單。"""
+    seen, out = set(), []
+    for it in items:
+        u = it.get("username", "")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(it)
+    return out
+
+
+def normalize(raw: list[dict], me: str = "") -> list[dict]:
+    """瀏覽器抽出的原始資料 → 乾淨的候選清單。"""
+    out = []
+    for r in raw or []:
+        user = parse_username(r.get("user", ""))
+        if not user or (me and user.lower() == me.lower()):
+            continue                     # 不要把自己列進候選
+        url = (r.get("url", "") or "").split("?")[0]   # 不依賴 JS 那邊已經去過查詢字串
+        out.append({
+            "username": user,
+            "post_url": f"https://www.threads.com{url}" if url.startswith("/") else url,
+            "snippet": clean_snippet(r.get("text", ""), author=user),
+            "posted_at": r.get("posted_at", ""),
+        })
+    return dedupe(out)
+
+
+def do_search(profile_dir: Path, keywords: list[str], region: str,
+              max_results: int, headless: bool) -> dict:
+    from src.run_threads_post import _current_username, _logged_in, THREADS_URL
+
+    pw = sync_playwright().start()
+    ctx, page = _launch(pw, profile_dir, headless=headless)
+    try:
+        page.goto(THREADS_URL, wait_until="commit", timeout=60000)
+        human_sleep(2.0, 3.5)
+        if not _logged_in(page):
+            raise RuntimeError("尚未登入 Threads——先到帳號設定連結一次")
+        me = _current_username(page)
+
+        items: list[dict] = []
+        for kw in keywords:
+            q = f"{region} {kw}".strip()
+            page.goto(SEARCH_URL.format(q=quote(q)), wait_until="commit", timeout=60000)
+            human_sleep(3.0, 5.0)
+            # 捲幾次讓結果載進來（Threads 是無限捲動）
+            for _ in range(3):
+                page.mouse.wheel(0, 1600)
+                human_sleep(1.2, 2.4)
+            raw = page.evaluate(POSTS_JS)
+            got = normalize(raw, me)
+            print(f"[search] 「{q}」找到 {len(got)} 個帳號", flush=True)
+            items.extend(got)
+            if len(dedupe(items)) >= max_results:
+                break
+            human_sleep(2.0, 4.0)          # 關鍵字之間也要喘口氣
+
+        items = dedupe(items)[:max_results]
+        print(f"[search] 合計 {len(items)} 個候選帳號", flush=True)
+        return {"items": items, "me": me}
+    except Exception as e:
+        body = ""
+        with contextlib.suppress(Exception):
+            body = page.evaluate("()=>document.body.innerText")[:4000]
+        e.reason = classify_failure(page_text=body, error_text=str(e))
+        _debug_shot(page, "search_failed")
+        raise
+    finally:
+        for close in (ctx.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser(description="Threads 潛在客戶探索")
+    ap.add_argument("--keywords", required=True, help="逗號分隔關鍵字")
+    ap.add_argument("--region", default="", help="地區（會併進搜尋字串）")
+    ap.add_argument("--max-results", type=int, default=50)
+    ap.add_argument("--profile-dir", default=str(DEFAULT_PROFILE))
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--result-json")
+    args = ap.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {"schema": 1, "success": False, "error": "未完成",
+               "data": {"items": [], "reason": ""}}
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    kws = parse_keywords(args.keywords)
+    if not kws:
+        _RESULT["error"] = "沒有可用的關鍵字"
+        sys.exit(1)
+
+    try:
+        r = do_search(Path(args.profile_dir).expanduser(), kws, args.region.strip(),
+                      max(1, min(200, args.max_results)), args.headless)
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        _RESULT["data"].update(r)
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        _RESULT["data"]["reason"] = getattr(e, "reason", None) or classify_failure(error_text=str(e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

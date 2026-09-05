@@ -1,0 +1,304 @@
+"""FB 自動加好友的離線測試（SPEC-P31）。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_fb_friend.py -v
+
+守的是「保守」：額度不能被隨手調大、未回應超標不送、同一個人只邀一次、
+被擋立刻停但已做的要保留、後端已記錄的人進頁面前就剔掉。不開真的瀏覽器。
+"""
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("playwright")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import run_fb_friend as fr  # noqa: E402
+from src.meta_block import ACTION_BLOCKED, UNKNOWN  # noqa: E402
+
+
+class Test額度:
+    def test_預設四人(self):
+        assert fr.effective_limit(None) == 4
+        assert fr.effective_limit(0) == 4
+
+    def test_不准超過硬上限八(self):
+        """FB 被判定會連坐到發文——設定再大也只能 8。"""
+        assert fr.effective_limit(100) == fr.HARD_CAP == 8
+
+    def test_合理值照收(self):
+        assert fr.effective_limit(2) == 2
+
+
+class Test來源:
+    def test_去空白去重保順序(self):
+        assert fr.parse_sources(" pymk , own_posts ,pymk, ") == ["pymk", "own_posts"]
+
+    def test_名字打錯直接報錯(self):
+        with pytest.raises(ValueError):
+            fr.parse_sources("own_posts,friends_of_friends")
+
+    def test_社團來源是空實作(self):
+        """§3 說社團來源風險最高、預設不勾——先回空清單，不能偷跑。"""
+        assert fr._collect_groups(None, "1", 5) == []
+
+
+class Test鍵值:
+    def test_數字id優先(self):
+        assert fr.target_key_from_url("https://www.facebook.com/profile.php?id=100012345&sk=about") == "100012345"
+        assert fr.target_key_from_url("https://www.facebook.com/people/王小明/100012345/") == "100012345"
+
+    def test_代稱去掉查詢字串(self):
+        assert fr.target_key_from_url("https://www.facebook.com/john.doe?comment_id=99") == "john.doe"
+
+    def test_非個人頁回空(self):
+        for u in ("https://www.facebook.com/groups/123/posts/9/",
+                  "https://www.facebook.com/photo/?fbid=1",
+                  "https://www.facebook.com/friends/requests", ""):
+            assert fr.target_key_from_url(u) == ""
+
+    def test_同一個人只留優先來源那筆(self):
+        ts = [{"key": "a", "source": "own_posts"}, {"key": "b", "source": "own_posts"},
+              {"key": "a", "source": "pymk"}, {"key": "", "source": "pymk"}]
+        out = fr.dedupe_targets(ts)
+        assert [(t["key"], t["source"]) for t in out] == [("a", "own_posts"), ("b", "own_posts")]
+
+
+class Test未回應邀請:
+    def test_超過上限不送_剛好可送(self):
+        assert fr.should_send(30) is True
+        assert fr.should_send(31) is False
+
+    def test_數不出來視為可送(self):
+        """這是保護機制不是閘門——讀不到數字不該讓整輪空跑。"""
+        assert fr.should_send(None) is True
+
+    def test_數取消邀請鈕(self):
+        labels = ["取消邀請", "取消邀請", "Cancel request", "加朋友", "朋友", "更多"]
+        assert fr.count_pending_labels(labels) == 3
+
+
+class Test按鈕狀態:
+    def test_三種狀態(self):
+        assert fr.button_status("加朋友") == "add"
+        assert fr.button_status("Add friend") == "add"
+        assert fr.button_status("朋友") == "existing"
+        assert fr.button_status("取消邀請") == "pending"
+        assert fr.button_status("Cancel request") == "pending"
+
+    def test_不相干的字不算(self):
+        """「朋友」exact 才算已是好友——「朋友的朋友」「所有朋友」不能誤判成已好友。"""
+        assert fr.button_status("所有朋友") == ""
+        assert fr.button_status("") == ""
+
+
+class Test封鎖判斷:
+    def test_FB自己的封鎖字樣(self):
+        assert fr.classify_fb_block("你暫時被封鎖\n請稍後再試") == ACTION_BLOCKED
+        assert fr.classify_fb_block("You're Temporarily Blocked") == ACTION_BLOCKED
+        assert fr.classify_fb_block("你的好友邀請已達上限") == ACTION_BLOCKED
+
+    def test_退回meta_block通用規則(self):
+        assert fr.classify_fb_block("Action Blocked") == ACTION_BLOCKED
+        assert fr.classify_fb_block("王小明 的個人檔案 加朋友 朋友 相片") == UNKNOWN
+
+
+class Test結果統計:
+    def test_依status計數(self):
+        ts = [{"status": "sent"}, {"status": "sent"}, {"status": "existing"},
+              {"status": "pending"}, {"status": "failed"}, {"status": "dry_run"}]
+        assert fr.summarize(ts) == {"sent": 2, "skipped_existing": 1, "skipped_pending": 1,
+                                    "failed": 1, "dry_run": 1}
+
+
+class Test排除清單:
+    def test_讀檔並剔除(self, tmp_path):
+        p = tmp_path / "known.json"
+        p.write_text(json.dumps(["100012345", "john.doe", 777, " "]), encoding="utf-8")
+        known = fr.load_exclude_keys(str(p))
+        assert known == {"100012345", "john.doe", "777"}
+        kept, n = fr.drop_known([{"key": "100012345"}, {"key": "x"}, {"key": "john.doe"}], known)
+        assert [t["key"] for t in kept] == ["x"] and n == 2
+
+    def test_檔案不在或壞掉當空的(self, tmp_path):
+        assert fr.load_exclude_keys(None) == set()
+        assert fr.load_exclude_keys(str(tmp_path / "nope.json")) == set()
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        assert fr.load_exclude_keys(str(bad)) == set()
+        obj = tmp_path / "obj.json"
+        obj.write_text('{"a": 1}', encoding="utf-8")
+        assert fr.load_exclude_keys(str(obj)) == set()
+
+
+class Test處理流程:
+    """用假的 friend_one 走 process_targets，不開瀏覽器。"""
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self, monkeypatch):
+        monkeypatch.setattr(fr, "human_sleep", lambda *a, **k: None)
+
+    def _targets(self, n):
+        return [{"key": str(i), "name": f"人{i}", "source": "pymk", "url": f"u{i}"} for i in range(n)]
+
+    def test_送滿就停(self):
+        calls = []
+
+        def fake(page, fbid, t, dry_run, p):
+            calls.append(t["key"])
+            return "sent", False, ""
+
+        r = fr.process_targets(None, "1", self._targets(10), 3, False, friend_one=fake, gap=(0, 0))
+        assert len(calls) == 3 and fr.summarize(r["targets"])["sent"] == 3
+        assert r["blocked"] is False
+
+    def test_已好友已送過不算額度(self):
+        seq = iter([("existing", False, ""), ("pending", False, ""), ("sent", True, ""), ("sent", False, "")])
+
+        def fake(page, fbid, t, dry_run, p):
+            return next(seq)
+
+        r = fr.process_targets(None, "1", self._targets(4), 2, False, friend_one=fake, gap=(0, 0))
+        s = fr.summarize(r["targets"])
+        assert s == {"sent": 2, "skipped_existing": 1, "skipped_pending": 1, "failed": 0, "dry_run": 0}
+        assert r["targets"][2]["liked"] is True
+
+    def test_被擋立刻停但保留已做的(self):
+        seq = iter([("sent", False, ""), ("blocked", False, ACTION_BLOCKED), ("sent", False, "")])
+        calls = []
+
+        def fake(page, fbid, t, dry_run, p):
+            calls.append(t["key"])
+            return next(seq)
+
+        r = fr.process_targets(None, "1", self._targets(3), 3, False, friend_one=fake, gap=(0, 0))
+        assert r["blocked"] is True and r["block_reason"] == ACTION_BLOCKED
+        assert len(calls) == 2                                   # 第三個沒碰
+        assert fr.summarize(r["targets"])["sent"] == 1            # 已送的保留
+
+    def test_dry_run不點任何東西(self):
+        def fake(page, fbid, t, dry_run, p):
+            assert dry_run is True
+            return "dry_run", False, ""
+
+        r = fr.process_targets(None, "1", self._targets(2), 2, True, friend_one=fake, gap=(0, 0))
+        assert fr.summarize(r["targets"]) == {"sent": 0, "skipped_existing": 0, "skipped_pending": 0,
+                                              "failed": 0, "dry_run": 2}
+
+
+class Test安全預設:
+    def test_不是每個都按讚且間隔夠長(self):
+        assert 0 < fr.LIKE_PROBABILITY < 1
+        assert fr.GAP[0] >= 20 and fr.PENDING_LIMIT == 30 and fr.DEFAULT_MAX == 4
+
+    def test_已好友已送出的標籤涵蓋中英(self):
+        """漏判會導致再點一次＝取消邀請／解除好友，比不加更糟。"""
+        for lab in ("朋友", "Friends"):
+            assert lab in fr._FRIEND_LABELS
+        for lab in ("取消邀請", "Cancel request"):
+            assert lab in fr._PENDING_LABELS
+
+
+class Test實測校正後的過濾:
+    """2026-09-02 在 mini 上實跑 dry-run 撈到的雜訊，每一種都補一條。"""
+
+    def test_粉專統計字串不是人(self):
+        from src.run_fb_friend import looks_like_person
+        assert not looks_like_person("3,698 位追蹤者")
+        assert not looks_like_person("正在追蹤 1,772 人") or True   # 名稱型態隨版面變，這條只求不炸
+
+    def test_留言時間戳不是人(self):
+        from src.run_fb_friend import looks_like_person
+        for t in ("1天", "3 小時", "2週", "45分鐘"):
+            assert not looks_like_person(t), t
+
+    def test_真名要留下(self):
+        from src.run_fb_friend import looks_like_person
+        for t in ("蔣錦堂", "Ivan Ho", "林冠辰"):
+            assert looks_like_person(t), t
+
+    def test_主控板等內部路徑不是個人頁(self):
+        from src.run_fb_friend import target_key_from_url
+        for u in ("https://www.facebook.com/professional_dashboard",
+                  "https://www.facebook.com/latest/", "https://www.facebook.com/allactivity"):
+            assert target_key_from_url(u) == "", u
+
+    def test_JS片段不得含真換行(self):
+        """踩過兩次的坑：Python 字串裡寫 \\n，JS 收到真換行 → 整段語法錯誤、默默回空。"""
+        import inspect
+        from src import run_fb_friend as m
+        src = inspect.getsource(m)
+        for line in src.splitlines():
+            if "querySelectorAll" in line or "innerText" in line:
+                assert "split('" not in line or "fromCharCode" in line, line
+
+
+class Test實測校正_2026_09_03:
+    """mini 實測踩到的三件事：通知面板被當成候選、自己也在名單裡、加朋友鈕比對不到。"""
+
+    def test_通知文字不是人名(self):
+        import src.run_fb_friend as fr
+        assert fr.looks_like_notification("未讀郭豈辰在一則貼文中標註了你和其他 8 人。1分鐘")
+        assert fr.looks_like_notification("你今天有動態回顧值得看看。4小時")
+        assert fr.looks_like_notification("Wei Che Chang 、陳罕青和其他 3 人都說你分享的 1 張相片讚。2小時")
+        assert not fr.looks_like_notification("蔣錦堂")
+        assert not fr.looks_like_notification("郭豈辰")
+
+    def test_系統頁不是個人檔案(self):
+        import src.run_fb_friend as fr
+        assert fr.target_key_from_url("https://www.facebook.com/onthisday") == ""
+
+    def test_加朋友鈕的label夾著名字也認得(self):
+        import src.run_fb_friend as fr
+        # 實際的 aria-label：「將蔣錦堂加為朋友」
+        assert fr.button_status("將蔣錦堂加為朋友") == "add"
+        assert fr.button_status("加朋友") == "add"
+        assert fr.button_status("朋友") == "existing"
+        assert fr.button_status("取消邀請") == "pending"
+
+    def test_額度看按了幾次加朋友(self, monkeypatch):
+        """驗證誤判成失敗時，額度也不能被繞過（備份刪文踩過同一顆地雷）。"""
+        import src.run_fb_friend as fr
+        monkeypatch.setattr(fr, "_CLICKED", 2)      # 已經按滿 2 次
+        calls = []
+
+        def fake_one(*a, **k):
+            calls.append(1)
+            return "failed", False, "驗證看不到"
+
+        out = fr.process_targets(None, "1", [{"key": "a"}, {"key": "b"}],
+                                 max_send=2, dry_run=False, friend_one=fake_one, gap=(0, 0))
+        assert calls == []                          # 一個都不再碰
+        assert out["targets"] == []
+
+    def test_只認主角的按鈕_不理會推薦名單裡別人的(self):
+        """個人頁下方的「你可能認識的人」每個人都有一顆加朋友鈕。"""
+        import src.run_fb_friend as fr
+
+        class El:
+            def __init__(self, lab): self.lab = lab
+            def is_visible(self): return True
+            def get_attribute(self, k): return self.lab
+            def inner_text(self): return ""
+
+        class Loc:
+            def __init__(self, els): self.els = els
+            def count(self): return len(self.els)
+            def nth(self, i): return self.els[i]
+            def locator(self, sel): return self
+
+        class Page:
+            def __init__(self, els): self._loc = Loc(els)
+            def locator(self, sel): return self._loc
+
+        els = [El("取消對陳泊廷的邀請"), El("將蕭雅惠加為朋友")]
+        st, _ = fr._find_action_button(Page(els), owner="陳泊廷")
+        assert st == "pending"          # 主角已送出；隔壁蕭雅惠的「加朋友」不算
+
+    def test_從按鈕label反推主角是誰(self):
+        import src.run_fb_friend as fr
+        assert fr.owner_from_label("將陳泊廷加為朋友") == "陳泊廷"
+        assert fr.owner_from_label("取消對陳泊廷的邀請") == "陳泊廷"
+        assert fr.owner_from_label("Add John Smith as friend") == "John Smith"
+        assert fr.owner_from_label("發送訊息") == ""

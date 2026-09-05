@@ -1,0 +1,232 @@
+"""Threads 追蹤潛在客戶（SPEC-P29）。
+
+行為模型參考 mini 上「thread 龍蝦」的節奏（進個人頁 → 滑動瀏覽 → 隨機點讚 →
+追蹤 → 再逛一下 → 離開），程式自己寫。
+
+刻意保守的地方，每一條都有理由：
+  - 預設每次 10 人（龍蝦是 20）：這是最容易被判定為機器人的動作類型。
+  - **不是每個人都按讚**（機率 30–50%）：每個都按才像腳本。
+  - 人與人之間 20–60 秒：連續動作是最明顯的機器特徵。
+  - 一偵測到 action_blocked 立刻**中止整批**——已經被限制了還繼續按，
+    只會把限制拉長。已完成的部分照樣回報，不會整批白做。
+
+不做私訊、不做留言：那是騷擾的紅線，也是最快被檢舉的行為。
+
+用法：
+    python -m src.run_threads_follow --users a,b,c --max-follow 10 \
+        --headless --result-json out.json
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import random
+import sys
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+from src.meta_block import ACTION_BLOCKED, classify as classify_failure
+from src.run_threads_post import _debug_shot, _launch, DEFAULT_PROFILE
+from src.utils import human_sleep
+
+_JSON_PATH = None
+_RESULT = None
+
+PROFILE_URL = "https://www.threads.com/@{user}"
+DEFAULT_MAX_FOLLOW = 10
+HARD_CAP = 20                       # 再怎麼設定也不准超過
+
+_FOLLOW_LABELS = ["追蹤", "Follow"]
+_FOLLOWING_LABELS = ["追蹤中", "Following", "已追蹤"]
+LIKE_PROBABILITY = 0.4              # 不是每個都按——每個都按才像腳本
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[follow] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+def parse_users(arg: str) -> list[str]:
+    """逗號分隔 → 去 @、去空白、去重，保留順序。"""
+    seen, out = [], []
+    for raw in (arg or "").split(","):
+        u = raw.strip().lstrip("@")
+        if u and u not in seen:
+            seen.append(u)
+            out.append(u)
+    return out
+
+
+def effective_limit(requested: int | None) -> int:
+    """把設定值夾到合理範圍。上限是硬的——這種動作不該讓人隨手調到 100。"""
+    n = DEFAULT_MAX_FOLLOW if not requested or requested <= 0 else requested
+    return max(1, min(HARD_CAP, n))
+
+
+def _page_blocked(page) -> bool:
+    """頁面上出現平台的封鎖警告？"""
+    with contextlib.suppress(Exception):
+        body = page.evaluate("()=>document.body.innerText")[:4000]
+        return classify_failure(page_text=body) == ACTION_BLOCKED
+    return False
+
+
+def _human_browse(page, rounds: tuple[int, int] = (2, 4)) -> None:
+    """滑一滑再動作——直接進頁面就按追蹤，時間軸上太乾淨了。"""
+    for _ in range(random.randint(*rounds)):
+        page.mouse.wheel(0, random.randint(200, 600))
+        human_sleep(0.8, 2.0)
+
+
+def _maybe_like(page) -> bool:
+    """依機率對畫面上一篇貼文按讚。找不到就算了，不是必要動作。"""
+    if random.random() > LIKE_PROBABILITY:
+        return False
+    with contextlib.suppress(Exception):
+        btns = page.locator('svg[aria-label="讚"], svg[aria-label="Like"]')
+        n = btns.count()
+        if n == 0:
+            return False
+        el = btns.nth(random.randrange(min(n, 5)))
+        if el.is_visible():
+            el.click()
+            human_sleep(0.6, 1.5)
+            return True
+    return False
+
+
+def _follow_one(page, user: str) -> str:
+    """回 'followed' / 'already' / 'not_found' / 'blocked'。"""
+    page.goto(PROFILE_URL.format(user=user), wait_until="commit", timeout=45000)
+    human_sleep(2.0, 4.0)
+
+    if _page_blocked(page):
+        return "blocked"
+
+    # 已經追蹤過就別再點——會變成取消追蹤
+    for lab in _FOLLOWING_LABELS:
+        with contextlib.suppress(Exception):
+            if page.get_by_role("button", name=lab, exact=True).first.count() > 0:
+                return "already"
+
+    _human_browse(page)
+    liked = _maybe_like(page)
+    if liked:
+        human_sleep(1.0, 2.5)
+
+    btn = None
+    for lab in _FOLLOW_LABELS:
+        with contextlib.suppress(Exception):
+            cand = page.get_by_role("button", name=lab, exact=True).first
+            if cand.count() > 0 and cand.is_visible():
+                btn = cand
+                break
+    if btn is None:
+        return "not_found"
+
+    btn.click()
+    human_sleep(1.5, 3.0)
+    if _page_blocked(page):
+        return "blocked"
+
+    # 確認真的追蹤了（按鈕變成「追蹤中」）
+    for lab in _FOLLOWING_LABELS:
+        with contextlib.suppress(Exception):
+            if page.get_by_role("button", name=lab, exact=True).first.count() > 0:
+                _human_browse(page, (1, 2))       # 追蹤完再逛一下才離開
+                return "followed"
+    return "not_found"
+
+
+def do_follow(profile_dir: Path, users: list[str], max_follow: int,
+              headless: bool) -> dict:
+    from src.run_threads_post import _logged_in, THREADS_URL
+
+    pw = sync_playwright().start()
+    ctx, page = _launch(pw, profile_dir, headless=headless)
+    followed, skipped = [], []
+    blocked = False
+    try:
+        page.goto(THREADS_URL, wait_until="commit", timeout=60000)
+        human_sleep(2.0, 3.5)
+        if not _logged_in(page):
+            raise RuntimeError("尚未登入 Threads——先到帳號設定連結一次")
+
+        for i, user in enumerate(users):
+            if len(followed) >= max_follow:
+                break
+            try:
+                r = _follow_one(page, user)
+            except Exception as e:
+                skipped.append({"username": user, "why": str(e)[:80]})
+                continue
+
+            if r == "followed":
+                followed.append(user)
+                print(f"[follow] 已追蹤 @{user}（{len(followed)}/{max_follow}）", flush=True)
+            elif r == "blocked":
+                blocked = True
+                print("[follow] ⚠ 偵測到動作被限制，立即中止整批", flush=True)
+                _debug_shot(page, "follow_blocked")
+                break
+            else:
+                skipped.append({"username": user, "why": r})
+
+            if len(followed) < max_follow and i < len(users) - 1:
+                human_sleep(20, 60)       # 人與人之間拉長，連續動作最像機器
+        return {"followed": followed, "skipped": skipped, "blocked": blocked}
+    except Exception as e:
+        body = ""
+        with contextlib.suppress(Exception):
+            body = page.evaluate("()=>document.body.innerText")[:4000]
+        e.reason = classify_failure(page_text=body, error_text=str(e))
+        # 已經追蹤的部分不能白做，附在例外上讓上層記錄
+        e.partial = {"followed": followed, "skipped": skipped, "blocked": blocked}
+        raise
+    finally:
+        for close in (ctx.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser(description="Threads 追蹤潛在客戶")
+    ap.add_argument("--users", required=True, help="逗號分隔的帳號（不含 @）")
+    ap.add_argument("--max-follow", type=int, default=DEFAULT_MAX_FOLLOW)
+    ap.add_argument("--profile-dir", default=str(DEFAULT_PROFILE))
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--result-json")
+    args = ap.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {"schema": 1, "success": False, "error": "未完成",
+               "data": {"followed": [], "skipped": [], "blocked": False, "reason": ""}}
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    users = parse_users(args.users)
+    if not users:
+        _RESULT["error"] = "沒有可追蹤的帳號"
+        sys.exit(1)
+
+    try:
+        r = do_follow(Path(args.profile_dir).expanduser(), users,
+                      effective_limit(args.max_follow), args.headless)
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        _RESULT["data"].update(r)
+        print(f"[follow] ✅ 追蹤 {len(r['followed'])} 人、略過 {len(r['skipped'])} 人", flush=True)
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        _RESULT["data"].update(getattr(e, "partial", {}) or {})
+        _RESULT["data"]["reason"] = getattr(e, "reason", None) or classify_failure(error_text=str(e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

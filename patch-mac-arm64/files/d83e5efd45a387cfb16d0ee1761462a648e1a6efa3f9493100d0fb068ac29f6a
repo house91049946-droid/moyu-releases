@@ -1,0 +1,120 @@
+"""P27 附加平台發送：FB 主發後把同一物件順發到排程勾選的 Threads / IG。
+
+規則（見 SPEC-P27 / P28）：
+  - 序列執行（全域瀏覽器鎖本來就會排隊），每場次每平台最多 1 則。
+  - 附加平台失敗不影響 FB 結果、不重試——下一場次自然再發。
+  - IG 必帶圖：物件沒圖就跳過並在紀錄寫明，不算失敗。
+  - **被平台限制動作時停手一段時間**（P28）：暫停期內連瀏覽器都不開，
+    時間到自動恢復。停手也要留紀錄——安靜地不做事，客戶會以為功能壞了。
+  - 每平台各寫一筆 RunLog，摘要由 runlog_summary 組句。
+"""
+from .. import platform_block
+
+VALID_PLATFORMS = platform_block.VALID_PLATFORMS
+
+
+def _load_account_row():
+    """Threads/IG 的狀態列（單帳號產品只有一列）。拿不到就當成沒暫停。"""
+    from sqlalchemy import select
+    from ..database import SyncSession, ThreadsAccount
+    try:
+        with SyncSession() as s:
+            return s.execute(select(ThreadsAccount).order_by(ThreadsAccount.id)).scalars().first()
+    except Exception:
+        return None
+
+
+def _apply_block(platform: str, reason_text: str) -> int:
+    """把「被限制」寫進資料庫，回傳停幾小時。"""
+    from sqlalchemy import select
+    from ..database import SyncSession, ThreadsAccount
+    try:
+        with SyncSession() as s:
+            row = s.execute(select(ThreadsAccount).order_by(ThreadsAccount.id)).scalars().first()
+            if row is None:
+                return 0
+            hours = platform_block.mark_blocked(row, platform, reason_text)
+            s.commit()
+            return hours
+    except Exception:
+        return 0
+
+
+def _clear_block(platform: str) -> None:
+    from sqlalchemy import select
+    from ..database import SyncSession, ThreadsAccount
+    try:
+        with SyncSession() as s:
+            row = s.execute(select(ThreadsAccount).order_by(ThreadsAccount.id)).scalars().first()
+            if row is not None and getattr(row, f"{platform}_block_count", 0):
+                platform_block.clear_block(row, platform)
+                s.commit()
+    except Exception:
+        pass
+
+
+def _remember_post(account_id, platform: str, post_url: str) -> None:
+    """把剛發的 Threads／IG 貼文網址記進 post_history。
+
+    備份刪文（P32）只刪摸魚發的，靠的就是這張表：沒有這一筆，那則貼文以後就得靠
+    內文比對才認得出來——物件被刪掉之後就再也認不出來了。記不起來不影響發文。"""
+    if not post_url or not account_id:
+        return
+    try:
+        from ..database import SyncSession, PostHistory
+        with SyncSession() as s:
+            s.add(PostHistory(account_id=account_id,
+                              group_name="Threads" if platform == "threads" else "Instagram",
+                              post_url=post_url, status="success"))
+            s.commit()
+    except Exception as e:                  # 記不起來不能影響發文
+        print(f"[extra] 貼文網址沒記起來（不影響發文）：{str(e)[:80]}", flush=True)
+
+
+async def share_to_extras(platforms, title: str, text: str,
+                          image_paths: list[str], account_id, fbid: str = ""):
+    from ..fbauto_bridge import (
+        BridgeResult, create_run_log_sync, update_run_log_sync,
+        run_threads_share, run_ig_share,
+    )
+    acc_row = _load_account_row()
+
+    for plat in [p for p in VALID_PLATFORMS if p in (platforms or [])]:
+        log_id = create_run_log_sync(f"{plat}_post", fbid, account_id)
+        try:
+            # 平台被限制中 → 這一輪不碰它（連瀏覽器都不開）
+            if platform_block.is_blocked(acc_row, plat):
+                note = platform_block.block_note(acc_row, plat)
+                update_run_log_sync(
+                    log_id, BridgeResult(success=True, data={"paused": True, "note": note}),
+                    context={"title": title})
+                print(f"[extra] {title}：{note}", flush=True)
+                continue
+
+            if plat == "ig" and not image_paths:
+                update_run_log_sync(
+                    log_id, BridgeResult(success=True, data={"skipped": True}),
+                    context={"title": title})
+                print(f"[extra] {title}：沒有圖片，IG 略過", flush=True)
+                continue
+
+            if plat == "threads":
+                r = await run_threads_share(text, image_paths)
+            else:
+                r = await run_ig_share(text, image_paths)
+        except Exception as e:              # 附加平台絕不能把主流程炸掉
+            r = BridgeResult(success=False, error=str(e))
+
+        update_run_log_sync(log_id, r, context={"title": title})
+        _remember_post(account_id, plat, (r.data or {}).get("post_url", "") if r.success else "")
+
+        # 依這次的結果調整暫停狀態
+        reason = (r.data or {}).get("reason", "")
+        if r.success:
+            _clear_block(plat)              # 發成功＝限制解除
+        elif reason == "action_blocked":
+            hours = _apply_block(plat, r.error or "帳號動作被限制")
+            acc_row = _load_account_row()   # 重讀，同一輪的下一個平台看得到最新狀態
+            print(f"[extra] ⚠ {plat} 動作被限制，暫停 {hours} 小時", flush=True)
+
+        print(f"[extra] {title} → {plat}：{'成功' if r.success else r.error}", flush=True)

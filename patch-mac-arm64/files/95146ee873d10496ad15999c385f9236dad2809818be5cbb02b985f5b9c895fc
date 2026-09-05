@@ -1,0 +1,54 @@
+"""失敗原因判斷（SPEC-P28）：分得出「登入過期」與「動作被限制」。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_meta_block.py -v
+
+誤判成 action_blocked 的代價是功能無故停 24 小時，所以寧可漏判也不能亂判。
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import meta_block as m  # noqa: E402
+
+
+class Test動作被限制:
+    def test_中文警告(self):
+        assert m.classify(page_text="很抱歉，你的動作已遭封鎖") == m.ACTION_BLOCKED
+
+    def test_英文警告(self):
+        assert m.classify(page_text="Action Blocked. We restrict certain activity") == m.ACTION_BLOCKED
+
+    def test_限制特定活動(self):
+        assert m.classify(page_text="我們限制了特定活動以保護社群") == m.ACTION_BLOCKED
+
+    def test_該停手(self):
+        assert m.is_blocking(m.ACTION_BLOCKED) is True
+
+
+class Test其他原因:
+    def test_節流不算封鎖(self):
+        """節流是短期的，下一個場次本來就過了——不該停 24 小時。"""
+        r = m.classify(page_text="你的動作太快，請稍後再試")
+        assert r in (m.RATE_LIMITED, m.ACTION_BLOCKED)
+        assert m.is_blocking(m.RATE_LIMITED) is False
+
+    def test_登入過期(self):
+        assert m.classify(page_text="登入 Instagram\n忘記密碼？") == m.LOGGED_OUT
+
+    def test_版面改了(self):
+        """我們自己丟的「找不到按鈕」＝平台改版，是我們要修，不是客戶的錯。"""
+        assert m.classify(error_text="找不到「發佈」按鈕（截圖：/tmp/x.png）") == m.LAYOUT_CHANGED
+
+
+class Test不亂判:
+    def test_一般網路錯誤是unknown(self):
+        assert m.classify(error_text="Timeout 30000ms exceeded") == m.UNKNOWN
+
+    def test_空輸入是unknown(self):
+        assert m.classify() == m.UNKNOWN
+
+    def test_正常頁面不會被判成封鎖(self):
+        normal = "為你推薦\n追蹤中\n大安區三房 開價 1750 萬\n讚 回應 分享"
+        assert m.classify(page_text=normal) == m.UNKNOWN
+        assert m.is_blocking(m.classify(page_text=normal)) is False

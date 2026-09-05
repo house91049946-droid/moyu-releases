@@ -1,0 +1,494 @@
+"""Threads 發文 CLI（v1：單帳號、單則貼文、可帶圖）。
+
+背景：老闆想把 Threads 當第二個曝光渠道。mini 上的 workspace-threads 是
+**爬蟲**套件（crawl/classify/auto-follow），沒有發文能力——所以這支是新寫的，
+只借它兩件事：threads.net 的 aria-label 是中英雙語、以及「手動登入一次、
+之後吃 session」的模式。
+
+設計比照本專案其他 CLI（run_import_url 等）：
+  - --result-json + atexit：任何路徑掛掉都留下結果與原因
+  - 真人化輸入（utils.human_type）、真 Chrome、亂數停頓
+  - 用**獨立的持久化 profile**（不吃 FB 的 cookie profile）：Threads 走
+    Instagram 帳號體系，跟 FB 自動化的登入態分開，一邊出事不拖累另一邊
+
+用法：
+    # 第一次：開視窗手動登入（登入態存在 profile，之後不用再登）
+    python -m src.run_threads_post --login
+
+    # 發文
+    python -m src.run_threads_post --text "文案內容" \
+        [--images a.jpg,b.jpg] [--headless] [--result-json out.json]
+
+已知限制（v1 刻意不做）：
+  - 不切長文為串文（超過 500 字直接截斷並在結果標記 truncated）
+  - 不排程、不進 UI——那是產品層決策，等拍板再接進 backend
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import sys
+import time
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+from src.meta_block import classify as classify_failure
+from src.paths import DATA_DIR
+from src.utils import human_sleep, human_type, native_chrome_executable, raise_fd_limit
+
+_JSON_PATH = None
+_RESULT = None
+
+THREADS_URL = "https://www.threads.net/"
+TEXT_LIMIT = 500                    # Threads 單則上限
+DEFAULT_PROFILE = DATA_DIR / "threads_profile"
+
+# aria-label 中英雙語都認（介面語言跟帳號設定走）
+_COMPOSE_LABELS = ["建立", "Create", "新增串文", "New thread"]
+_POST_LABELS = ["發佈", "Post", "張貼"]
+
+
+def clip_text(text: str, limit: int = TEXT_LIMIT) -> tuple[str, bool]:
+    """裁到單則上限。回 (裁後文字, 是否被截斷)。
+
+    截在字元邊界就好——Threads 是逐字元計數；盡量往回找換行/空白收尾，
+    免得句子斷在半路。
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text, False
+    cut = text[:limit]
+    for sep in ("\n", "。", "！", "？", " "):
+        i = cut.rfind(sep)
+        if i >= limit * 0.6:            # 太前面就不值得回退
+            return cut[:i + 1].rstrip(), True
+    return cut, True
+
+
+def parse_images(arg: str) -> list[Path]:
+    """逗號分隔的圖片路徑 → 存在的檔案清單。任何一張不存在就整批報錯，
+    寧可不發也不要少圖發出去（房仲的圖是賣點）。"""
+    if not arg:
+        return []
+    out = []
+    for raw in arg.split(","):
+        p = Path(raw.strip()).expanduser()
+        if not p.is_file():
+            raise FileNotFoundError(f"找不到圖片：{p}")
+        out.append(p)
+    return out[:10]                     # Threads 上限 10 張
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[threads] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+def _launch(pw, profile_dir: Path, headless: bool):
+    """持久化 context：登入態就活在 profile_dir，一次登入之後都免登。"""
+    print(f"[threads] fd 上限：{raise_fd_limit()}", flush=True)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    kw = dict(
+        headless=headless,
+        locale="zh-TW", timezone_id="Asia/Taipei",
+        viewport={"width": 1280, "height": 900},
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    native = native_chrome_executable()
+    if native:
+        kw["executable_path"] = str(native)
+    else:
+        with contextlib.suppress(Exception):
+            kw["channel"] = "chrome"
+    try:
+        ctx = pw.chromium.launch_persistent_context(str(profile_dir), **kw)
+    except Exception:
+        kw.pop("channel", None); kw.pop("executable_path", None)
+        ctx = pw.chromium.launch_persistent_context(str(profile_dir), **kw)
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>false});")
+    return ctx, page
+
+
+def _find_by_labels(scope, labels: list[str], roles=("button", "link")):
+    """依 aria-label（中英）找可點元素。scope 可以是 page 或 locator（限定在
+    對話框內找，避免 aria-label*="Post" 撈到動態牆上的貼文）。找不到回 None。"""
+    for lab in labels:
+        for sel in (f'[aria-label="{lab}"]', f'[aria-label*="{lab}"]'):
+            with contextlib.suppress(Exception):
+                el = scope.locator(sel).first
+                if el.count() > 0 and el.is_visible():
+                    return el
+    # 退路：role=button 內文比對
+    with contextlib.suppress(Exception):
+        for lab in labels:
+            el = scope.get_by_role("button", name=lab).first
+            if el.count() > 0 and el.is_visible():
+                return el
+    return None
+
+
+def _debug_shot(page, tag: str) -> str:
+    """失敗現場截圖，路徑進錯誤訊息，遠端排查不用開視窗。
+
+    寫進 debug/ 子目錄而不是 data 根目錄：備份是照頂層目錄名排除的，
+    散在根目錄的檔案會被一起打包進客戶的備份檔（2026-08-31 實測到）。
+    """
+    out = DATA_DIR / "debug" / f"threads_{tag}.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(Exception):
+        page.screenshot(path=str(out), full_page=False)
+        return str(out)
+    return ""
+
+
+def _logged_in(page) -> bool:
+    """有「建立」入口＝已登入；出現登入按鈕＝未登入。"""
+    if _find_by_labels(page, _COMPOSE_LABELS):
+        return True
+    with contextlib.suppress(Exception):
+        if page.locator('a[href*="/login"]').first.is_visible():
+            return False
+    # 兩者都判不出來：看有沒有自己的頭像列
+    with contextlib.suppress(Exception):
+        return page.locator('[aria-label="個人檔案"], [aria-label="Profile"]').first.count() > 0
+    return False
+
+
+def parse_username(href: str) -> str:
+    """個人頁連結 → 帳號名（不含 @）。'/@fs_123?x=1' → 'fs_123'。"""
+    href = (href or "").split("?")[0].strip("/")
+    return href[1:] if href.startswith("@") else ""
+
+
+def _current_username(page) -> str:
+    """左欄「個人檔案」入口的 href 就是自己的帳號頁（2026-08-29 實測）。"""
+    with contextlib.suppress(Exception):
+        href = page.evaluate(
+            """()=>{const a=document.querySelector("a[href^='/@']");"""
+            """return a?a.getAttribute("href"):""}""")
+        return parse_username(href)
+    return ""
+
+
+def do_login(profile_dir: Path) -> dict:
+    """開視窗給人手動登入，登入完成自動存好（persistent profile）。"""
+    pw = sync_playwright().start()
+    ctx, page = _launch(pw, profile_dir, headless=False)
+    try:
+        page.goto(THREADS_URL, wait_until="commit", timeout=60000)
+        print("[threads] 請在開啟的視窗登入 Threads（用 Instagram 帳號）。", flush=True)
+        print("[threads] 登入完成後這裡會自動偵測，最多等 5 分鐘。", flush=True)
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            page.wait_for_timeout(3000)
+            if _logged_in(page):
+                user = _current_username(page)
+                print(f"[threads] ✅ 已登入 @{user or '?'}，登入態已存在 profile，"
+                      "之後發文不用再登。", flush=True)
+                return {"logged_in": True, "username": user}
+        print("[threads] ❌ 等不到登入完成（5 分鐘）。", flush=True)
+        return {"logged_in": False, "username": ""}
+    finally:
+        for close in (ctx.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+def do_open(profile_dir: Path, url: str, max_minutes: int = 30, label: str = "Threads") -> dict:
+    """用系統存的登入態開一個**有視窗**的瀏覽器給人用（看通知、處理驗證、
+    手動操作），關掉視窗就結束；最多開 max_minutes 分鐘後自動關。
+
+    為什麼要有時限：視窗開著期間 profile 被占用，排程的 Threads/IG 發文會
+    因為 SingletonLock 起不來。客戶忘了關就會靜靜地錯過好幾場——
+    所以到時自動關，UI 也要講清楚。
+    """
+    pw = sync_playwright().start()
+    ctx, page = _launch(pw, profile_dir, headless=False)
+    try:
+        page.goto(url, wait_until="commit", timeout=60000)
+        print(f"[{label}] 已開啟登入視窗，關閉視窗即結束；最多 {max_minutes} 分鐘後自動關閉。", flush=True)
+        deadline = time.time() + max_minutes * 60
+        closed_by_user = False
+        while time.time() < deadline:
+            # is_closed() 是本地狀態不打瀏覽器，不會插隊客戶正在做的事
+            if page.is_closed() or not ctx.pages:
+                closed_by_user = True
+                break
+            time.sleep(1)
+        print(f"[{label}] {'視窗已由使用者關閉' if closed_by_user else '時間到，自動關閉'}", flush=True)
+        return {"opened": True, "closed_by_user": closed_by_user,
+                "minutes": round((time.time() - (deadline - max_minutes * 60)) / 60, 1)}
+    finally:
+        for close in (ctx.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+def do_check(profile_dir: Path, headless: bool = True) -> dict:
+    """探測登入態（不發文）。未登入不是錯誤——回 logged_in=False 讓上層決定。"""
+    pw = sync_playwright().start()
+    ctx, page = _launch(pw, profile_dir, headless=headless)
+    try:
+        page.goto(THREADS_URL, wait_until="commit", timeout=60000)
+        human_sleep(2.5, 4.5)
+        if not _logged_in(page):
+            print("[threads] 登入態無效或尚未登入。", flush=True)
+            return {"logged_in": False, "username": ""}
+        user = _current_username(page)
+        print(f"[threads] 登入有效：@{user or '?'}", flush=True)
+        return {"logged_in": True, "username": user}
+    finally:
+        for close in (ctx.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+def _newest_post_url(page) -> str:
+    """回自己的個人頁，抓最上面那則貼文的網址（剛發的那則）。抓不到回空字串。
+
+    2026-09-05 實測：直接開首頁抓 a[href*='/post/'] 會抓到別人的貼文（或什麼都抓不到），
+    所以要先讀出自己的帳號名再進 /@自己，並且只認網址裡是自己的那幾條。
+    """
+    with contextlib.suppress(Exception):
+        user = _current_username(page)
+        if not user:
+            page.goto(THREADS_URL, wait_until="domcontentloaded", timeout=45000)
+            human_sleep(2.0, 3.0)
+            user = _current_username(page)
+        if not user:
+            return ""
+        page.goto(f"https://www.threads.com/@{user}", wait_until="domcontentloaded", timeout=45000)
+        human_sleep(3.0, 4.5)
+        href = page.evaluate(
+            "(u)=>{const a=[...document.querySelectorAll(\"a[href*='/post/']\")]"
+            ".find(x=>(x.getAttribute('href')||'').startsWith('/@'+u+'/post/'));"
+            "return a?a.href:''}", user) or ""
+        return href.split("?")[0]
+    return ""
+
+
+def do_post(profile_dir: Path, text: str, images: list[Path],
+            headless: bool, dry_run: bool = False,
+            import_cookies: str = "") -> dict:
+    pw = sync_playwright().start()
+    ctx, page = _launch(pw, profile_dir, headless=headless)
+    try:
+        if import_cookies:
+            # 一次性：把外部（例如爬蟲存的）Playwright cookies 餵進 profile
+            cookies = json.loads(Path(import_cookies).read_text(encoding="utf-8"))
+            if isinstance(cookies, dict):
+                cookies = cookies.get("cookies", [])
+            ctx.add_cookies(cookies)
+            print(f"[threads] 已匯入 {len(cookies)} 個 cookie", flush=True)
+        page.goto(THREADS_URL, wait_until="commit", timeout=60000)
+        human_sleep(2.5, 4.5)
+        if not _logged_in(page):
+            raise RuntimeError("尚未登入 Threads——先跑一次 --login（會開視窗讓你手動登入）")
+
+        compose = _find_by_labels(page, _COMPOSE_LABELS)
+        if not compose:
+            raise RuntimeError("找不到「建立」按鈕，Threads 版面可能改了")
+        compose.click()
+        human_sleep(1.2, 2.4)
+
+        # 對話框裡的輸入區：contenteditable
+        box = page.locator('div[role="dialog"] [contenteditable="true"]').first
+        if box.count() == 0:
+            box = page.locator('[contenteditable="true"]').first
+        if box.count() == 0:
+            raise RuntimeError("找不到輸入框，Threads 版面可能改了")
+        box.click()
+        human_sleep(0.5, 1.2)
+        human_type(page, text, max_chars=TEXT_LIMIT + 10)
+
+        if images:
+            file_input = page.locator('div[role="dialog"] input[type="file"]').first
+            if file_input.count() == 0:
+                file_input = page.locator('input[type="file"]').first
+            if file_input.count() == 0:
+                raise RuntimeError("找不到圖片上傳入口")
+            file_input.set_input_files([str(p) for p in images])
+            # 等縮圖出現（每張給一點時間）
+            human_sleep(1.5 + len(images), 3.0 + len(images))
+
+        if dry_run:
+            print("[threads] dry-run：流程驗證完成（登入態✓、發文框✓、輸入✓），不按發佈", flush=True)
+            return {"posted": False, "dry_run": True, "images": len(images)}
+
+        # 發佈鈕不能全頁搜尋：動態牆頂端的快速發文列也有一顆「發佈」，
+        # 會誤點。先逐層找「含輸入框的那個對話框」，在裡面找。
+        post_btn = None
+        dialogs = page.locator('div[role="dialog"]')
+        for i in range(dialogs.count()):
+            d = dialogs.nth(i)
+            if d.locator('[contenteditable="true"]').count() == 0:
+                continue
+            cand = _find_by_labels(d, _POST_LABELS)
+            if not cand:
+                with contextlib.suppress(Exception):
+                    c = d.get_by_text("發佈", exact=True).last
+                    if c.count() > 0 and c.is_visible():
+                        cand = c
+            if cand:
+                post_btn = cand
+                break
+        if not post_btn:
+            # 幾何退路：發文視窗浮在頁面下方，取最下面那顆可見「發佈」
+            # （快速發文列那顆在最上面）。
+            with contextlib.suppress(Exception):
+                best, best_y = None, -1.0
+                cands = page.get_by_text("發佈", exact=True)
+                for i in range(cands.count()):
+                    c = cands.nth(i)
+                    if not c.is_visible():
+                        continue
+                    bb = c.bounding_box()
+                    if bb and bb["y"] > best_y:
+                        best, best_y = c, bb["y"]
+                post_btn = best
+        if not post_btn or (hasattr(post_btn, "count") and post_btn.count() == 0):
+            shot = _debug_shot(page, "no_post_btn")
+            raise RuntimeError(f"找不到「發佈」按鈕（截圖：{shot}）")
+        post_btn.click()
+
+        # 成功判定：發文視窗收掉＝輸入框裡再也找不到剛打的字
+        probe = text[:20]
+        deadline = time.time() + 30
+        posted = False
+        while time.time() < deadline:
+            page.wait_for_timeout(1000)
+            still_open = False
+            with contextlib.suppress(Exception):
+                boxes = page.locator('[contenteditable="true"]')
+                for i in range(boxes.count()):
+                    b = boxes.nth(i)
+                    if b.is_visible() and probe in (b.inner_text() or ""):
+                        still_open = True
+                        break
+            if not still_open:
+                posted = True
+                break
+        if not posted:
+            shot = _debug_shot(page, "dialog_stuck")
+            raise RuntimeError(f"按了發佈但對話框沒關閉——可能被擋或網路慢（截圖：{shot}）")
+        human_sleep(2.0, 4.0)
+        # 順手把剛發那則的網址記下來：備份刪文要靠它認出「這是摸魚發的」（P32，2026-09-05）。
+        # 抓不到就算了，絕不能因此把一次成功的發文變成失敗。
+        return {"posted": True, "images": len(images), "post_url": _newest_post_url(page)}
+    except Exception as e:
+        # 失敗當下的頁面文字才是最準的訊號：「動作已遭封鎖」只會出現在畫面上，
+        # 例外訊息裡沒有。抓不到就算了，classify 會退回 unknown。
+        body = ""
+        with contextlib.suppress(Exception):
+            body = page.evaluate("()=>document.body.innerText")[:4000]
+        e.reason = classify_failure(page_text=body, error_text=str(e))
+        raise
+    finally:
+        for close in (ctx.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser(description="Threads 發文")
+    ap.add_argument("--login", action="store_true", help="開視窗手動登入一次")
+    ap.add_argument("--open", action="store_true",
+                    help="用存好的登入態開視窗給人用（最多 --open-minutes 分鐘）")
+    ap.add_argument("--open-minutes", type=int, default=30)
+    ap.add_argument("--check", action="store_true",
+                    help="探測登入態並回報帳號名（不發文）")
+    ap.add_argument("--text", default="", help="貼文內容（超過 500 字會截斷）")
+    ap.add_argument("--images", default="", help="逗號分隔的圖片路徑，最多 10 張")
+    ap.add_argument("--profile-dir", default=str(DEFAULT_PROFILE))
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="走完整流程但不按發佈（驗證登入態與版面用）")
+    ap.add_argument("--import-cookies", default="",
+                    help="從 Playwright cookies JSON 匯入登入態到 profile（一次性）")
+    ap.add_argument("--result-json")
+    args = ap.parse_args()
+
+    profile_dir = Path(args.profile_dir).expanduser()
+
+    if args.open:
+        _JSON_PATH = args.result_json
+        _RESULT = {"schema": 1, "success": False, "error": "未完成",
+                   "data": {"opened": False, "closed_by_user": False, "minutes": 0}}
+        if _JSON_PATH:
+            atexit.register(_write)
+        try:
+            r = do_open(profile_dir, THREADS_URL, max(1, min(180, args.open_minutes)))
+            _RESULT["success"] = True
+            _RESULT["error"] = ""
+            _RESULT["data"].update(r)
+            sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as e:
+            _RESULT["error"] = str(e)
+            sys.exit(1)
+
+    if args.login or args.check:
+        # 兩者都是「狀態動作」：result JSON 形狀相同，後端好共用解析
+        _JSON_PATH = args.result_json
+        _RESULT = {"schema": 1, "success": False, "error": "未完成",
+                   "data": {"logged_in": False, "username": ""}}
+        if _JSON_PATH:
+            atexit.register(_write)
+        try:
+            r = (do_login(profile_dir) if args.login
+                 else do_check(profile_dir, headless=args.headless))
+            # --check 探測到未登入是正常結果；--login 等不到人算失敗
+            ok = r["logged_in"] or args.check
+            _RESULT["success"] = ok
+            _RESULT["error"] = "" if ok else "等不到登入完成（5 分鐘）"
+            _RESULT["data"].update(r)
+            sys.exit(0 if ok else 1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            _RESULT["error"] = str(e)
+            sys.exit(1)
+
+    _JSON_PATH = args.result_json
+    _RESULT = {"schema": 1, "success": False, "error": "未完成",
+               "data": {"posted": False, "truncated": False, "images": 0}}
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    if not args.text.strip():
+        _RESULT["error"] = "沒有 --text 內容可發"
+        sys.exit(1)
+    try:
+        images = parse_images(args.images)
+    except FileNotFoundError as e:
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+
+    text, truncated = clip_text(args.text)
+    _RESULT["data"]["truncated"] = truncated
+
+    try:
+        r = do_post(profile_dir, text, images, headless=args.headless,
+                    dry_run=args.dry_run, import_cookies=args.import_cookies)
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        _RESULT["data"].update(r)
+        if r.get("dry_run"):
+            sys.exit(0)
+        print(f"[threads] ✅ 已發佈（{len(images)} 張圖"
+              f"{'，文字有截斷' if truncated else ''}）", flush=True)
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        _RESULT["data"]["reason"] = getattr(e, "reason", None) or classify_failure(error_text=str(e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

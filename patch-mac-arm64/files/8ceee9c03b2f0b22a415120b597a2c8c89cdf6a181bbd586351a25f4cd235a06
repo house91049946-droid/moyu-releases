@@ -1,0 +1,59 @@
+"""Threads / IG 失敗原因判斷（SPEC-P28）。
+
+為什麼要分類：現在發文失敗只留下一行「發到 IG 失敗」，但「登入過期」和
+「帳號動作被限制」是完全不同的兩件事——前者重登就好，後者再試只會把帳號
+推向更嚴重的限制。分不出來，系統就會每天照樣重試，客戶還不知道發生什麼。
+
+判斷依據是頁面上出現的文字（中英雙語）。這種比對一定會有漏網，所以：
+  - 判不出來就回 unknown，照舊記錄，不亂猜；
+  - 寧可漏判（當成一般失敗）也不要誤判成 action_blocked——誤判會讓功能
+    無故停 24 小時，客戶會以為壞了。
+"""
+
+# reason 常數（與 backend/app/scheduler/extra_share.py 共用同一組字串）
+LOGGED_OUT = "logged_out"
+ACTION_BLOCKED = "action_blocked"
+RATE_LIMITED = "rate_limited"
+LAYOUT_CHANGED = "layout_changed"
+UNKNOWN = "unknown"
+
+# 順序有意義：由重到輕，先命中的優先
+_RULES = [
+    (ACTION_BLOCKED, (
+        "動作已遭封鎖", "動作遭到封鎖", "我們限制了特定活動", "限制了你的部分活動",
+        "你已被暫時封鎖", "暫時停用這項功能", "帳號已被停用",
+        "Action Blocked", "We restrict certain activity",
+        "temporarily blocked", "temporarily restricted", "Your account has been disabled",
+    )),
+    (RATE_LIMITED, (
+        "你的動作太快", "動作太頻繁", "請稍後再試", "稍後再試一次",
+        "Slow down", "Try Again Later", "Please wait a few minutes",
+    )),
+    (LOGGED_OUT, (
+        "登入 Instagram", "登入 Threads", "忘記密碼", "建立新帳號",
+        "Log in to Instagram", "Log in to Threads", "Forgot password", "Create new account",
+    )),
+]
+
+# 我們自己丟的例外訊息（找不到按鈕之類）＝版面改了，不是帳號的問題
+_LAYOUT_HINTS = ("找不到", "版面可能改了", "沒關閉")
+
+
+def classify(page_text: str = "", error_text: str = "") -> str:
+    """回傳 reason 字串。page_text 是失敗當下的頁面文字，error_text 是例外訊息。"""
+    blob = f"{page_text}\n{error_text}"
+    for reason, keys in _RULES:
+        if any(k.lower() in blob.lower() for k in keys):
+            return reason
+    # 頁面上沒有平台的警告字樣，但我們自己報「找不到某元素」→ 版面改了
+    if any(h in (error_text or "") for h in _LAYOUT_HINTS):
+        return LAYOUT_CHANGED
+    return UNKNOWN
+
+
+def is_blocking(reason: str) -> bool:
+    """這個原因該不該讓系統停手一段時間。
+
+    rate_limited 不算：那是短期節流，下一個場次（幾小時後）本來就過了。
+    """
+    return reason == ACTION_BLOCKED

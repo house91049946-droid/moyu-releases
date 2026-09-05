@@ -1,0 +1,239 @@
+"""清單匯入的解析規則（純函式，不碰瀏覽器也不連網）。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_import_parse.py -v
+
+測試資料是實際從樂屋網店鋪頁抓下來的卡片文字行。
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.import_parse import (  # noqa: E402
+    find_store_url, is_listing_page, next_page_url,
+    http_error_message, normalize_item_url, parse_cards, parse_price,
+    pick_list_page,
+)
+
+# 實際抓到的三張卡片（開頭的 "25" 是相片張數徽章，不是資料）
+REAL_CARDS = [
+    {"url": "https://www.rakuya.com.tw/sell_item/info?ehid=0cdaa9352192812&from=list_gaze",
+     "lines": ["25", "捷運六張犁站電梯雙面採光景觀宅✨101世貿、有管理",
+               "台北市大安區基隆路二段", "1750萬", "電梯大廈", "1房2廳1衛",
+               "14.36坪", "屋齡17.6年"]},
+    {"url": "https://www.rakuya.com.tw/sell_item/info?ehid=08464935218064a",
+     "lines": ["25", "中正至美☀️電梯邊間採光三房☀️一層2戶✨有車位",
+               "台北市中正區泉州街", "3380萬", "華廈", "3房2廳2衛",
+               "47.5坪", "屋齡18.8年"]},
+    {"url": "https://www.rakuya.com.tw/sell_item/info?ehid=004a67352209234",
+     "lines": ["25", "專任️✨新店指標豪邸面山✨園上園✨近七張站、有車位",
+               "新北市新店區中興路二段", "3468萬", "電梯大廈", "2房2廳2衛",
+               "56.52坪", "屋齡17.2年"]},
+]
+
+
+class Test價格:
+    def test_萬元轉數字(self):
+        assert parse_price("1750萬") == 17500000
+
+    def test_帶千分位與前綴(self):
+        assert parse_price("總價 1,288 萬") == 12880000
+
+    def test_元(self):
+        assert parse_price("12880000 元") == 12880000
+
+    def test_抓不到回零(self):
+        assert parse_price("價格面議") == 0
+        assert parse_price("") == 0
+
+
+class Test網址正規化:
+    def test_砍掉追蹤參數只留ehid(self):
+        """同一物件從不同入口進來要是同一個字串，否則「已匯入」永遠比對不到。"""
+        a = normalize_item_url(
+            "https://www.rakuya.com.tw/sell_item/info?ehid=0cdaa9352192812&from=list_gaze")
+        b = normalize_item_url(
+            "https://www.rakuya.com.tw/sell_item/info?ehid=0cdaa9352192812&from=item_onfire")
+        assert a == b == "https://www.rakuya.com.tw/sell_item/info?ehid=0cdaa9352192812"
+
+    def test_不是物件頁回空字串(self):
+        assert normalize_item_url("https://vip.rakuya.com.tw/0932641004") == ""
+        assert normalize_item_url("") == ""
+
+    def test_出租物件仍可辨識(self):
+        """要留得下來才有辦法在下一關被濾掉。"""
+        u = normalize_item_url("https://www.rakuya.com.tw/rent_item/info?ehid=abc123")
+        assert "rent_item" in u
+
+
+class Test卡片解析:
+    def test_三張卡片欄位都對(self):
+        items = parse_cards(REAL_CARDS)
+        assert len(items) == 3
+        first = items[0]
+        assert first["title"] == "捷運六張犁站電梯雙面採光景觀宅✨101世貿、有管理"
+        assert first["address"] == "台北市大安區基隆路二段"
+        assert first["price_text"] == "1750萬"
+        assert first["price"] == 17500000
+        assert first["type"] == "電梯大廈"
+        assert first["layout"] == "1房2廳1衛"
+        assert first["area"] == "14.36坪"
+        assert first["age"] == "屋齡17.6年"
+
+    def test_相片張數徽章不會變成標題(self):
+        assert all(i["title"] != "25" for i in parse_cards(REAL_CARDS))
+
+    def test_網址已正規化(self):
+        assert all("from=" not in i["url"] for i in parse_cards(REAL_CARDS))
+
+    def test_出租物件被濾掉(self):
+        raw = REAL_CARDS + [{
+            "url": "https://www.rakuya.com.tw/rent_item/info?ehid=zzz",
+            "lines": ["10", "捷運宅雅房出租", "台北市大安區和平東路", "1.2萬", "公寓"]}]
+        assert len(parse_cards(raw)) == 3
+
+    def test_同一物件只留一筆(self):
+        raw = REAL_CARDS + [{
+            "url": "https://www.rakuya.com.tw/sell_item/info?ehid=0cdaa9352192812&from=別的入口",
+            "lines": REAL_CARDS[0]["lines"]}]
+        assert len(parse_cards(raw)) == 3
+
+    def test_欄位缺了也不會壞(self):
+        """版面改了、只剩標題時仍要能勾選匯入——網址才是真正必要的東西。"""
+        items = parse_cards([{
+            "url": "https://www.rakuya.com.tw/sell_item/info?ehid=zzz1",
+            "lines": ["只剩一行標題"]}])
+        assert len(items) == 1
+        assert items[0]["title"] == "只剩一行標題"
+        assert items[0]["price"] == 0
+        assert items[0]["address"] == ""
+
+    def test_沒有網址的整筆丟掉(self):
+        assert parse_cards([{"url": "", "lines": ["標題"]}]) == []
+
+
+class Test店家入口:
+    def test_優先用vip網域(self):
+        links = [
+            {"href": "https://www.rakuya.com.tw/sell_item/info?ehid=a", "text": "其他物件"},
+            {"href": "https://vip.rakuya.com.tw/0932641004", "text": "進入店鋪"},
+        ]
+        assert find_store_url(links) == "https://vip.rakuya.com.tw/0932641004"
+
+    def test_退回文字比對(self):
+        links = [{"href": "https://example.com/agent/42", "text": "查看他的其他物件"}]
+        assert find_store_url(links) == "https://example.com/agent/42"
+
+    def test_不會把物件頁當成店家頁(self):
+        """物件頁的『其他物件』錨點指向另一個物件時，跟進去會抓成單一物件。"""
+        links = [{"href": "https://www.rakuya.com.tw/sell_item/info?ehid=b",
+                  "text": "其他物件"}]
+        assert find_store_url(links) == ""
+
+    def test_找不到回空字串(self):
+        assert find_store_url([{"href": "https://example.com/", "text": "首頁"}]) == ""
+
+
+class Test清單頁判定與分頁:
+    def test_夠多物件連結就算清單頁(self):
+        urls = [f"https://www.rakuya.com.tw/sell_item/info?ehid=e{i}" for i in range(6)]
+        assert is_listing_page(urls) is True
+
+    def test_物件詳情頁不算清單頁(self):
+        """詳情頁通常只帶一兩個推薦物件連結。"""
+        urls = ["https://www.rakuya.com.tw/sell_item/info?ehid=a",
+                "https://www.rakuya.com.tw/sell_item/info?ehid=b"]
+        assert is_listing_page(urls) is False
+
+    def test_同一物件重複出現不算數(self):
+        urls = ["https://www.rakuya.com.tw/sell_item/info?ehid=a&from=x"] * 8
+        assert is_listing_page(urls) is False
+
+    def test_加上分頁參數(self):
+        assert next_page_url("https://vip.rakuya.com.tw/0932641004", 2) == \
+            "https://vip.rakuya.com.tw/0932641004?page=2"
+
+    def test_保留原有參數並覆蓋page(self):
+        got = next_page_url("https://vip.rakuya.com.tw/0932641004?sort=11&page=2", 3)
+        assert "sort=11" in got and "page=3" in got and "page=2" not in got
+
+
+class Test決定去哪一頁抓清單:
+    """順序錯了會抓回一堆別人的物件——這是實測踩到的坑，值得單獨一組測試。"""
+
+    def test_有店家連結就跟著走(self):
+        links = [{"href": "https://vip.rakuya.com.tw/0932641004", "text": "進入店鋪"}]
+        got = pick_list_page("https://www.rakuya.com.tw/sell_item/info?ehid=a", links)
+        assert got == "https://vip.rakuya.com.tw/0932641004"
+
+    def test_詳情頁的推薦物件不可以被當成清單頁(self):
+        """詳情頁上「周邊物件」動輒十幾個連結，數量判斷會整個誤判。"""
+        links = [{"href": f"https://www.rakuya.com.tw/sell_item/info?ehid=n{i}",
+                  "text": "推薦物件"} for i in range(19)]
+        assert pick_list_page("https://www.rakuya.com.tw/sell_item/info?ehid=a", links) == ""
+
+    def test_店家連結優先於數量判斷(self):
+        links = [{"href": f"https://www.rakuya.com.tw/sell_item/info?ehid=n{i}",
+                  "text": "推薦物件"} for i in range(19)]
+        links.append({"href": "https://vip.rakuya.com.tw/0932641004", "text": "進入店鋪"})
+        got = pick_list_page("https://www.rakuya.com.tw/sell_item/info?ehid=a", links)
+        assert got == "https://vip.rakuya.com.tw/0932641004"
+
+    def test_直接貼清單頁也吃得下(self):
+        url = "https://vip.rakuya.com.tw/0932641004"
+        links = [{"href": f"https://www.rakuya.com.tw/sell_item/info?ehid=n{i}", "text": ""}
+                 for i in range(20)]
+        assert pick_list_page(url, links) == url
+
+    def test_既不是物件頁也沒有清單就回空字串(self):
+        assert pick_list_page("https://www.google.com", [{"href": "https://x/", "text": "首頁"}]) == ""
+
+
+class Test網頁錯誤訊息:
+    """403 被吞掉會顯示成「沒抓到物件（可能全部是出租）」，把人引去查錯方向。"""
+
+    def test_被擋時要講是被擋而且會好(self):
+        msg = http_error_message(403)
+        assert "403" in msg
+        assert "擋" in msg and "再試" in msg
+
+    def test_429同樣視為被擋(self):
+        assert "再試" in http_error_message(429)
+
+    def test_其他錯誤照實說(self):
+        msg = http_error_message(500)
+        assert "500" in msg
+
+    def test_正常狀態沒有訊息(self):
+        assert http_error_message(200) == ""
+        assert http_error_message(None) == ""
+
+
+class Test卡片欄位配對:
+    """2026-09-02 實測 vip.rakuya.com.tw/hyr 抓到的真實缺陷。"""
+
+    def test_精簡卡片不把瀏覽數當標題(self):
+        """有些店鋪頁的卡片只有 價格／縣市／瀏覽數，沒有真正的標題。
+        濾掉狀態字之後標題該是空的，而不是「瀏覽：0人」。"""
+        from src.import_parse import _classify
+        it = _classify(["158萬", "桃園市中壢區", "瀏覽：0人"], "u")
+        assert it["title"] == ""
+        assert it["price_text"] == "158萬" and it["price"] == 1580000
+        assert it["address"] == "桃園市中壢區"
+
+    def test_已售出等狀態字也不當標題(self):
+        from src.import_parse import _classify
+        assert _classify(["928萬", "台北市北投區", "已售出"], "u")["title"] == ""
+
+    def test_有真標題時照樣抓得到(self):
+        from src.import_parse import _classify
+        it = _classify(
+            ["捷運六張犁站電梯雙面採光景觀宅", "台北市大安區基隆路二段", "1750萬",
+             "1房2廳1衛", "14.36坪", "瀏覽：88人"], "u")
+        assert it["title"] == "捷運六張犁站電梯雙面採光景觀宅"
+        assert it["price"] == 17500000 and it["layout"] == "1房2廳1衛"
+
+    def test_擷取JS用不重複網址判斷卡片邊界(self):
+        """卡片裡有圖片連結＋標題連結兩個指向同一筆，用元素數會誤判。"""
+        from src.import_parse import LIST_EXTRACT_JS
+        assert "ids(node).size > 1" in LIST_EXTRACT_JS

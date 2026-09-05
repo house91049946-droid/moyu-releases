@@ -1,0 +1,71 @@
+"""IG 發文 CLI 的離線測試（純函式＋失敗路徑，不開瀏覽器不連網）。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_ig_post.py -v
+真發文的實測在 mini 用共用的 threads_profile 跑（2026-08-29 已驗證）。
+"""
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("playwright")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.run_ig_post import CAPTION_LIMIT, DEFAULT_PROFILE  # noqa: E402
+from src.run_threads_post import clip_text  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class Test基本約束:
+    def test_與threads共用同一個profile(self):
+        """同一 Meta 登入，登一次兩邊都能發——分開就要登兩次。"""
+        from src.run_threads_post import DEFAULT_PROFILE as TP
+        assert DEFAULT_PROFILE == TP
+
+    def test_caption上限2200(self):
+        text, truncated = clip_text("哈" * 3000, limit=CAPTION_LIMIT)
+        assert truncated is True and len(text) <= 2200
+
+
+class Test沒圖就擋:
+    def test_無images直接報錯不開瀏覽器(self, tmp_path):
+        out = tmp_path / "r.json"
+        r = subprocess.run(
+            [sys.executable, "-m", "src.run_ig_post",
+             "--text", "x", "--result-json", str(out)],
+            cwd=ROOT, capture_output=True, text=True)
+        assert r.returncode == 1
+        data = json.loads(out.read_text())
+        assert "要圖" in data["error"] or "images" in data["error"]
+
+    def test_圖片不存在整批報錯(self, tmp_path):
+        out = tmp_path / "r.json"
+        r = subprocess.run(
+            [sys.executable, "-m", "src.run_ig_post",
+             "--text", "x", "--images", "/no/such.jpg",
+             "--result-json", str(out)],
+            cwd=ROOT, capture_output=True, text=True)
+        assert r.returncode == 1
+        assert "找不到圖片" in json.loads(out.read_text())["error"]
+
+
+class TestCheck:
+    def test_check未登入也exit0(self, tmp_path):
+        out = tmp_path / "r.json"
+        code = (
+            "import sys; sys.argv=['x','--check','--result-json',r'%s',"
+            "'--profile-dir',r'%s']\n"
+            "import src.run_ig_post as m\n"
+            "m.do_check=lambda p,headless=True:{'logged_in':False,'username':''}\n"
+            "try: m.main()\n"
+            "except SystemExit as e: sys.exit(e.code)\n"
+        ) % (out, tmp_path / "prof")
+        r = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        data = json.loads(out.read_text())
+        assert data["success"] is True
+        assert data["data"]["logged_in"] is False

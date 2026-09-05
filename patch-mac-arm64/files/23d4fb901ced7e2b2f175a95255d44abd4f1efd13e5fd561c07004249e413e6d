@@ -1,0 +1,29 @@
+"""法律文件版本控管。
+
+文件正本在 frontend/lib/legalDocs.ts（那裡才有全文）；後端只需要知道
+「目前要求的是哪一版」，用來判斷使用者的同意紀錄是否仍然有效。
+
+⚠️ 這個常數必須與 legalDocs.ts 的 LEGAL_VERSION 完全相同。
+    兩邊不同步會發生「客戶同意了 A 版、系統以為他同意 B 版」——
+    tests/test_consent.py 會直接讀 TS 檔比對，忘記改就會紅燈。
+"""
+
+CONSENT_VERSION = "2026-09-03"
+
+
+def has_valid_consent() -> bool:
+    """本機是否已同意「目前版本」的條款。
+
+    同意是在「申請試用／輸入授權金鑰」當下勾選的（授權管理頁），
+    之後不再重複詢問、也不阻擋既有客戶的排程發文。這個函式供授權頁
+    判斷是否還要顯示同意欄位。查不到資料庫時回 False（當成尚未同意）。
+    """
+    from sqlalchemy import select
+    from .database import SyncSession, UserConsent
+    try:
+        with SyncSession() as s:
+            return s.execute(
+                select(UserConsent.id).where(UserConsent.doc_version == CONSENT_VERSION).limit(1)
+            ).scalar_one_or_none() is not None
+    except Exception:
+        return False

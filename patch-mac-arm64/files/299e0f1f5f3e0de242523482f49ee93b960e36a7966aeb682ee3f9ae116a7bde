@@ -1,0 +1,863 @@
+"""FB 自動加好友——送出好友邀請（SPEC-P31）。
+
+結構抄 `run_threads_follow`（P29）：進對方頁 → 滑一下 → 機率性點讚 → 送邀請 →
+再逛一下 → 下一個。每一步都看有沒有被擋，一被擋就中止整批、保留已做的部分。
+
+FB 和 Threads 不一樣的地方，也是這支比較保守的理由：
+  - 好友邀請要對方同意，**未回應的邀請會累積**；累積太多 FB 就禁送 1–30 天。
+    所以送之前先到「已送出的邀請」數一下，超過 PENDING_LIMIT 這輪就不送。
+  - 硬上限 8、預設 4（Threads 是 20／10）：三個平台共用同一個人，FB 被判定
+    會連坐到發文，而發文才是客戶付錢買的東西。
+  - 只找「和客戶有自然關聯」的人（自己貼文的互動者、FB 自己推薦的），不掃名單。
+
+不私訊、不留言、不接受別人的邀請（同 P29 紅線）。
+
+用法：
+    python -m src.run_fb_friend --fbid <id> --max 4 --sources own_posts,pymk \
+        [--like-probability 0.2] [--pending-limit 30] [--headless] [--dry-run] \
+        [--result-json out.json] [--profile-dir …] [--exclude-file known.json]
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import random
+import re
+import sys
+from urllib.parse import parse_qs, urlparse
+
+from src.meta_block import ACTION_BLOCKED, classify as classify_meta
+from src.utils import human_sleep
+
+_JSON_PATH: str | None = None
+_RESULT: dict | None = None
+
+PLATFORM = "fb"
+DEFAULT_MAX = 4
+HARD_CAP = 8                        # 再怎麼設定也不准超過
+LIKE_PROBABILITY = 0.2
+_CLICKED = 0                  # 這一輪按過幾次「加朋友」——額度看這個，不看驗證結果              # 不是每個都按——每個都按才像腳本
+GAP = (20, 90)                      # 人與人之間的秒數，連續動作最像機器
+PENDING_LIMIT = 30                  # 未回應邀請超過這個數就這輪不送
+
+SOURCE_OWN_POSTS = "own_posts"      # 在客戶自己貼文下按讚／留言的人（最有意向）
+SOURCE_PYMK = "pymk"                # FB 自己推薦的「你可能認識的朋友」（最安全）
+SOURCE_GROUPS = "groups"            # 社團裡物件貼文的互動者（風險最高，預設不開）
+SOURCES = (SOURCE_OWN_POSTS, SOURCE_PYMK, SOURCE_GROUPS)
+
+FB = "https://www.facebook.com"
+URL_PYMK = f"{FB}/friends/suggestions"
+URL_REQUESTS = f"{FB}/friends/requests"
+URL_ME = f"{FB}/me"
+
+# FB 的封鎖／限制字樣（meta_block 那份是 IG/Threads 的用語，FB 講法不同）。
+# 命中一律當 action_blocked：已經被限制了還繼續送，只會把禁令拉長。
+_FB_BLOCK_PHRASES = (
+    "你暫時被封鎖", "你暫時遭到封鎖", "你目前無法使用此功能", "暫時無法使用此功能",
+    "已達上限", "你的好友邀請已達上限", "無法送出好友邀請",
+    "You're Temporarily Blocked", "You’re Temporarily Blocked",
+    "This feature is temporarily blocked", "You can't use this feature right now",
+    "You Can't Use This Feature", "reached the limit", "Can't send friend request",
+)
+
+# 加朋友按鈕的三種狀態（aria-label／文字，中英）
+_ADD_LABELS = ("加朋友", "加為朋友", "Add friend", "Add Friend")
+_FRIEND_LABELS = ("朋友", "Friends")                       # 已是好友
+_PENDING_LABELS = ("已送出邀請", "取消邀請", "取消好友邀請",   # 邀請已送、等對方回應
+                   "Cancel request", "Cancel Request", "Friend request sent")
+
+# 這些路徑第一段不是個人檔案
+_NOT_PROFILE = {
+    "friends", "groups", "pages", "photo", "photo.php", "photos", "watch", "marketplace",
+    "events", "stories", "reel", "reels", "hashtag", "help", "policies", "login", "home.php",
+    "story.php", "posts", "search", "messages", "notifications", "bookmarks", "gaming",
+    "settings", "privacy", "me", "profile", "share", "video", "videos", "permalink.php",
+    "business", "ads", "campaign", "dialog", "sharer", "sharer.php", "l.php", "people",
+    "public", "pg", "media", "memories", "saved", "bookmarks", "feeds", "?", "",
+    # 2026-09-02 mini 實測撈到的雜訊：主控板、粉專入口、通知中心等
+    "professional_dashboard", "latest", "allactivity", "lite", "mobile", "recover",
+    # 2026-09-03：通知面板撈到的系統頁，不是人
+    "onthisday", "notifications.php", "friends_center", "birthdays", "fundraisers",
+    "buylocal", "fundraisers", "jobs", "weather", "climatescienceinfo", "coronavirus_info",
+}
+
+# 名稱看起來就不是人：粉專的「N 位追蹤者」、「N 人說讚」這種統計字串。
+_COUNT_NAME_RE = re.compile(r"^[\d,.]+\s*(位追蹤者|人追蹤|位粉絲|人說讚|位朋友|followers?|likes?)", re.I)
+# 留言區的時間戳也是連結（「1天」「3 小時」「2週」），名字絕不會長這樣。
+_TIME_NAME_RE = re.compile(r"^\d+\s*(秒|分鐘|小時|天|週|周|個月|年|[smhdwy])$", re.I)
+
+
+def looks_like_person(name: str) -> bool:
+    """粗篩：統計數字、空白名稱都不是人。留在收集階段擋掉，省得白開一次個人頁。"""
+    n = (name or "").strip()
+    return bool(n) and not _COUNT_NAME_RE.match(n) and not _TIME_NAME_RE.match(n)
+
+
+# ---------------------------------------------------------------- 純函式（可離線測）
+
+def _write():
+    """atexit：不管怎麼結束都要把結果寫出去（例外時保留已做的部分）。"""
+    if _JSON_PATH and _RESULT is not None:
+        # 後端 bridge 的 `_result_from_raw` 只讀 raw["data"]（envelope v2），
+        # 平面欄位是 SPEC-P31 §4 的契約——兩邊都給，各取所需。
+        _RESULT["data"] = {k: v for k, v in _RESULT.items() if k != "data"}
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[friend] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+def effective_limit(requested: int | None) -> int:
+    """把設定值夾到合理範圍。上限是硬的——這種動作不該讓人隨手調到 100。"""
+    n = DEFAULT_MAX if not requested or requested <= 0 else requested
+    return max(1, min(HARD_CAP, n))
+
+
+def parse_sources(arg: str) -> list[str]:
+    """逗號分隔 → 去空白、去重、保留順序（順序＝優先序）。名字打錯直接報錯，不猜。"""
+    out: list[str] = []
+    for raw in (arg or "").split(","):
+        s = raw.strip().lower()
+        if not s:
+            continue
+        if s not in SOURCES:
+            raise ValueError(f"不認識的來源「{s}」，可用：{','.join(SOURCES)}")
+        if s not in out:
+            out.append(s)
+    return out
+
+
+def target_key_from_url(url: str) -> str:
+    """從個人檔案網址取唯一鍵：有數字 id 就用 id，否則用帳號代稱。
+
+    - profile.php?id=100012345            → "100012345"
+    - /people/王小明/100012345/           → "100012345"
+    - /john.doe?comment_id=…              → "john.doe"
+    - /groups/…、/photo/…、/friends/… 等  → ""（不是個人）
+    """
+    if not url:
+        return ""
+    u = urlparse(url.strip())
+    path = u.path or ""
+    qs = parse_qs(u.query or "")
+
+    if path.rstrip("/").endswith("profile.php"):
+        pid = (qs.get("id") or [""])[0]
+        return pid if pid.isdigit() else ""
+
+    segs = [s for s in path.split("/") if s]
+    if not segs:
+        return ""
+    if segs[0] == "people":
+        # /people/<顯示名>/<數字 id>/
+        for s in segs[1:]:
+            if s.isdigit():
+                return s
+        return ""
+    head = segs[0]
+    if head in _NOT_PROFILE or not re.fullmatch(r"[A-Za-z0-9.\-_]+", head):
+        return ""
+    if head.isdigit():
+        return head
+    return head
+
+
+def profile_url_for_key(key: str) -> str:
+    """鍵 → 可直接開的個人頁網址。"""
+    if key.isdigit():
+        return f"{FB}/profile.php?id={key}"
+    return f"{FB}/{key}"
+
+
+def dedupe_targets(targets: list[dict]) -> list[dict]:
+    """同一個人只留第一筆（來源依優先序排，先出現的來源比較有意向）。沒鍵的丟掉。"""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for t in targets:
+        key = (t.get("key") or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(t)
+    return out
+
+
+def should_send(pending_count: int | None, limit: int = PENDING_LIMIT) -> bool:
+    """未回應邀請超過上限就不送。數不出來（None）視為可送——這是保護機制，不是閘門。"""
+    if pending_count is None:
+        return True
+    return pending_count <= limit
+
+
+def load_exclude_keys(path: str | None) -> set[str]:
+    """讀後端給的「已邀請過」鍵清單（JSON 字串陣列）。
+
+    檔案不在、格式壞掉一律回空集合：這是避免重邀的輔助，不該讓整輪跑不起來。
+    """
+    if not path:
+        return set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[friend] 排除清單讀取失敗（當作空的）：{str(e)[:120]}", flush=True)
+        return set()
+    if not isinstance(raw, list):
+        print("[friend] 排除清單不是陣列（當作空的）", flush=True)
+        return set()
+    return {str(k).strip() for k in raw if isinstance(k, (str, int)) and str(k).strip()}
+
+
+def drop_known(targets: list[dict], known: set[str]) -> tuple[list[dict], int]:
+    """把後端已記錄邀請過的人在進頁面之前就剔掉。回 (剩下的, 剔掉幾個)。"""
+    if not known:
+        return list(targets), 0
+    kept = [t for t in targets if (t.get("key") or "") not in known]
+    return kept, len(targets) - len(kept)
+
+
+# 通知面板的文字長這樣：「未讀郭豈辰在一則貼文中標註了你和其他 8 人。1分鐘」。
+# 名字欄位出現這些特徵就不是人名，整筆丟掉——寧可少加，也不要對系統頁送邀請。
+_NOTIFICATION_HINTS = ("未讀", "說你", "標註了你", "動態回顧", "追蹤你", "個人檔案的",
+                       "在一則貼文", "分享的", "的大頭貼照", "邀請你")
+
+
+def looks_like_notification(name: str) -> bool:
+    n = (name or "").strip()
+    if not n:
+        return False
+    if any(h in n for h in _NOTIFICATION_HINTS):
+        return True
+    # 「…。1分鐘」「…。4小時」這種時間尾巴也是通知才有
+    return bool(__import__("re").search(r"。\s*\d+\s*(分鐘|小時|天|週)$", n))
+
+
+def button_status(label: str) -> str:
+    """按鈕文字 → 'existing'（已是好友）／'pending'（已送出）／'add'（可加）／''（不相干）。
+
+    順序有意義：「取消邀請」也含「邀請」，「加朋友」不含「朋友」以外的詞，
+    先看已送出、再看已是好友、最後才是可加。
+    """
+    s = (label or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    if any(p.lower() in low for p in _PENDING_LABELS):
+        return "pending"
+    # FB 會把名字塞進中間：「取消對陳泊廷的邀請」——整串比對永遠對不上（2026-09-03 實測）
+    if ("取消" in s and "邀請" in s) or ("cancel" in low and "request" in low):
+        return "pending"
+    if any(p.lower() in low for p in _ADD_LABELS):
+        return "add"
+    if any(s == p or low == p.lower() for p in _FRIEND_LABELS):
+        return "existing"
+    return ""
+
+
+def count_pending_labels(labels: list[str]) -> int:
+    """「已送出的邀請」頁上每一筆都有一顆「取消邀請」——數這顆最可靠。"""
+    return sum(1 for lab in labels if button_status(lab) == "pending")
+
+
+def classify_fb_block(page_text: str = "", error_text: str = "") -> str:
+    """FB 版的失敗分類：先比 FB 自己的封鎖字樣，再退回 meta_block 的通用規則。"""
+    blob = f"{page_text}\n{error_text}".lower()
+    if any(p.lower() in blob for p in _FB_BLOCK_PHRASES):
+        return ACTION_BLOCKED
+    return classify_meta(page_text=page_text, error_text=error_text)
+
+
+def summarize(targets: list[dict]) -> dict:
+    """依 status 計數，給結果 JSON 與紀錄摘要用。"""
+    c = {"sent": 0, "skipped_existing": 0, "skipped_pending": 0, "failed": 0, "dry_run": 0}
+    for t in targets:
+        st = t.get("status", "")
+        if st == "sent":
+            c["sent"] += 1
+        elif st == "existing":
+            c["skipped_existing"] += 1
+        elif st == "pending":
+            c["skipped_pending"] += 1
+        elif st == "dry_run":
+            c["dry_run"] += 1
+        elif st == "failed":
+            c["failed"] += 1
+    return c
+
+
+# ---------------------------------------------------------------- 瀏覽器動作
+
+def _body_text(page, limit: int = 4000) -> str:
+    with contextlib.suppress(Exception):
+        return page.evaluate("()=>document.body.innerText")[:limit]
+    return ""
+
+
+def _blocked_reason(page, fbid: str) -> str:
+    """頁面上有封鎖／驗證跡象嗎？回原因字串，沒有回空字串。
+
+    兩層：FB nurture 既有的 perform_checks（封鎖、鎖定、驗證檢查點）＋
+    文字比對（FB 封鎖字樣、meta_block 通用規則）。
+    """
+    from src.utils import CheckResult, perform_checks
+
+    with contextlib.suppress(Exception):
+        chk = perform_checks(page, fbid)
+        if chk != CheckResult.OK:
+            return chk.value
+    reason = classify_fb_block(page_text=_body_text(page))
+    return reason if reason == ACTION_BLOCKED else ""
+
+
+def _own_id(page) -> str:
+    """自己的數字 id（c_user cookie）——蒐集名單時要把自己排掉。"""
+    with contextlib.suppress(Exception):
+        for c in page.context.cookies(FB):
+            if c.get("name") == "c_user" and c.get("value"):
+                return str(c["value"])
+    return ""
+
+
+def _human_browse(page, rounds: tuple[int, int] = (2, 4)) -> None:
+    """滑一滑再動作——直接進頁面就按加朋友，時間軸上太乾淨了。"""
+    for _ in range(random.randint(*rounds)):
+        with contextlib.suppress(Exception):
+            page.mouse.wheel(0, random.randint(200, 600))
+        human_sleep(0.8, 2.0)
+
+
+def _maybe_like(page, probability: float = LIKE_PROBABILITY) -> bool:
+    """依機率對畫面上一篇貼文按讚。沿用養號的 `_like_post`（會處理表情選單彈出）。"""
+    if random.random() > probability:
+        return False
+    with contextlib.suppress(Exception):
+        from src.raiseaccount_www import _like_post
+        return bool(_like_post(page))
+    return False
+
+
+def _links_in(page, scope_selector: str) -> list[dict]:
+    """收 scope 裡所有有文字的連結 → [{href, text}]。"""
+    js = """(sel) => {
+        const root = document.querySelector(sel) || document.body;
+        const out = [];
+        for (const a of root.querySelectorAll('a[href]')) {
+            const t = (a.innerText || a.getAttribute('aria-label') || '').trim();
+            if (!t) continue;
+            out.push({href: a.href, text: t.split(String.fromCharCode(10))[0].slice(0, 80)});
+        }
+        return out;
+    }"""
+    with contextlib.suppress(Exception):
+        return page.evaluate(js, scope_selector) or []
+    return []
+
+
+def _to_targets(links: list[dict], source: str, exclude: set[str]) -> list[dict]:
+    out = []
+    for l in links:
+        key = target_key_from_url(l.get("href", ""))
+        if not key or key in exclude:
+            continue
+        name = l.get("text", "")
+        if not looks_like_person(name) or looks_like_notification(name):
+            continue
+        out.append({"key": key, "name": name, "source": source,
+                    "url": profile_url_for_key(key)})
+    return dedupe_targets(out)
+
+
+def _self_keys(page, fbid: str) -> set[str]:
+    """自己的所有寫法：數字 id ＋ 代稱。2026-09-03 實測：候選名單裡出現老闆本人
+    （/chunhao.tsai1），因為排除清單只放了數字 id。"""
+    keys = {str(fbid), _own_id(page)}
+    with contextlib.suppress(Exception):
+        u = page.url or ""
+        seg = [x for x in u.split("?")[0].split("/") if x]
+        if seg and seg[-1] not in _NOT_PROFILE and "." not in seg[-1][:4]:
+            keys.add(seg[-1])
+    with contextlib.suppress(Exception):
+        page.goto(f"{FB}/me", wait_until="domcontentloaded", timeout=30000)
+        human_sleep(2.0, 3.5)
+        seg = [x for x in (page.url or "").split("?")[0].split("/") if x]
+        if seg and seg[-1] not in _NOT_PROFILE:
+            keys.add(seg[-1])
+    return {k for k in keys if k}
+
+
+def _collect_own_posts(page, fbid: str, want: int) -> list[dict]:
+    """來源 1：在自己最近幾篇貼文下按讚／留言的人。
+
+    2026-09-02 mini 實測校正過的選擇器：
+      - 留言者：留言裡的名字連結會帶 `?comment_id=…`，這是最乾淨的辨識方式
+        （整頁抓連結會撈到自己的粉專、學校、主控板那些東西）。
+      - 按讚者：貼文下方的心情總數 aria-label 是「N 個心情；查看誰對此傳達了心情」，
+        點下去才開出名單對話框。
+    """
+    exclude = _self_keys(page, fbid)
+    found: list[dict] = []
+    # /me 會被通知面板蓋住，直接進 profile.php 比較穩
+    page.goto(f"{FB}/profile.php?id={fbid}", wait_until="domcontentloaded", timeout=45000)
+    human_sleep(7.0, 10.0)
+    for _ in range(3):
+        with contextlib.suppress(Exception):
+            page.mouse.wheel(0, 1500)
+        human_sleep(1.5, 2.5)
+
+    # 2026-09-03 實測：整頁抓 comment_id 連結會把**通知面板**一起抓進來——
+    # 撈到的「人」是「未讀郭豈辰在一則貼文中標註了你…」「你今天有動態回顧值得看看」，
+    # 連自己（chunhao.tsai1）和系統頁（onthisday）都成了候選。限定在 main 裡面找。
+    js_comments = """() => {
+        const root = document.querySelector("div[role='main']") || document.querySelector("main") || document.body;
+        return [...root.querySelectorAll("a[href*='comment_id']")]
+            .map(a => ({href: a.href, text: (a.innerText || '').trim().split(String.fromCharCode(10))[0].slice(0, 80)}))
+            .filter(x => x.text);
+    }"""
+    try:
+        raw_c = page.evaluate(js_comments) or []
+    except Exception as e:
+        raw_c = []
+        print(f"[friend] 留言者解析失敗：{str(e)[:200]}", flush=True)
+    print(f"[friend] 留言者連結 {len(raw_c)} 條", flush=True)
+    found += _to_targets(raw_c, SOURCE_OWN_POSTS, exclude)
+
+    reacts = page.locator("[aria-label*='查看誰對此傳達了心情'], [aria-label*='See who reacted']")
+    n = min(reacts.count(), 3)
+    for i in range(n):
+        if len(found) >= want * 3:
+            break
+        with contextlib.suppress(Exception):
+            reacts.nth(i).scroll_into_view_if_needed(timeout=3000)
+            human_sleep(0.5, 1.2)
+            reacts.nth(i).click(timeout=5000)
+            human_sleep(2.0, 3.5)
+            found += _to_targets(_links_in(page, "div[role='dialog']"), SOURCE_OWN_POSTS, exclude)
+            page.keyboard.press("Escape")
+            human_sleep(0.8, 1.5)
+    return dedupe_targets(found)
+
+
+def _collect_pymk(page, fbid: str, want: int) -> list[dict]:
+    """來源 2：FB 自己推薦的「你可能認識的朋友」。
+
+    2026-09-02 mini 實測：這頁的名字不是連結，`div[role='main']` 裡一個 a 都沒有——
+    每一筆是一張卡片（頭像＋名字＋共同朋友＋「加朋友」鈕），個人頁連結藏在卡片裡。
+    所以從「加朋友」按鈕往上找卡片，再從卡片取連結與名字。
+    """
+    exclude = {_own_id(page), fbid}
+    page.goto(URL_PYMK, wait_until="domcontentloaded", timeout=45000)
+    # 這頁的卡片是延遲載入的：等太短就是一片空白（實測 5 秒不夠、9 秒才有）
+    human_sleep(7.0, 10.0)
+    for _ in range(3):
+        with contextlib.suppress(Exception):
+            page.mouse.wheel(0, 1200)
+        human_sleep(1.5, 2.5)
+    js = """() => {
+        const btns = [...document.querySelectorAll("div[role='button'],button")]
+            .filter(e => /加朋友|Add friend/i.test(e.innerText || ''));
+        const out = [];
+        for (const b of btns) {
+            let card = b;
+            for (let i = 0; i < 8 && card.parentElement; i++) {
+                card = card.parentElement;
+                if ((card.innerText || '').trim().length > 10) break;
+            }
+            const a = card.querySelector("a[href]");
+            if (!a) continue;
+            const name = (card.innerText || '').trim().split(String.fromCharCode(10))[0].slice(0, 80);
+            out.push({href: a.href, text: name});
+        }
+        return out;
+    }"""
+    links = []
+    try:
+        links = page.evaluate(js) or []
+    except Exception as e:                       # 版面改了要看得到原因，不能默默吞掉
+        print(f"[friend] pymk 卡片解析失敗：{str(e)[:200]}", flush=True)
+    print(f"[friend] pymk 卡片 {len(links)} 張", flush=True)
+    return _to_targets(links, SOURCE_PYMK, exclude)[: max(want * 3, want)]
+
+
+def _collect_groups(page, fbid: str, want: int) -> list[dict]:
+    """來源 3：常發文社團裡在物件貼文下互動的成員。
+
+    TODO：SPEC-P31 §3 說這是風險最高的來源、預設不勾；先留空實作，等前兩個來源
+    在 mini 上跑穩再決定要不要做。
+    """
+    return []
+
+
+_COLLECTORS = {
+    SOURCE_OWN_POSTS: _collect_own_posts,
+    SOURCE_PYMK: _collect_pymk,
+    SOURCE_GROUPS: _collect_groups,
+}
+
+
+def collect_targets(page, fbid: str, sources: list[str], want: int) -> list[dict]:
+    """依來源優先序蒐集，直到夠用為止；同一個人只留優先來源那筆。"""
+    found: list[dict] = []
+    for src in sources:
+        if len(found) >= want:
+            break
+        try:
+            got = _COLLECTORS[src](page, fbid, want - len(found))
+        except Exception as e:
+            print(f"[friend] 來源 {src} 蒐集失敗（略過）：{str(e)[:120]}", flush=True)
+            continue
+        print(f"[friend] 來源 {src} 找到 {len(got)} 人", flush=True)
+        found = dedupe_targets(found + got)
+    return found
+
+
+def count_pending_requests(page) -> int | None:
+    """到「已送出的邀請」數未回應數。數不出來回 None（記一行，不算失敗）。"""
+    try:
+        page.goto(URL_REQUESTS, wait_until="domcontentloaded", timeout=45000)
+        human_sleep(2.0, 3.5)
+        # TODO 實測校正：入口文字（「查看已送出的邀請」/ "View sent requests"）。
+        opened = False
+        for lab in ("查看已送出的邀請", "已送出的邀請", "View sent requests", "Sent requests"):
+            with contextlib.suppress(Exception):
+                el = page.get_by_text(lab, exact=False).first
+                if el.count() > 0 and el.is_visible():
+                    el.click(timeout=5000)
+                    opened = True
+                    break
+        if not opened:
+            print("[friend] 找不到「已送出的邀請」入口，略過未回應數檢查", flush=True)
+            return None
+        human_sleep(2.0, 3.5)
+        for _ in range(4):                      # 清單是懶載入的，多滑幾下
+            with contextlib.suppress(Exception):
+                page.mouse.wheel(0, 1200)
+            human_sleep(0.8, 1.5)
+        labels = page.evaluate(
+            "()=>Array.from(document.querySelectorAll(\"div[role='button'],button\"))"
+            ".map(b=>(b.getAttribute('aria-label')||b.innerText||'').trim())"
+        ) or []
+        return count_pending_labels(labels)
+    except Exception as e:
+        print(f"[friend] 未回應邀請數讀取失敗（略過）：{str(e)[:120]}", flush=True)
+        return None
+
+
+_SKIP_HEADINGS = ("通知", "Notifications", "Facebook", "動態消息", "News Feed")
+
+_OWNER_RE = __import__("re").compile(
+    r"^將(?P<zh>.+?)加為朋友$|^Add (?P<en>.+?) as (?:a )?friend$|"
+    r"^取消對(?P<zh2>.+?)的邀請$|^Cancel request to (?P<en2>.+?)$")
+
+
+def owner_from_label(label: str) -> str:
+    """從按鈕的 aria-label 反推這顆鈕是誰的：「將陳泊廷加為朋友」→ 陳泊廷。
+
+    比讀頁面標題可靠：2026-09-03 實測，個人頁的第一個 h1 是**通知面板**的「通知」，
+    拿它當主角名字，所有按鈕都被過濾掉，變成「找不到加朋友按鈕」。
+    """
+    m = _OWNER_RE.match((label or "").strip())
+    if not m:
+        return ""
+    return next((v for v in m.groupdict().values() if v), "")
+
+
+def _profile_name(page) -> str:
+    """這一頁是誰的個人檔案。個人頁下方還有「你可能認識的人」，每個人都有一顆
+    「將○○加為朋友」——不認人就會驗到別人的按鈕（2026-09-03 實測：按了確實送出，
+    卻因為看到隔壁人的「加朋友」而記成失敗）。
+
+    先從主要按鈕的 aria-label 反推（最準），再退回 h1（要跳過通知面板那顆）。
+    """
+    with contextlib.suppress(Exception):
+        main = page.locator("div[role='main']")
+        root = main if main.count() > 0 else page
+        loc = root.locator("div[role='button'], a[role='button'], button")
+        for i in range(min(loc.count(), 40)):
+            el = loc.nth(i)
+            with contextlib.suppress(Exception):
+                if not el.is_visible():
+                    continue
+                name = owner_from_label(el.get_attribute("aria-label") or "")
+                if name:
+                    return name
+    for sel in ("div[role='main'] h1", "h1"):
+        with contextlib.suppress(Exception):
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 5)):
+                name = (loc.nth(i).inner_text() or "").strip().splitlines()[0]
+                if name and name not in _SKIP_HEADINGS:
+                    return name[:40]
+    return ""
+
+
+def _find_action_button(page, owner: str = ""):
+    """找個人頁上的加朋友鈕，回 (狀態, locator)。狀態見 button_status。
+
+    2026-09-03 mini 實測：這顆鈕的 aria-label 是「將{姓名}加為朋友」——名字夾在中間，
+    exact 比對永遠對不上，5 個候選有 2 個被記成「找不到加朋友按鈕」。所以改成：
+    先掃頁面上所有按鈕的 aria-label／文字，交給 button_status 判斷（它本來就是「包含」比對），
+    再退回原本的 exact 比對。
+    """
+    # **一定要限定在 div[role=main] 裡**：FB 的通知面板長駐在 DOM 上，裡面全是
+    # 「標示為已讀，○○傳送了交友邀請給你」這種按鈕。不限定範圍就會掃到它們，
+    # 於是「按了但沒看到已送出邀請」——因為根本沒按到個人頁上的鈕（2026-09-03 實測）。
+    with contextlib.suppress(Exception):
+        main = page.locator("div[role='main']")
+        root = main if main.count() > 0 else page
+        loc = root.locator("div[role='button'], a[role='button'], button")
+        n = min(loc.count(), 60)
+        best = None
+        for i in range(n):
+            el = loc.nth(i)
+            with contextlib.suppress(Exception):
+                if not el.is_visible():
+                    continue
+                lab = (el.get_attribute("aria-label") or el.inner_text() or "").strip()
+                if owner and lab and owner not in lab and lab not in ("加朋友", "朋友", "Add friend", "Friends"):
+                    continue                    # 是「你可能認識的人」裡別人的鈕，不是主角的
+                st = button_status(lab)
+                if st == "add":
+                    return st, el                      # 可加就直接用，不必再找
+                if st in ("pending", "existing") and best is None:
+                    best = (st, el)                    # 已送出／已是好友：記著，但繼續找可加的
+        if best is not None:
+            return best
+    for labels, st in ((_PENDING_LABELS, "pending"), (_ADD_LABELS, "add"), (_FRIEND_LABELS, "existing")):
+        for lab in labels:
+            with contextlib.suppress(Exception):
+                cand = page.get_by_role("button", name=lab, exact=True).first
+                if cand.count() > 0 and cand.is_visible():
+                    return st, cand
+    return "", None
+
+
+def _friend_one(page, fbid: str, target: dict, dry_run: bool,
+                like_probability: float) -> tuple[str, bool, str]:
+    """對一個人送邀請。回 (status, liked, reason)。
+
+    status：sent / existing / pending / failed / dry_run / blocked
+    """
+    if dry_run:
+        # dry-run 只是「給我看會邀誰」，不必真的開 17 個人的個人頁——
+        # 慢，而且留下一堆沒有意義的瀏覽足跡（2026-09-02 實測）。
+        return "dry_run", False, ""
+
+    page.goto(target["url"], wait_until="domcontentloaded", timeout=45000)
+    human_sleep(2.0, 4.0)
+
+    why = _blocked_reason(page, fbid)
+    if why:
+        return "blocked", False, why
+
+    owner = _profile_name(page)
+    st, btn = _find_action_button(page, owner)
+    if st in ("existing", "pending"):
+        return st, False, ""                    # 已是好友／已送過，別再點——會變成取消
+
+    _human_browse(page)
+    liked = False if dry_run else _maybe_like(page, like_probability)
+    if liked:
+        human_sleep(1.0, 2.5)
+
+    if btn is None:
+        # 逛完再找一次（有些版面要捲到頂才出現）
+        with contextlib.suppress(Exception):
+            page.mouse.wheel(0, -3000)
+        human_sleep(0.6, 1.2)
+        st, btn = _find_action_button(page, owner)
+        if st in ("existing", "pending"):
+            return st, liked, ""
+        if btn is None:
+            return "failed", liked, "找不到加朋友按鈕（可能對方不開放、或版面改了）"
+
+    if dry_run:
+        return "dry_run", liked, ""
+
+    global _CLICKED
+    _CLICKED += 1                # 按下去就算一次額度：驗證誤判時也不准多送（備份刪文那課）
+    btn.click(timeout=8000)
+    human_sleep(1.5, 3.0)
+    why = _blocked_reason(page, fbid)
+    if why:
+        return "blocked", liked, why
+
+    # 按鈕要幾秒才會從「加朋友」變成「取消邀請」，只看一次常常看太早
+    for _ in range(6):
+        st2, _ = _find_action_button(page, owner)
+        if st2 == "pending":
+            _human_browse(page, (1, 2))         # 送完再逛一下才離開
+            return "sent", liked, ""
+        if st2 == "existing":
+            return "existing", liked, ""
+        human_sleep(1.0, 2.0)
+    return "failed", liked, "按了但沒看到「已送出邀請」，不確定有沒有送出"
+
+
+def process_targets(page, fbid: str, targets: list[dict], max_send: int, dry_run: bool,
+                    like_probability: float = LIKE_PROBABILITY,
+                    friend_one=_friend_one, gap: tuple[int, int] = GAP) -> dict:
+    """逐一處理，直到送滿 max_send。被擋立刻停，已做的照樣回報。
+
+    friend_one／gap 可注入，離線測試用。
+    """
+    done: list[dict] = []
+    blocked, reason = False, ""
+    sent = 0
+    for i, t in enumerate(targets):
+        if sent >= max_send or _CLICKED >= max_send:
+            break
+        rec = dict(t)
+        try:
+            st, liked, why = friend_one(page, fbid, t, dry_run, like_probability)
+        except Exception as e:
+            st, liked, why = "failed", False, str(e)[:120]
+        rec.update({"liked": liked, "status": st})
+        if why:
+            rec["reason"] = why
+
+        if st == "blocked":
+            blocked, reason = True, why or ACTION_BLOCKED
+            rec["status"] = "failed"
+            done.append(rec)
+            print(f"[friend] ⚠ 偵測到被擋（{reason}），立即中止整批", flush=True)
+            break
+
+        done.append(rec)
+        if st in ("sent", "dry_run"):
+            sent += 1
+            verb = "將送出" if st == "dry_run" else "已送出"
+            print(f"[friend] {verb}邀請給 {t.get('name') or t['key']}（{sent}/{max_send}）", flush=True)
+        else:
+            print(f"[friend] 略過 {t.get('name') or t['key']}：{st}{'，' + why if why else ''}", flush=True)
+
+        if sent < max_send and i < len(targets) - 1:
+            human_sleep(*gap)
+    return {"targets": done, "blocked": blocked, "block_reason": reason}
+
+
+def do_friend(fbid: str, sources: list[str], max_send: int, headless: bool, dry_run: bool,
+              like_probability: float, pending_limit: int, profile_dir: str | None,
+              known: set[str] | None = None) -> dict:
+    from src.login import _try_cookie_login
+    from src.utils import capture_screenshot, launch_browser
+
+    browser, context, page = launch_browser(fbid=fbid, headless=headless, user_data_dir=profile_dir)
+    out = {"targets": [], "blocked": False, "block_reason": "", "pending_over_limit": 0,
+           "skipped_known": 0}
+    try:
+        if not _try_cookie_login(page, context, fbid):
+            raise RuntimeError("Cookie 登入失敗，請先用 CLI 登入一次")
+
+        why = _blocked_reason(page, fbid)
+        if why:
+            out.update(blocked=True, block_reason=why)
+            capture_screenshot(page, fbid, "friend_blocked")
+            return out
+
+        pending = count_pending_requests(page)
+        if pending is None:
+            print("[friend] 未回應邀請數：讀不到，照常進行", flush=True)
+        else:
+            print(f"[friend] 未回應邀請 {pending} 個（上限 {pending_limit}）", flush=True)
+        if not should_send(pending, pending_limit):
+            out["pending_over_limit"] = pending
+            print(f"[friend] 未回應邀請 {pending} 個，今天先不送", flush=True)
+            return out
+
+        want = max_send * 3                     # 多找一些：有人會是已好友／已送過
+        targets = collect_targets(page, fbid, sources, want)
+        targets, out["skipped_known"] = drop_known(targets, known or set())
+        print(f"[friend] 候選 {len(targets)} 人（另剔除 {out['skipped_known']} 個邀請過的），"
+              f"目標送出 {max_send}", flush=True)
+        if dry_run:
+            for t in targets[:max_send]:
+                print(f"[friend] (dry-run) 會送給 {t.get('name') or t['key']} ← {t['source']} {t['url']}", flush=True)
+
+        r = process_targets(page, fbid, targets, max_send, dry_run, like_probability)
+        out.update(r)
+        if r["blocked"]:
+            with contextlib.suppress(Exception):
+                capture_screenshot(page, fbid, "friend_blocked")
+        return out
+    except Exception as e:
+        e.reason = classify_fb_block(page_text=_body_text(page), error_text=str(e))
+        e.partial = out                          # 已做的部分不能白做
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            context.close()                      # persistent context：browser 與 context 同物件
+
+
+def _apply(result: dict, r: dict) -> None:
+    result["targets"] = r.get("targets", [])
+    result.update(summarize(result["targets"]))
+    result["blocked"] = bool(r.get("blocked"))
+    result["block_reason"] = r.get("block_reason", "")
+    result["pending_over_limit"] = r.get("pending_over_limit", 0) or 0
+    result["skipped_known"] = r.get("skipped_known", 0) or 0
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser(description="FB 自動加好友（送出好友邀請）")
+    ap.add_argument("--fbid", required=True)
+    ap.add_argument("--max", type=int, default=DEFAULT_MAX, help=f"這輪最多送幾個（硬上限 {HARD_CAP}）")
+    ap.add_argument("--sources", default=f"{SOURCE_OWN_POSTS},{SOURCE_PYMK}",
+                    help="逗號分隔、依優先序：own_posts,pymk,groups")
+    ap.add_argument("--like-probability", type=float, default=LIKE_PROBABILITY)
+    ap.add_argument("--pending-limit", type=int, default=PENDING_LIMIT)
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="只蒐集名單、印出會送給誰，不點任何東西")
+    ap.add_argument("--result-json")
+    ap.add_argument("--profile-dir", default=None, help="瀏覽器設定檔目錄（預設 user_data/<fbid>）")
+    ap.add_argument("--exclude-file", default=None,
+                    help="JSON 字串陣列：後端已記錄邀請過的 target_key，進頁面前就剔除")
+    args = ap.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {
+        "schema": 2, "success": False, "fbid": args.fbid, "platform": PLATFORM,
+        "sent": 0, "skipped_existing": 0, "skipped_pending": 0, "failed": 0, "dry_run": 0,
+        "skipped_known": 0, "blocked": False, "block_reason": "", "pending_over_limit": 0,
+        "error": "未完成", "reason": "", "targets": [],
+    }
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    try:
+        sources = parse_sources(args.sources)
+    except ValueError as e:
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    if not sources:
+        _RESULT["error"] = "沒有指定對象來源"
+        sys.exit(1)
+
+    like_p = min(1.0, max(0.0, args.like_probability))
+    try:
+        r = do_friend(args.fbid, sources, effective_limit(args.max), args.headless, args.dry_run,
+                      like_p, args.pending_limit, args.profile_dir,
+                      known=load_exclude_keys(args.exclude_file))
+        _apply(_RESULT, r)
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        if _RESULT["blocked"]:
+            _RESULT["reason"] = _RESULT["block_reason"]
+            print(f"[friend] ⚠ 中斷：{_RESULT['block_reason']}（已送出 {_RESULT['sent']} 個）", flush=True)
+        elif _RESULT["pending_over_limit"]:
+            print(f"[friend] 未回應邀請 {_RESULT['pending_over_limit']} 個，今天先不送", flush=True)
+        else:
+            print(f"[friend] ✅ 送出 {_RESULT['sent']} 個好友邀請，略過 {_RESULT['skipped_existing']} 個已是好友、"
+                  f"{_RESULT['skipped_pending']} 個已送過", flush=True)
+    except KeyboardInterrupt:
+        _RESULT["error"] = "使用者中斷"
+        sys.exit(0)
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        _apply(_RESULT, getattr(e, "partial", {}) or {})
+        _RESULT["reason"] = getattr(e, "reason", None) or classify_fb_block(error_text=str(e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

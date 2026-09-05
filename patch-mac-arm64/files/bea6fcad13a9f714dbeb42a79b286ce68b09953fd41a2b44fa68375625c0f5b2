@@ -1,0 +1,918 @@
+"""FB 備份模式自動刪文（SPEC-P32 §2）。
+
+**為什麼不能用 `run_delete_posts`**：那支是照 `data/postStatus.json`（我們自己的發文紀錄）
+去刪——知道貼文網址才刪得到。可是「紀錄不見（重灌、換電腦、還原備份失敗）或那則根本不是
+用摸魚發的」正是備份模式要救的情況。所以這支**完全不看紀錄**，直接開帳號自己的動態時報，
+掃平台上實際存在的貼文，超過 N 天的一律刪，當第二道保險。兩套同時開也不衝突——
+既有那套先刪，這邊掃到的就是漏網的。
+
+刪除不可逆，所以保守規則全部寫死，設定再大也不准放寬（與 Threads／IG 那支同一組數字）：
+  - 天數最少 7 天（給更小的值會被提高到 7，並在紀錄裡講明白）。
+  - 一輪最多 20 則、硬上限 50；沒刪完的明天繼續。
+  - 每則之間 10–30 秒——連續刪最像腳本。
+  - **只動登入帳號自己的貼文**：進場先比對 c_user cookie 與 --fbid，不一致就直接不做；
+    連結上的作者不是本人（別人 tag 你、社團轉貼）一律不進清單。
+  - 置頂貼文不刪（那是客戶刻意留在最上面的）。
+  - **日期讀不到就跳過**，寧可留著也不誤刪，並計入 skipped_undated 讓客戶看得到。
+  - 偵測到 FB 限制／檢查點立刻中止整輪，已刪的照樣回報，讓上層的暫停機制接手。
+
+結果 JSON 與 `run_meta_cleanup` 同一份契約（欄位名、data 鏡像都一樣），
+後端 `cleanup_runner` 才不用為 FB 開特例。
+
+用法：
+    python -m src.run_fb_cleanup --fbid <id> --older-than 30 \
+        [--max 20] [--headless] [--dry-run] [--result-json out.json] [--profile-dir …]
+
+--dry-run 一則都不刪、也不開任何貼文頁，只把「會刪哪些」（網址 + 幾天前）列出來——
+真的動手前先跑這個。
+"""
+import argparse
+import atexit
+import contextlib
+import datetime
+import json
+import sys
+from urllib.parse import parse_qs, urlparse
+
+from src.meta_block import ACTION_BLOCKED
+# 同一個領域的知識只寫一份：FB 的封鎖字樣沿用加好友那支（已在真帳號上校正過），
+# 相對時間解析沿用 Threads／IG 那支（同一套中英語系，沒必要維護兩份）。
+from src.run_fb_friend import classify_fb_block
+from src.run_meta_cleanup import parse_age_days as _meta_age_days
+from src.utils import human_sleep
+
+_JSON_PATH: str | None = None
+_RESULT: dict | None = None
+
+PLATFORM = "fb"
+FB = "https://www.facebook.com"
+PROFILE_URL = FB + "/profile.php?id={fbid}"
+# 2026-09-03 實測：新版時報是虛擬清單＋延遲載入，捲了半天只掃到 1 則自己的貼文；
+# mbasic／m.facebook.com 都已被導回新版，走不通。**活動紀錄**（allactivity，篩「貼文」）
+# 才是 FB 自己列「你發過的每一則」的地方：一行一則、依日期分組、捲動就有更多——
+# 同樣 8 次捲動，時報 1 則、活動紀錄 62 則。掃描走這裡，刪除仍在貼文頁上做。
+ACTIVITY_URL = FB + "/{fbid}/allactivity?activity_history=false&category_key=STATUSCLUSTER"
+
+DEFAULT_OLDER_THAN = 30       # 老闆定的預設值（SPEC-P32 §2）
+MIN_OLDER_THAN = 7            # 再小就等於「剛發就刪」，不准
+DEFAULT_MAX = 20              # 一輪最多刪幾則，剩下的明天繼續
+HARD_CAP = 50                 # 設定再大也不准超過
+DELETE_GAP = (10, 30)         # 每則之間的秒數（SPEC-P32 §2）
+MAX_CONSECUTIVE_FAILS = 3     # 連續幾則刪不掉就停：多半是版面改了，繼續只是白點
+# 2026-09-03 實測教訓：驗證把「刪成功」誤判成失敗，deleted 沒加、上限沒擋，設定 1 則卻刪了 3 則。
+# 所以額度看「按了幾次確認」，不看驗證結果——按下去的那一刻貼文就沒了。
+_CONFIRM_CLICKS = 0
+SCAN_SLACK = 20               # 要掃的貼文數＝上限 * 3 + 這個，時報最上面那批通常都還太新
+
+# 置頂貼文的標記（TODO 實測校正：FB 版面常改，這幾個字要在 mini 上對過）
+_PINNED_HINTS = "置頂貼文|已置頂|置頂|Pinned Post|Pinned"
+
+# 貼文右上角的「⋯」。FB 實際的 aria-label 是「{姓名}的貼文的更多選項」這種長字串，
+# 所以一律用「包含」比對，不用相等。TODO 實測校正。
+_MORE_LABELS = ("採取的動作", "這則貼文的更多選項", "更多選項", "更多動作",
+                "Actions for this post", "More options")
+# FB 現在把貼文「移到垃圾桶」而不是直接刪；兩種講法都收。TODO 實測校正。
+_DELETE_TEXTS = ("移到垃圾桶", "移至垃圾桶", "刪除貼文", "刪除",
+                 "Move to trash", "Move to Trash", "Delete post", "Delete")
+_CONFIRM_TEXTS = ("移到垃圾桶", "移至垃圾桶", "刪除", "確認", "Move", "Delete", "Confirm")
+# 刪成功後畫面上的痕跡
+_DELETED_MARKS = ("已移到垃圾桶", "已移至垃圾桶", "貼文已刪除", "已刪除貼文",
+                  "Moved to trash", "Post deleted")
+# 重開貼文網址時，已刪的貼文會變成這些字樣
+_GONE_MARKS = ("這個內容目前無法顯示", "內容目前無法使用", "你目前無法查看這項內容",
+               # 2026-09-03 實測：刪掉後重開是這句——原本的字表沒有它，害刪成功被記成失敗
+               "目前無法查看此內容", "會發生此情況，通常是因為擁有者",
+               "找不到你要找的內容", "此內容目前無法使用", "抱歉，我們找不到",
+               "content isn't available", "This page isn't available",
+               "Sorry, this content isn't available")
+
+# 這些路徑第一段不是貼文作者（避免把粉專入口、相片頁當成自己的貼文）
+_NOT_AUTHOR = {"groups", "photo", "photo.php", "photos", "watch", "marketplace", "events",
+               "stories", "reel", "reels", "media", "video", "videos", "pages", "people",
+               "hashtag", "search", "l.php", "sharer", "sharer.php", "dialog", "login"}
+
+# ---- page.evaluate 用的 JS ----
+# ⚠️ 教訓 1：這些字串裡**絕不能出現 \n 跳脫**——Python 會把它變成真的換行，塞進 JS
+#    字串常值就是 SyntaxError，而 evaluate 包在 suppress 裡會安靜地回空：功能整個失效
+#    卻沒有任何錯誤訊息（本專案踩過兩次）。要換行一律用 String.fromCharCode(10)。
+# ⚠️ 教訓 2：FB 的卡片裡，作者名與時間戳常常不是 <a>（是 span，靠 aria-labelledby 拼字）。
+#    所以從「找得到的元素」（時間戳連結）往上爬到整張卡，再**在卡片內**查詢需要的東西，
+#    不要對 document 全域查詢——全域查會把上一則的資料配到下一則身上。
+_CARDS_JS = """(arg) => {
+    const sel = "a[href*='/posts/'], a[href*='permalink.php'], a[href*='story.php']";
+    const out = [];
+    const pin = new RegExp(arg.pin);
+    for (const a of document.querySelectorAll(sel)) {
+        const href = a.href || '';
+        if (!href) continue;
+        let card = a;
+        for (let i = 0; i < 12 && card.parentElement; i++) {
+            card = card.parentElement;
+            if (card.getAttribute && card.getAttribute('role') === 'article') break;
+            if ((card.innerText || '').trim().length > 60) break;
+        }
+        // 不要用「一張卡只收一次」去砍重複：往上爬有時會停在包住好幾則貼文的容器，
+        // 那樣一整批貼文會被折成一則（2026-09-03 實測：9 個連結只剩 1 則）。
+        // 重複交給 cards_to_posts 用貼文 key 去除，那個判準才是對的。
+        if (!card) continue;
+        const head = (card.innerText || '').trim().slice(0, 160);
+        const stamp = (a.innerText || a.getAttribute('aria-label') || '').trim();
+        const marked = card.querySelector("[aria-label*='置頂'], [aria-label*='Pinned']");
+        out.push({href: href, stamp: stamp, head: head, pinned: pin.test(head) || !!marked});
+    }
+    return out;
+}"""
+
+# 貼文頁上的所有時間線索：datetime 屬性最準，其次是連結的 aria-label（滑鼠停留看到的完整日期），
+# 最後才是看得到的文字。一行一條，交給 parse_age_days 由上往下試。
+_TIMES_JS = """() => {
+    const sel = "a[href*='/posts/'], a[href*='permalink.php'], a[href*='story.php'], time, abbr";
+    const out = [];
+    document.querySelectorAll(sel).forEach(el => {
+        const v = ((el.getAttribute('datetime') || '') + ' ' +
+            (el.getAttribute('aria-label') || '') + ' ' + (el.innerText || '')).trim();
+        if (v) out.push(v);
+    });
+    return out.slice(0, 40).join(String.fromCharCode(10));
+}"""
+
+# FB 專屬的相對日期：Threads／IG 不會這樣寫，所以 run_meta_cleanup 那份沒有收。
+_TODAY_WORDS = ("今天", "剛剛", "Today")
+_YESTERDAY_WORDS = ("昨天", "Yesterday")
+_DAY_BEFORE_WORDS = ("前天",)
+
+
+def _write():
+    """任何離開路徑都要留下結果——被擋、例外、Ctrl-C 都算。
+
+    後端橋接（fbauto_bridge._result_from_raw）只讀 raw["data"]，但人／舊工具看的是頂層，
+    所以寫檔時把同一份內容鏡到 data 底下，兩邊永遠一致（與 run_meta_cleanup 同契約）。
+    """
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(envelope(_RESULT), f, ensure_ascii=False, indent=2)
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[fbclean] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+# ---------------------------------------------------------------- 純函式（可離線測）
+
+# ── 只刪摸魚發的（老闆 2026-09-05）──────────────────────────────────────────────
+# 掃到的貼文要「對得上我們自己的紀錄」才刪：網址在白名單裡，或內文含我們固定附加的
+# 法定資訊／某個物件標題。兩種都對不上就跳過（記成 not_ours），寧可留著客戶手動發的。
+def load_only(path: str) -> dict:
+    """讀白名單檔。壞檔／不存在 → 回 None，代表「沒有白名單」。
+
+    注意這裡回 None 而不是空 dict：兩者語意不同。
+    None＝呼叫端沒給白名單（舊行為）；空的白名單＝有給但裡面沒東西，
+    那就一則都不該刪——不然「紀錄是空的」會變成「全部都刪」。
+    """
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        print("[fbclean] ⚠ 白名單讀不到，這輪不刪任何東西（保守處理）", flush=True)
+        return {"urls": [], "phrases": []}
+    if isinstance(raw, dict):
+        return {"urls": [str(u) for u in (raw.get("urls") or [])],
+                "phrases": [str(p) for p in (raw.get("phrases") or [])]}
+    return {"urls": [], "phrases": []}
+
+
+def _norm_url(u: str) -> str:
+    return (u or "").split("?")[0].rstrip("/").lower()
+
+
+def is_ours(url: str, text: str, only: dict | None) -> bool:
+    """這則是不是摸魚發的？沒有白名單就一律當成是（維持舊行為）。"""
+    if only is None:
+        return True
+    nu = _norm_url(url)
+    if nu and any(nu == _norm_url(u) or (u and _norm_url(u) in nu) for u in only.get("urls") or []):
+        return True
+    body = (text or "")
+    return any(p and p in body for p in only.get("phrases") or [])
+
+
+def envelope(result: dict) -> dict:
+    """結果 dict → 寫進檔案的樣子：頂層照舊，另鏡一份到 data。"""
+    body = {k: v for k, v in result.items() if k != "data"}
+    out = dict(body)
+    out["data"] = body
+    return out
+
+
+def effective_older_than(requested: int | None) -> int:
+    """把天數夾到合理範圍。下限是硬的——刪文不可逆，太短會刪到還在曝光的貼文。"""
+    n = DEFAULT_OLDER_THAN if not requested or requested <= 0 else int(requested)
+    return max(MIN_OLDER_THAN, n)
+
+
+def effective_max(requested: int | None) -> int:
+    """一輪的刪除上限。剩下的明天繼續刪，不要一次刪光——量太大最容易被判機器人。"""
+    n = DEFAULT_MAX if not requested or requested <= 0 else int(requested)
+    return max(1, min(HARD_CAP, n))
+
+
+def should_delete(age_days, older_than: int) -> bool:
+    """這則該不該刪？日期讀不到（None／負數／看不懂）一律不刪——寧可留著。"""
+    if age_days is None:
+        return False
+    try:
+        age = int(age_days)
+    except (TypeError, ValueError):
+        return False
+    return age >= 0 and age >= older_than
+
+
+def parse_age_days(text: str, now: datetime.datetime | None = None) -> int | None:
+    """FB 的時間標記 → 幾天前發的；判不出來回 None（呼叫端要跳過，不是當成 0）。
+
+    FB 自己多出來的講法只有「今天／昨天／前天」（時報上很常見），先在這裡吃掉；
+    ISO、「2026年7月12日」、「3天前」「2週」「3 days ago」那些跟 Threads／IG 同語系，
+    直接交給 run_meta_cleanup 的同一份解析，不維護兩套字表。
+
+    now 可注入：不注入的話測試會寫死日期，過幾個月自己爆炸。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    if any(w in text for w in _DAY_BEFORE_WORDS):
+        return 2
+    if any(w in text for w in _YESTERDAY_WORDS):
+        return 1
+    if any(w in text for w in _TODAY_WORDS):
+        return 0
+    got = _meta_age_days(text, now=now)
+    if got is not None:
+        return got
+    return _month_day_age(text, now=now)
+
+
+_MONTH_DAY_RE = __import__("re").compile(r"(?<!\d)(\d{1,2})月(\d{1,2})日")
+
+
+def _month_day_age(text: str, now: datetime.datetime | None = None) -> int | None:
+    """FB 一年內的時間戳「7月12日 下午2:10」不帶年份。
+    當作今年；算出來在未來就是去年的——FB 只對一年內的貼文省略年份，不會更早。"""
+    m = _MONTH_DAY_RE.search(text or "")
+    if not m:
+        return None
+    now = now or datetime.datetime.now()
+    try:
+        d = datetime.datetime(now.year, int(m.group(1)), int(m.group(2)))
+    except ValueError:
+        return None
+    if d > now:
+        d = d.replace(year=now.year - 1)
+    return (now - d).days
+
+
+def profile_url(fbid: str) -> str:
+    """帳號自己的動態時報。用 profile.php?id= 而不是 /me：/me 常被通知面板蓋住。"""
+    return PROFILE_URL.format(fbid=fbid)
+
+
+def post_key_from_url(url: str, fbid: str = "", vanity: str = "") -> str:
+    """FB 連結 → 「這是哪一則貼文」的唯一鍵；不是本人的貼文一律回空字串。
+
+    認得的四種寫法（其餘一律不認，寧可少刪）：
+      - /permalink.php?story_fbid=X&id=<fbid>   → X
+      - /story.php?story_fbid=X&id=<fbid>       → X
+      - /<fbid>/posts/X                          → X
+      - /<自己的代稱>/posts/X                     → X（vanity 有給才認）
+
+    刻意擋掉的：
+      - 帶 comment_id 的連結——那是**留言**的永久連結，不是貼文本體。
+        FB 的留言區裡到處都是這種連結，收進來就會去刪錯東西。
+      - /groups/…/posts/… —— 社團貼文（SPEC-P32 §2 另一條路，本支不掃）。
+      - 別人的貼文（id／代稱對不上）—— 別人 tag 你、朋友貼到你的時報都長這樣。
+      - /photo/、/reel/、/videos/ —— 那是附件的連結，不是貼文標頭。
+    """
+    if not url:
+        return ""
+    u = urlparse(url.strip())
+    qs = parse_qs(u.query or "")
+    if qs.get("comment_id"):
+        return ""
+    path = (u.path or "").rstrip("/")
+    segs = [s for s in path.split("/") if s]
+
+    if path.endswith("permalink.php") or path.endswith("story.php"):
+        sid = (qs.get("story_fbid") or [""])[0]
+        owner = (qs.get("id") or [""])[0]
+        if not sid:
+            return ""
+        if fbid and owner and owner != str(fbid):
+            return ""
+        return sid
+
+    if len(segs) >= 3 and segs[1] == "posts":
+        author, sid = segs[0], segs[2]
+        if author in _NOT_AUTHOR:
+            return ""
+        allowed = {str(fbid)} | ({vanity} if vanity else set())
+        if fbid and author not in allowed:
+            return ""
+        return sid
+    return ""
+
+
+def canonical_post_url(url: str, fbid: str = "", vanity: str = "") -> str:
+    """把帶一堆追蹤參數（__cft__、__tn__、notif_id…）的連結收斂成乾淨網址。
+
+    不收斂的話同一則會因為參數不同被當成好幾則，一輪的額度就被同一篇吃光。
+    """
+    key = post_key_from_url(url, fbid, vanity)
+    if not key:
+        return ""
+    u = urlparse(url.strip())
+    path = (u.path or "").rstrip("/")
+    if path.endswith("permalink.php") or path.endswith("story.php"):
+        owner = (parse_qs(u.query or "").get("id") or [str(fbid)])[0] or str(fbid)
+        return f"{FB}/permalink.php?story_fbid={key}&id={owner}"
+    segs = [s for s in path.split("/") if s]
+    return f"{FB}/{segs[0]}/posts/{key}"
+
+
+def cards_to_posts(cards: list, fbid: str = "", vanity: str = "",
+                   now: datetime.datetime | None = None) -> list[dict]:
+    """時報上收到的卡片 → 候選貼文 [{url, key, age_days, pinned}]，同一則只留第一筆。
+
+    年齡優先讀時間戳連結自己的文字（「3天」「2週」）；讀不到才退回卡片開頭那段
+    （名字＋時間那一行）。**絕不整張卡拿去解析**——卡片下半部是留言，留言的
+    「2 小時」會把一則三個月前的貼文算成今天發的。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for c in cards or []:
+        href = (c or {}).get("href") or ""
+        key = post_key_from_url(href, fbid, vanity)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        age = parse_age_days((c.get("stamp") or ""), now=now)
+        if age is None:
+            age = parse_age_days((c.get("head") or "")[:60], now=now)
+        out.append({"url": canonical_post_url(href, fbid, vanity), "key": key,
+                    "age_days": age, "pinned": bool(c.get("pinned"))})
+    return out
+
+
+def block_reason(page_text: str = "", error_text: str = "") -> str:
+    """頁面文字是不是「這輪該停」的訊號？是就回原因字串，否則空字串。
+
+    只認 action_blocked：FB 到處都有「請稍後再試」，把節流也當封鎖會天天誤停。
+    """
+    reason = classify_fb_block(page_text=page_text, error_text=error_text)
+    return reason if reason == ACTION_BLOCKED else ""
+
+
+def summarize(posts: list) -> dict:
+    """結果 JSON 的計數欄位。dry-run 的那些算「本來要刪的」，不算已刪。"""
+    st = [p.get("status") for p in posts or []]
+    return {"deleted": st.count("deleted"),
+            "skipped_undated": st.count("undated"),
+            "skipped_recent": st.count("recent")}
+
+
+def describe(result: dict) -> str:
+    """給客戶看的一行紀錄：動詞＋對象＋數量，不能只寫「成功」。"""
+    older = result.get("older_than", DEFAULT_OLDER_THAN)
+    undated = result.get("skipped_undated", 0)
+    tail = f"（另 {undated} 則日期讀不到，留著）" if undated else ""
+    if result.get("dry_run"):
+        n = sum(1 for p in result.get("posts", []) if p.get("status") == "dry_run")
+        return f"FB 備份刪文試跑：找到 {n} 則超過 {older} 天的貼文（沒有真的刪）{tail}"
+    return f"FB 備份刪文：清掉 {result.get('deleted', 0)} 則超過 {older} 天的貼文{tail}"
+
+
+# ---------------------------------------------------------------- 瀏覽器動作
+
+def _body_text(page, limit: int = 4000) -> str:
+    with contextlib.suppress(Exception):
+        return page.evaluate("()=>document.body.innerText")[:limit]
+    return ""
+
+
+def _blocked_reason(page, fbid: str) -> str:
+    """頁面上有封鎖／驗證跡象嗎？回原因字串，沒有回空字串。
+
+    兩層，與加好友那支同一套：既有的 perform_checks（封鎖、鎖定、檢查點）＋文字比對。
+    """
+    from src.utils import CheckResult, perform_checks
+
+    with contextlib.suppress(Exception):
+        chk = perform_checks(page, fbid)
+        if chk != CheckResult.OK:
+            return chk.value
+    return block_reason(page_text=_body_text(page))
+
+
+def _own_id(page) -> str:
+    """登入中的帳號 id（c_user cookie）——要跟 --fbid 對得起來才准動手。"""
+    with contextlib.suppress(Exception):
+        for c in page.context.cookies(FB):
+            if c.get("name") == "c_user" and c.get("value"):
+                return str(c["value"])
+    return ""
+
+
+def _my_vanity(page) -> str:
+    """自己的帳號代稱（有些帳號的貼文連結是 /代稱/posts/…，不是數字 id）。
+
+    2026-09-03 mini 實測：個人頁沒有 og:url，但 profile.php?id=… 會 302 到
+    /代稱/，所以先讀當下網址，再退回 og:url。讀不到就只認數字 id 的連結——
+    少收幾則沒關係，收錯人的就糟了。
+    """
+    for getter in (lambda: page.url,
+                   lambda: page.evaluate(
+                       "()=>(document.querySelector('meta[property=\"og:url\"]')||{}).content||'')".replace("')", "'")) or ""):
+        with contextlib.suppress(Exception):
+            u = getter() or ""
+            seg = [s for s in urlparse(u).path.split("/") if s]
+            if seg and seg[0] not in _NOT_AUTHOR and not seg[0].endswith(".php"):
+                return seg[0]
+    return ""
+
+
+def activity_url(fbid: str) -> str:
+    return ACTIVITY_URL.format(fbid=fbid)
+
+
+# 活動紀錄的一列：「蔡峻豪新增了 1 張相片。 …內文… 所有人 下午8:53 查看」，
+# 「查看」是貼文連結；日期在**上方的分組標頭**（「2026年9月1日」），不在列裡。
+# ⚠️ 列的內文不能拿來算年齡：「新增了 2011年9月1日的 1 則生活要事」這種列，
+#    內文裡的年份是事件日期，不是發文日期——拿它算會把上個月發的當成 15 年前的貼文刪掉。
+#    所以 head 一律給空字串，年齡只信標頭；標頭找不到就 undated、不刪。
+_ACTIVITY_JS = """() => {
+    const isDate = /^((\\d{4}年)?\\d{1,2}月\\d{1,2}日|今天|昨天|前天)/;
+    const out = [];
+    const links = [...document.querySelectorAll("a[href*='/posts/'], a[href*='permalink.php'], a[href*='story.php']")]
+        .filter(a => !/comment_id=/.test(a.href || ''));
+    for (const a of links) {
+        let row = a;
+        for (let i = 0; i < 10 && row.parentElement; i++) {
+            row = row.parentElement;
+            const t = (row.innerText || '').trim();
+            if (t.length > 25 && /\\d/.test(t)) break;
+        }
+        let hdr = '';
+        let el = row;
+        for (let i = 0; i < 6 && el && !hdr; i++) {
+            let sib = el.previousElementSibling;
+            while (sib && !hdr) {
+                const t = (sib.innerText || '').trim().split(String.fromCharCode(10))[0];
+                if (isDate.test(t)) hdr = t;
+                sib = sib.previousElementSibling;
+            }
+            el = el.parentElement;
+        }
+        const rowText = (row.innerText || '').slice(0, 80);
+        out.push({href: a.href || '', stamp: hdr, head: '', pinned: /置頂|Pinned/.test(rowText)});
+    }
+    return out;
+}"""
+
+
+def _collect_activity_log(page, fbid: str, vanity: str, want: int, rounds: int,
+                          now: datetime.datetime | None = None) -> list[dict]:
+    """活動紀錄「貼文」分類：邊捲邊收（一樣是虛擬清單），直到夠用或連捲 5 次沒新東西。"""
+    with contextlib.suppress(Exception):
+        page.goto(activity_url(fbid), wait_until="domcontentloaded", timeout=60000)
+    human_sleep(5.0, 8.0)
+    if "allactivity" not in (page.url or ""):
+        print("[fbclean] 活動紀錄頁被導走了，改走時報", flush=True)
+        return []
+    found: list[dict] = []
+    keys: set[str] = set()
+    empty_rounds = 0
+    for _ in range(max(1, rounds)):
+        before = len(found)
+        cards = []
+        with contextlib.suppress(Exception):
+            cards = page.evaluate(_ACTIVITY_JS) or []
+        for p in cards_to_posts(cards, fbid, vanity, now=now):
+            if p["key"] in keys:
+                continue
+            keys.add(p["key"])
+            p["dated_by"] = "activity"      # 日期來自 FB 自己的活動紀錄標頭，不必再到貼文頁複驗
+            found.append(p)
+        if len(found) >= want:
+            break
+        empty_rounds = empty_rounds + 1 if len(found) == before else 0
+        if empty_rounds >= 5:
+            break
+        with contextlib.suppress(Exception):
+            page.mouse.wheel(0, 2400)
+        human_sleep(1.5, 3.0)
+    print(f"[fbclean] 活動紀錄收到 {len(found)} 則自己的貼文", flush=True)
+    return found[:want]
+
+
+def _collect_cards(page) -> list[dict]:
+    with contextlib.suppress(Exception):
+        return page.evaluate(_CARDS_JS, {"pin": _PINNED_HINTS}) or []
+    return []
+
+
+def _collect_while_scrolling(page, fbid: str, vanity: str, want: int, rounds: int,
+                             now: datetime.datetime | None = None) -> list[dict]:
+    """邊捲邊收，不是捲完才收。
+
+    FB 的動態時報跟 IG 九宮格一樣是**虛擬清單**：捲下去以後上面那幾則會被從 DOM 拿掉。
+    「捲 N 次再抓」的寫法只會抓到最後一屏——2026-09-03 在 IG 那支實測是把 6 則抓成 1 則，
+    FB 只會更嚴重（要刪的正是最舊的那批，它們在最下面）。
+    """
+    found: list[dict] = []
+    keys: set[str] = set()
+    empty_rounds = 0
+    for _ in range(max(1, rounds)):
+        before = len(found)
+        for p in cards_to_posts(_collect_cards(page), fbid, vanity, now=now):
+            if p["key"] in keys:
+                continue
+            keys.add(p["key"])
+            found.append(p)
+        if len(found) >= want:
+            break
+        empty_rounds = empty_rounds + 1 if len(found) == before else 0
+        # FB 時報一則貼文可能佔滿整屏，而且載入慢：連續 5 次沒有新東西才算到底，
+        # 每次捲 2 屏。門檻太低會提早收手——實測只掃到 1 則就停了（2026-09-03）。
+        if empty_rounds >= 5:
+            break
+        with contextlib.suppress(Exception):
+            page.mouse.wheel(0, 2400)
+        human_sleep(1.5, 3.0)
+    return found[:want]
+
+
+def _post_age_days(page, now: datetime.datetime | None = None) -> int | None:
+    """貼文頁上的時間線索 → 幾天前。留言的時間也在這頁，但它一定比貼文新，
+    最壞情況是把老貼文看成新的而跳過——保守方向，可以接受。"""
+    blob = ""
+    with contextlib.suppress(Exception):
+        blob = page.evaluate(_TIMES_JS) or ""
+    for line in blob.splitlines():
+        age = parse_age_days(line, now=now)
+        if age is not None:
+            return age
+    return None
+
+
+def _first_visible(loc, limit: int = 12):
+    """同一個選擇器常命中兩份：FB 會把貼文對話框渲染兩次，一份藏著（2026-09-03 實測）。
+    取 .first 會剛好撞到藏著的那份、is_visible() 為 False，整個流程就當作「找不到」。
+    所以要在所有命中裡挑第一個看得見的。"""
+    with contextlib.suppress(Exception):
+        n = min(loc.count(), limit)
+        for i in range(n):
+            el = loc.nth(i)
+            if el.is_visible():
+                return el
+    return None
+
+
+def _find_by_texts(page, texts, roles=("menuitem", "button")):
+    """依中英文字找可點的元素；找不到回 None。"""
+    for t in texts:
+        for role in roles:
+            el = _first_visible(page.get_by_role(role, name=t, exact=True))
+            if el is not None:
+                return el
+    for t in texts:
+        el = _first_visible(page.get_by_text(t, exact=True))
+        if el is not None:
+            return el
+    return None
+
+
+def _find_more_button(page):
+    """貼文右上角的「⋯」。
+
+    2026-09-03 mini 實測：貼文永久連結是開在 div[role=dialog] 裡，後面的動態牆還在；
+    ⋯ 的 aria-label 是「對{姓名}的這則貼文採取的動作」。**一定要限定在對話框內找**——
+    不限定的話會抓到後面動態牆別人貼文的 ⋯（實測抓到「對陳安森的這則貼文採取的動作」，
+    而且被對話框蓋住點不下去，30 秒逾時）。
+    """
+    scopes = ('div[role="dialog"] ', "")
+    for scope in scopes:
+        for lab in _MORE_LABELS:
+            for sel in (f'{scope}div[role="button"][aria-label*="{lab}"]', f'{scope}[aria-label*="{lab}"]'):
+                el = _first_visible(page.locator(sel))
+                if el is not None:
+                    return el
+    return _find_by_texts(page, _MORE_LABELS, roles=("button",))
+
+
+def _deleted_ok(page, url: str) -> bool:
+    """真的刪掉了嗎？先看有沒有「已移到垃圾桶」之類的提示，沒有就重開這則看是不是已經不在。
+
+    不能只憑「按了確認」就算成功——按鈕點空了、對話框卡住都不會報錯，
+    數字灌水比少刪一則糟糕得多（客戶會以為舊文清乾淨了，其實還掛在牆上）。
+    """
+    for _ in range(8):
+        if any(k in _body_text(page) for k in _DELETED_MARKS):
+            return True
+        human_sleep(0.8, 1.4)
+    with contextlib.suppress(Exception):
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        human_sleep(2.0, 3.5)
+        body = _body_text(page).lower()
+        return any(k.lower() in body for k in _GONE_MARKS)
+    return False
+
+
+def _delete_one(page, url: str) -> bool:
+    """在已開啟的貼文頁上：⋯ → 移到垃圾桶／刪除 → 確認 → 驗證。
+
+    流程沿用 delete_club_post.www_delete_club_post_main 與 Marketplace 刪除那套
+    （選單找不到就 Escape 收手，確認框一定要在 dialog 裡找，最後一定要驗證），
+    任何一步找不到就放棄這則——放棄一則的代價遠小於亂點。
+    """
+    # 貼文頁是延遲渲染的：domcontentloaded 之後 ⋯ 常常還沒長出來（2026-09-03 實測同一則
+    # 貼文有時 7 秒後有、有時沒有）。先等它掛上 DOM，最多 20 秒，再找。
+    with contextlib.suppress(Exception):
+        page.wait_for_selector(
+            '[aria-label*="採取的動作"], [aria-label*="Actions for this post"], '
+            '[aria-label*="更多選項"], [aria-label*="More options"]',
+            state="attached", timeout=20000)
+    more = _find_more_button(page)
+    if more is None:
+        print("[fbclean] ⚠ 找不到貼文的「更多選項」，跳過這則", flush=True)
+        return False
+    more.click()
+    human_sleep(1.0, 2.0)
+
+    item = _find_by_texts(page, _DELETE_TEXTS)
+    if item is None:
+        with contextlib.suppress(Exception):
+            page.keyboard.press("Escape")
+        print("[fbclean] ⚠ 選單裡沒有「刪除／移到垃圾桶」（可能不是自己的貼文），跳過", flush=True)
+        return False
+    item.click()
+    human_sleep(1.0, 2.0)
+
+    # 確認框：**只在 dialog 裡找**，不做全頁退路。
+    # 「刪除」同時出現在選單與確認框，全頁找會把剛按過的選單項目再配一次（點空或點到別的東西）；
+    # 確認框沒開就代表這一步沒成功——寧可 Escape 收手，也不要在不確定的畫面上亂點。
+    # 2026-09-03 實測：貼文本身就開在一個 dialog 裡，確認框是後來才彈出的**最後一個** dialog。
+    # 所以取 .last 不取 .first——.first 會落在貼文 dialog 裡剛好也叫「刪除」的東西上。
+    confirm = None
+    for t in _CONFIRM_TEXTS:
+        for sel in (f'div[role="dialog"] [role="button"]:has-text("{t}")',
+                    f'div[role="dialog"] button:has-text("{t}")',
+                    f'div[role="dialog"] [aria-label="{t}"]'):
+            # 確認框是最後彈出的 dialog：從最後一個命中往前找第一個看得見的
+            with contextlib.suppress(Exception):
+                loc = page.locator(sel)
+                for i in range(min(loc.count(), 12) - 1, -1, -1):
+                    if loc.nth(i).is_visible():
+                        confirm = loc.nth(i)
+                        break
+            if confirm is not None:
+                break
+        if confirm is not None:
+            break
+    if confirm is None:
+        with contextlib.suppress(Exception):
+            page.keyboard.press("Escape")
+        print("[fbclean] ⚠ 沒有出現確認框，這則不動（不在不確定的畫面上亂點）", flush=True)
+        return False
+    with contextlib.suppress(Exception):
+        print(f"[fbclean] 確認框按鈕：{(confirm.get_attribute('aria-label') or confirm.inner_text() or '')[:40]!r}", flush=True)
+    global _CONFIRM_CLICKS
+    _CONFIRM_CLICKS += 1          # 按下去就算一次，不管後面驗證怎麼說
+    confirm.click()
+    human_sleep(1.5, 3.0)
+    ok = _deleted_ok(page, url)
+    if not ok:
+        # 沒有這一行，紀錄裡只會看到「連續 3 則刪不掉」，完全不知道卡在哪（2026-09-03 實測）
+        print("[fbclean] ⚠ 按了確認但驗證失敗：沒看到「已移到垃圾桶」，重開貼文也還在", flush=True)
+    return ok
+
+
+def do_cleanup(fbid: str, older_than: int, max_delete: int, headless: bool,
+               dry_run: bool = False, profile_dir: str | None = None,
+               only: dict | None = None) -> dict:
+    from src.login import _try_cookie_login
+    from src.utils import capture_screenshot, launch_browser
+
+    browser, context, page = launch_browser(fbid=fbid, headless=headless,
+                                            user_data_dir=profile_dir)
+    posts: list[dict] = []
+    blocked, reason, pinned_skipped = False, "", 0
+    try:
+        if not _try_cookie_login(page, context, fbid):
+            raise RuntimeError("Cookie 登入失敗，請先用 CLI 登入一次")
+
+        me = _own_id(page)
+        if me and str(me) != str(fbid):
+            # 登入的不是這個帳號還照刪，就是拿別人的帳號刪文——直接不做
+            raise RuntimeError(f"目前登入的是 {me}，與指定的 {fbid} 不同，為安全起見不刪任何東西")
+
+        why = _blocked_reason(page, fbid)
+        if why:
+            with contextlib.suppress(Exception):
+                capture_screenshot(page, fbid, "cleanup_blocked")
+            print("[fbclean] ⚠ 一進來就偵測到限制，這輪不刪任何東西", flush=True)
+            return {"posts": [], "blocked": True, "block_reason": why, "skipped_pinned": 0}
+
+        page.goto(profile_url(fbid), wait_until="domcontentloaded", timeout=60000)
+        human_sleep(5.0, 8.0)            # 時報是延遲載入的，等太短就是一片空白
+        why = _blocked_reason(page, fbid)
+        if why:
+            with contextlib.suppress(Exception):
+                capture_screenshot(page, fbid, "cleanup_blocked_profile")
+            print("[fbclean] ⚠ 一進動態時報就偵測到限制，這輪不刪任何東西", flush=True)
+            return {"posts": [], "blocked": True, "block_reason": why, "skipped_pinned": 0}
+
+        vanity = _my_vanity(page)
+        want = max_delete * 3 + SCAN_SLACK      # 要刪的是最舊的那批，得先翻得夠深
+        cands = _collect_activity_log(page, fbid, vanity, want,
+                                      rounds=min(60, max_delete * 3 + 12))
+        if not cands:
+            with contextlib.suppress(Exception):
+                page.goto(profile_url(fbid), wait_until="domcontentloaded", timeout=60000)
+            human_sleep(5.0, 8.0)
+            cands = _collect_while_scrolling(page, fbid, vanity, want,
+                                             rounds=min(60, max_delete * 3 + 12))
+        pinned_skipped = sum(1 for p in cands if p["pinned"])
+        cands = [p for p in cands if not p["pinned"]]
+        print(f"[fbclean] 掃到 {len(cands)} 則自己的貼文"
+              f"{f'（另 {pinned_skipped} 則置頂不動）' if pinned_skipped else ''}", flush=True)
+
+        deleted = 0
+        fails = 0
+        for cand in cands:
+            if deleted >= max_delete:
+                print(f"[fbclean] 已達本輪上限 {max_delete} 則，其餘下一輪再刪", flush=True)
+                break
+            url, age = cand["url"], cand["age_days"]
+            if age is None:
+                posts.append({"url": url, "age_days": None, "status": "undated"})
+                print(f"[fbclean] 日期讀不到，留著：{url}", flush=True)
+                continue
+            if not should_delete(age, older_than):
+                posts.append({"url": url, "age_days": age, "status": "recent"})
+                continue
+            if only is not None:
+                # 判斷「是不是摸魚發的」要看內文，所以這裡一定要開貼文頁（dry-run 也要）
+                with contextlib.suppress(Exception):
+                    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    human_sleep(2.0, 3.5)
+                if not is_ours(url, _body_text(page, 6000), only):
+                    posts.append({"url": url, "age_days": age, "status": "not_ours"})
+                    print(f"[fbclean] 不是摸魚發的，留著：{url}", flush=True)
+                    continue
+            if dry_run:
+                # 只列不刪
+                posts.append({"url": url, "age_days": age, "status": "dry_run"})
+                deleted += 1
+                continue
+
+            with contextlib.suppress(Exception):
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            human_sleep(2.5, 4.5)
+            why = _blocked_reason(page, fbid)
+            if why:
+                blocked, reason = True, why
+                with contextlib.suppress(Exception):
+                    capture_screenshot(page, fbid, "cleanup_blocked_post")
+                print("[fbclean] ⚠ 偵測到動作被限制，立即中止整輪", flush=True)
+                break
+            if any(m in _body_text(page, 3000) for m in _GONE_MARKS):
+                # 已經不在了（多半是上一輪刪成功但沒記到）：不算失敗、不吃額度、不重試
+                posts.append({"url": url, "age_days": age, "status": "gone"})
+                print(f"[fbclean] 這則已經不在了，略過：{url}", flush=True)
+                continue
+
+            # 時報卡片的時間不一定準，收來的要到貼文頁複驗一次。
+            # 活動紀錄來的**不複驗**：貼文頁上到處是留言、相關貼文的時間（2026-09-03 實測：
+            # 23 則舊貼文全被複驗成「太新」，一則都沒刪），而活動紀錄的日期是 FB 自己記的。
+            if cand.get("dated_by") != "activity":
+                page_age = _post_age_days(page)
+                if page_age is not None and not should_delete(page_age, older_than):
+                    # 兩邊不一致就聽比較保守的那個——刪錯不可逆
+                    posts.append({"url": url, "age_days": page_age, "status": "recent"})
+                    continue
+
+            if _CONFIRM_CLICKS >= max_delete:
+                print(f"[fbclean] 本輪已按過 {_CONFIRM_CLICKS} 次確認，達上限，停手", flush=True)
+                break
+            ok = False
+            try:
+                ok = _delete_one(page, url)
+            except Exception as e:
+                print(f"[fbclean] 刪除例外：{str(e)[:160]}", flush=True)
+            fails = fails + 1 if not ok else 0
+            if not ok and fails >= MAX_CONSECUTIVE_FAILS:
+                posts.append({"url": url, "age_days": age, "status": "failed"})
+                print(f"[fbclean] ⚠ 連續 {fails} 則刪不掉，多半是版面改了，這輪停手", flush=True)
+                break
+            why = _blocked_reason(page, fbid)
+            if why:
+                posts.append({"url": url, "age_days": age, "status": "failed"})
+                blocked, reason = True, why
+                with contextlib.suppress(Exception):
+                    capture_screenshot(page, fbid, "cleanup_blocked_delete")
+                print("[fbclean] ⚠ 刪除後偵測到限制，立即中止整輪", flush=True)
+                break
+            posts.append({"url": url, "age_days": age, "status": "deleted" if ok else "failed"})
+            if ok:
+                deleted += 1
+                print(f"[fbclean] 已刪除 {url}（{age} 天前，{deleted}/{max_delete}）", flush=True)
+                if deleted < max_delete:
+                    human_sleep(*DELETE_GAP)     # 連續刪最像腳本，一定要拉開
+        return {"posts": posts, "blocked": blocked, "block_reason": reason,
+                "skipped_pinned": pinned_skipped}
+    except Exception as e:
+        e.reason = classify_fb_block(page_text=_body_text(page), error_text=str(e))
+        # 已刪的不能白刪——附在例外上讓上層照樣記錄
+        e.partial = {"posts": posts, "blocked": blocked, "block_reason": reason,
+                     "skipped_pinned": pinned_skipped}
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            context.close()                      # persistent context：browser 與 context 同物件
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser(description="FB 備份模式自動刪文（SPEC-P32 §2）")
+    ap.add_argument("--fbid", required=True)
+    ap.add_argument("--older-than", type=int, default=DEFAULT_OLDER_THAN,
+                    help=f"刪超過幾天的貼文（預設 {DEFAULT_OLDER_THAN}，最少 {MIN_OLDER_THAN}）")
+    ap.add_argument("--max", type=int, default=DEFAULT_MAX,
+                    help=f"這輪最多刪幾則（硬上限 {HARD_CAP}）")
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="只列出會刪哪些，不刪任何東西")
+    ap.add_argument("--only-file", default="",
+                    help="白名單 JSON：只刪對得上的貼文（摸魚自己發的）")
+    ap.add_argument("--result-json")
+    ap.add_argument("--profile-dir", default=None, help="瀏覽器設定檔目錄（預設 user_data/<fbid>）")
+    args = ap.parse_args()
+
+    older_than = effective_older_than(args.older_than)
+    max_delete = effective_max(args.max)
+
+    _JSON_PATH = args.result_json
+    _RESULT = {"success": False, "platform": PLATFORM, "fbid": args.fbid,
+               "older_than": older_than, "max": max_delete, "dry_run": bool(args.dry_run),
+               "deleted": 0, "skipped_undated": 0, "skipped_recent": 0, "skipped_pinned": 0,
+               "blocked": False, "block_reason": "", "error": "未完成", "posts": []}
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    # 夾住要講明白，不然客戶以為設定 3 天就真的 3 天
+    if args.older_than and args.older_than < MIN_OLDER_THAN:
+        print(f"[fbclean] --older-than {args.older_than} 太小，已提高到最少 {MIN_OLDER_THAN} 天",
+              flush=True)
+    if args.max and args.max > HARD_CAP:
+        print(f"[fbclean] --max {args.max} 超過硬上限，已夾到 {HARD_CAP} 則", flush=True)
+
+    def _fill(r: dict):
+        _RESULT["posts"] = r.get("posts", []) or []
+        _RESULT["blocked"] = bool(r.get("blocked"))
+        _RESULT["block_reason"] = r.get("block_reason", "") or ""
+        _RESULT["skipped_pinned"] = int(r.get("skipped_pinned") or 0)
+        _RESULT.update(summarize(_RESULT["posts"]))
+
+    try:
+        r = do_cleanup(args.fbid, older_than, max_delete, args.headless,
+                       dry_run=args.dry_run, profile_dir=args.profile_dir,
+                       only=load_only(args.only_file))
+        _fill(r)
+        if _RESULT["blocked"]:
+            _RESULT["error"] = f"動作被限制，已中止（已刪 {_RESULT['deleted']} 則）"
+            sys.exit(1)
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        if args.dry_run:
+            # 這份清單是老闆真的動手前唯一的依據：網址 + 幾天前，最舊的排前面
+            cands = sorted((p for p in _RESULT["posts"] if p.get("status") == "dry_run"),
+                           key=lambda p: -(p.get("age_days") or 0))
+            for p in cands:
+                print(f"[fbclean] dry-run 會刪：{p['url']}（{p['age_days']} 天前）", flush=True)
+            for p in (p for p in _RESULT["posts"] if p.get("status") == "undated"):
+                print(f"[fbclean] dry-run 日期讀不到，會留著：{p['url']}", flush=True)
+        print("[fbclean] ✅ " + describe(_RESULT), flush=True)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        _RESULT["error"] = "使用者中斷"
+        sys.exit(0)
+    except Exception as e:
+        _fill(getattr(e, "partial", {}) or {})
+        _RESULT["error"] = str(e)
+        reason = getattr(e, "reason", None) or classify_fb_block(error_text=str(e))
+        if reason == ACTION_BLOCKED:
+            _RESULT["blocked"] = True
+            _RESULT["block_reason"] = reason
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,76 @@
+"""平台級暫停：被 Threads / IG 限制動作時停手一段時間（SPEC-P28）。
+
+為什麼要有：帳號還登著、但動作被限制時，繼續每天照發只會把帳號推向更嚴重的
+限制。FB 那條路徑早就有這層保護（偵測到就全域暫停 + 紅橫幅），Threads/IG 沒有。
+
+三個原則：
+  1. **平台獨立**——IG 被限制不該連帶停掉 Threads，更不該停掉 FB 主發。
+  2. **會自己好**——記「暫停到某時刻」而非布林，時間到自動恢復，不必客戶手動解鎖。
+  3. **越犯越久**——連續被限制代表帳號狀況不好，冷卻時間加倍（上限 7 天）。
+     成功發文一次就歸零：那代表限制已經解除。
+"""
+import datetime
+
+FIRST_COOLDOWN_HOURS = 24
+MAX_COOLDOWN_HOURS = 24 * 7
+VALID_PLATFORMS = ("threads", "ig")
+
+
+def cooldown_hours(previous_count: int) -> int:
+    """第 N 次被限制要停多久。1→24h、2→48h、3→96h…上限 7 天。"""
+    hours = FIRST_COOLDOWN_HOURS * (2 ** max(0, previous_count))
+    return min(hours, MAX_COOLDOWN_HOURS)
+
+
+def _fields(platform: str) -> tuple[str, str, str]:
+    return (f"{platform}_blocked_until", f"{platform}_block_reason", f"{platform}_block_count")
+
+
+def is_blocked(row, platform: str, now: datetime.datetime | None = None) -> bool:
+    """這個平台現在是不是暫停中。row 為 None（還沒連結）一律當成沒暫停。"""
+    if row is None or platform not in VALID_PLATFORMS:
+        return False
+    until = getattr(row, _fields(platform)[0], None)
+    if until is None:
+        return False
+    return until > (now or datetime.datetime.utcnow())
+
+
+def block_note(row, platform: str, now: datetime.datetime | None = None) -> str:
+    """給人看的一句話：為什麼停、什麼時候會自己再試。
+
+    now 可注入：不然測試只能拿真實時間比對，寫死日期的測試過幾天就會爆。
+    """
+    if not is_blocked(row, platform, now):
+        return ""
+    until, reason, _ = _fields(platform)
+    t = getattr(row, until)
+    label = "Threads" if platform == "threads" else "IG"
+    when = t.replace(tzinfo=datetime.timezone.utc).astimezone().strftime("%m/%d %H:%M")
+    why = getattr(row, reason, "") or "帳號動作被限制"
+    return f"{label} 暫停中——{why}，{when} 後自動再試"
+
+
+def mark_blocked(row, platform: str, reason_text: str = "",
+                 now: datetime.datetime | None = None) -> int:
+    """記錄一次被限制，回傳這次停幾小時。不 commit，由呼叫端處理。"""
+    if row is None or platform not in VALID_PLATFORMS:
+        return 0
+    until_f, reason_f, count_f = _fields(platform)
+    prev = getattr(row, count_f, 0) or 0
+    hours = cooldown_hours(prev)
+    base = now or datetime.datetime.utcnow()
+    setattr(row, until_f, base + datetime.timedelta(hours=hours))
+    setattr(row, reason_f, (reason_text or "帳號動作被限制")[:255])
+    setattr(row, count_f, prev + 1)
+    return hours
+
+
+def clear_block(row, platform: str) -> None:
+    """成功發文一次＝限制解除，把暫停與計數都歸零。"""
+    if row is None or platform not in VALID_PLATFORMS:
+        return
+    until_f, reason_f, count_f = _fields(platform)
+    setattr(row, until_f, None)
+    setattr(row, reason_f, "")
+    setattr(row, count_f, 0)

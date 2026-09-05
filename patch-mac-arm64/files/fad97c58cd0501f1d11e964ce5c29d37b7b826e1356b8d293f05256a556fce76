@@ -1,0 +1,189 @@
+"""備份刪文與自動加入社團 API（SPEC-P32）。
+
+跟 /api/friend 同一種形狀：設定、現在跑一次、看結果。前端一個元件吃三個平台。
+"""
+import datetime
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..database import (get_session, CleanupConfig, GroupJoinConfig, GroupJoinCandidate, Group)
+from ..scheduler import cleanup_runner as cr
+from ..scheduler import group_join_runner as gj
+
+router = APIRouter(prefix="/api/automation", tags=["automation"], redirect_slashes=False)
+
+
+# ── 備份刪文 ────────────────────────────────────────────────────────────────────
+
+class CleanupIn(BaseModel):
+    enabled: bool = True
+    older_than_days: int = Field(30, ge=7, le=3650)
+    max_per_run: int = Field(20, ge=1, le=50)
+    window_start: str = "02:00"
+    window_end: str = "06:00"
+
+
+def _win(*ts: str) -> None:
+    for t in ts:
+        try:
+            h, m = t.split(":")
+            assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+        except Exception:
+            raise HTTPException(422, f"時段格式錯誤：{t}（應為 HH:MM）")
+
+
+def _cleanup_out(cfg: CleanupConfig, planned: str) -> dict:
+    return {"platform": cfg.platform, "enabled": bool(cfg.enabled),
+            "older_than_days": cr.effective_days(cfg.older_than_days),
+            "max_per_run": cr.effective_max(cfg.max_per_run),
+            "min_days": cr.MIN_DAYS, "hard_max": cr.HARD_MAX_PER_RUN,
+            "window_start": cfg.window_start or "02:00", "window_end": cfg.window_end or "06:00",
+            "last_run_date": cfg.last_run_date or "", "today_planned": planned}
+
+
+def _platform(p: str) -> str:
+    if p not in cr.PLATFORMS:
+        raise HTTPException(422, "platform 只收 fb / threads / ig")
+    return p
+
+
+@router.get("/cleanup/config")
+async def get_cleanup(account_id: int, platform: str = "fb",
+                      session: AsyncSession = Depends(get_session)):
+    platform = _platform(platform)
+    cfg = await cr.get_or_create_config(session, account_id, platform)
+    just = getattr(cfg, "_just_created", False)
+    await session.commit()
+    if just and cfg.enabled:
+        try:
+            await cr.plan_and_schedule()
+        except Exception as e:
+            print(f"[cleanup] 預設開啟後排程失敗：{e}", flush=True)
+    return _cleanup_out(cfg, cr.scheduled_time_today(platform))
+
+
+@router.put("/cleanup/config")
+async def put_cleanup(account_id: int, data: CleanupIn, platform: str = "fb",
+                      session: AsyncSession = Depends(get_session)):
+    platform = _platform(platform)
+    _win(data.window_start, data.window_end)
+    cfg = await cr.get_or_create_config(session, account_id, platform)
+    cfg.enabled = data.enabled
+    cfg.older_than_days = cr.effective_days(data.older_than_days)
+    cfg.max_per_run = cr.effective_max(data.max_per_run)
+    cfg.window_start, cfg.window_end = data.window_start, data.window_end
+    await session.commit()
+    try:
+        await cr.plan_and_schedule()
+    except Exception as e:
+        print(f"[cleanup] 重排失敗：{e}", flush=True)
+    return _cleanup_out(cfg, cr.scheduled_time_today(platform))
+
+
+@router.post("/cleanup/run")
+async def run_cleanup(account_id: int, platform: str = "fb", dry_run: bool = True):
+    """現在跑一次。預設 dry-run——刪文不可還原，讓人先看清單。"""
+    platform = _platform(platform)
+    r = await cr.run_cleanup_once(account_id, platform, force=True, dry_run=dry_run)
+    if r.get("skipped"):
+        raise HTTPException(409, r["skipped"])
+    return {"job_id": r["job_id"], "state": "pending", "dry_run": dry_run}
+
+
+# ── 自動加入社團 ────────────────────────────────────────────────────────────────
+
+class GroupJoinIn(BaseModel):
+    enabled: bool = False
+    keywords: str = ""
+    daily_max: int = Field(2, ge=1, le=3)
+    window_start: str = "10:00"
+    window_end: str = "21:00"
+
+
+def _gj_out(cfg: GroupJoinConfig, planned: str, week: int) -> dict:
+    return {"enabled": bool(cfg.enabled), "keywords": cfg.keywords or "",
+            "daily_max": gj.effective_daily(cfg.daily_max), "hard_cap": gj.HARD_DAILY_CAP,
+            "weekly_max": gj.WEEKLY_CAP, "joined_this_week": week,
+            "no_post_days": gj.NO_POST_DAYS, "max_keywords": gj.MAX_KEYWORDS,
+            "window_start": cfg.window_start or "10:00", "window_end": cfg.window_end or "21:00",
+            "last_run_date": cfg.last_run_date or "", "today_planned": planned}
+
+
+@router.get("/groups/config")
+async def get_gj(account_id: int, session: AsyncSession = Depends(get_session)):
+    import asyncio
+    cfg = await gj.get_or_create_config(session, account_id)
+    await session.commit()
+    week = await asyncio.to_thread(gj.joined_this_week)
+    return _gj_out(cfg, gj.scheduled_time_today(), week)
+
+
+@router.put("/groups/config")
+async def put_gj(account_id: int, data: GroupJoinIn, session: AsyncSession = Depends(get_session)):
+    import asyncio
+    _win(data.window_start, data.window_end)
+    cfg = await gj.get_or_create_config(session, account_id)
+    cfg.enabled = data.enabled
+    cfg.keywords = ",".join(gj.parse_keywords(data.keywords))
+    cfg.daily_max = gj.effective_daily(data.daily_max)
+    cfg.window_start, cfg.window_end = data.window_start, data.window_end
+    await session.commit()
+    try:
+        await gj.plan_and_schedule()
+    except Exception as e:
+        print(f"[gjoin] 重排失敗：{e}", flush=True)
+    week = await asyncio.to_thread(gj.joined_this_week)
+    return _gj_out(cfg, gj.scheduled_time_today(), week)
+
+
+@router.post("/groups/search")
+async def gj_search(account_id: int):
+    r = await gj.run_search(account_id)
+    if r.get("skipped"):
+        raise HTTPException(409, r["skipped"])
+    return {"job_id": r["job_id"], "state": "pending"}
+
+
+@router.post("/groups/join")
+async def gj_join(account_id: int, dry_run: bool = False):
+    r = await gj.run_join_once(account_id, force=True, dry_run=dry_run)
+    if r.get("skipped"):
+        raise HTTPException(409, r["skipped"])
+    return {"job_id": r["job_id"], "state": "pending"}
+
+
+@router.get("/groups/candidates")
+async def gj_candidates(limit: int = 50, session: AsyncSession = Depends(get_session)):
+    rows = (await session.execute(select(GroupJoinCandidate)
+                                  .order_by(GroupJoinCandidate.members.desc())
+                                  .limit(max(1, min(200, limit))))).scalars().all()
+    return {"items": [{"id": r.id, "url": r.group_url, "name": r.name, "members": r.members,
+                       "privacy": r.privacy, "status": r.status, "keyword": r.keyword,
+                       "note": r.note} for r in rows]}
+
+
+@router.post("/groups/candidates/{cid}/exclude")
+async def gj_exclude(cid: int, session: AsyncSession = Depends(get_session)):
+    row = (await session.execute(select(GroupJoinCandidate)
+                                 .where(GroupJoinCandidate.id == cid))).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(404, "找不到這個候選")
+    row.status = "excluded"
+    await session.commit()
+    return {"excluded": True}
+
+
+@router.get("/groups/new-joined")
+async def new_joined(account_id: int, session: AsyncSession = Depends(get_session)):
+    """剛加入、還不能發文的社團（前端在社團清單旁顯示「X 天後可發」）。"""
+    rows = (await session.execute(select(Group).where(
+        Group.account_id == account_id, Group.joined_at.isnot(None)))).scalars().all()
+    out = []
+    for g in rows:
+        left = gj.days_until_postable(g.joined_at)
+        if left > 0:
+            out.append({"name": g.group_name, "url": g.group_url, "days_left": left})
+    return {"items": sorted(out, key=lambda x: x["days_left"])}
