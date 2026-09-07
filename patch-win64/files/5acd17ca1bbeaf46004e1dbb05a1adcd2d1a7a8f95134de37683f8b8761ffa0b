@@ -1,0 +1,278 @@
+"""自動刪文——備份模式的每日排程（SPEC-P32 §2）。
+
+跟排程裡「發文後 N 天自動刪除」的差別，一句話：那套靠我們自己的發文紀錄找貼文，
+紀錄不見（重灌、換電腦、當初不是用摸魚發的）就管不到；這套直接掃平台上超過 N 天的
+自己貼文，當第二道保險。兩套同時開也不衝突——先刪的先算，後跑的就掃不到了。
+
+保守的地方：
+- 預設在凌晨 02:00–06:00 跑，不跟發文搶瀏覽器。
+- 一輪最多 20 則（硬上限 50），每則之間 10–30 秒；日期讀不到的一律留著。
+- P28 平台暫停、系統暫停、瀏覽器忙 → 這輪略過並寫紀錄。
+"""
+from __future__ import annotations
+
+import contextlib
+import datetime
+import json
+import os
+import random
+import tempfile
+
+from sqlalchemy import select
+
+from ..database import (async_session_factory, SyncSession, Account, CleanupConfig,
+                        ThreadsAccount, PostHistory, LegalInfo, Property)
+from .marketplace_planner import plan_daily_times
+from .nurture_runner import TAIPEI, _as_taipei
+from .task_runner import scheduler
+
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+
+PLATFORMS = ("fb", "threads", "ig")
+MIN_DAYS = 7                  # 再怎麼設也不准刪 7 天內的貼文
+DEFAULT_DAYS = 30
+HARD_MAX_PER_RUN = 50
+DEFAULT_MAX_PER_RUN = 20
+JOB_PREFIX = "cleanup_"
+
+
+def effective_days(requested: int | None) -> int:
+    """低於 7 天一律拉回 7：使用者手滑打個 1，等於把剛發的文全刪了。"""
+    n = requested or DEFAULT_DAYS
+    return max(MIN_DAYS, int(n))
+
+
+def effective_max(requested: int | None) -> int:
+    n = requested or DEFAULT_MAX_PER_RUN
+    return max(1, min(HARD_MAX_PER_RUN, int(n)))
+
+
+# ── 「只刪摸魚發的」白名單（老闆 2026-09-05）────────────────────────────────────
+# 原本備份模式是「掃平台上超過 N 天的自己貼文一律刪」，那會連客戶手動發的舊文一起刪掉。
+# 改成：掃到的貼文要能對上「這是摸魚發的」才刪。兩種對法，滿足其一即可：
+#   1. 網址對得上我們自己的發文紀錄（PostHistory / Marketplace 上架清單）。
+#   2. 內文含我們固定附加的法定資訊（每篇都會加），或對得上某個物件的標題。
+# 兩種都對不上就跳過並記成 not_ours——寧可留著。
+MIN_PHRASE_LEN = 6          # 太短的詞（公司簡稱之類）會誤傷，不收
+
+
+def _clean_phrases(raw) -> list[str]:
+    out = []
+    for x in raw:
+        t = (x or "").strip()
+        # 法定區塊是多行的，逐行收；一行就是一個夠獨特的指紋
+        for line in t.splitlines():
+            line = line.strip()
+            if len(line) >= MIN_PHRASE_LEN and line not in out:
+                out.append(line)
+    return out[:60]
+
+
+def only_payload_sync(account_id: int) -> dict:
+    """組給 CLI 的白名單：{"urls": [...], "phrases": [...]}。"""
+    urls: list[str] = []
+    phrases: list[str] = []
+    with SyncSession() as s:
+        for (u,) in s.execute(select(PostHistory.post_url).where(
+                PostHistory.post_url != "")).all():
+            if u and u not in urls:
+                urls.append(u)
+        for (live,) in s.execute(select(Property.live_listings)).all():
+            for it in (live or []):
+                u = (it or {}).get("item_url") if isinstance(it, dict) else None
+                if u and u not in urls:
+                    urls.append(u)
+        legal = s.execute(select(LegalInfo)).scalars().first()
+        if legal is not None:
+            phrases += _clean_phrases([legal.footer_text, legal.extra, legal.license_no,
+                                       legal.agent_phone, legal.company])
+        # 物件／社團刊登的標題：內文第一行通常就是它。
+        # gp_listings 已併進 properties（2026-09-06），一份就涵蓋兩種通道。
+        for (name,) in s.execute(select(Property.name)).all():
+            if name:
+                phrases.append(name)
+    return {"urls": urls[:500], "phrases": _clean_phrases(phrases)}
+
+
+def write_only_file(account_id: int) -> str:
+    fd, path = tempfile.mkstemp(prefix="cleanup_only_", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(only_payload_sync(account_id), f, ensure_ascii=False)
+    return path
+
+
+async def get_or_create_config(session, account_id: int, platform: str) -> CleanupConfig:
+    cfg = (await session.execute(
+        select(CleanupConfig).where(CleanupConfig.account_id == account_id,
+                                    CleanupConfig.platform == platform))).scalars().first()
+    if cfg is None:
+        cfg = CleanupConfig(account_id=account_id, platform=platform)
+        session.add(cfg)
+        await session.flush()
+        cfg._just_created = True
+    return cfg
+
+
+def _mark_ran(account_id: int, platform: str) -> None:
+    with SyncSession() as s:
+        cfg = s.execute(select(CleanupConfig).where(
+            CleanupConfig.account_id == account_id,
+            CleanupConfig.platform == platform)).scalars().first()
+        if cfg is not None:
+            cfg.last_run_date = datetime.date.today().isoformat()
+            s.commit()
+
+
+def make_on_done(account_id: int, platform: str, only_file: str = ""):
+    def _cb(result):
+        data = result.data or {}
+        _mark_ran(account_id, platform)
+        if data.get("blocked") and platform in ("threads", "ig"):
+            from .. import platform_block
+            with SyncSession() as s:
+                acc = s.execute(select(ThreadsAccount)).scalars().first()
+                if acc is not None:
+                    platform_block.mark_blocked(acc, platform,
+                                                data.get("block_reason") or "action_blocked")
+                    s.commit()
+        print(f"[cleanup] {platform} 收尾：刪 {data.get('deleted', 0)} 則", flush=True)
+        if only_file:
+            with contextlib.suppress(OSError):
+                os.unlink(only_file)
+    return _cb
+
+
+async def skip_reason(session, account_id: int, platform: str, cfg: CleanupConfig | None) -> str:
+    import asyncio
+    from ..database import get_system_state_sync
+    try:
+        st = await asyncio.to_thread(get_system_state_sync)
+        if getattr(st, "paused", None) or (isinstance(st, dict) and st.get("paused")):
+            return "系統已暫停"
+    except Exception:
+        pass
+    if platform == "fb":
+        acc = (await session.execute(
+            select(Account).where(Account.id == account_id))).scalar_one_or_none()
+        if not acc or not acc.fb_user_id:
+            return "FB 尚未綁定"
+        from ..fbauto_bridge import cookie_exists
+        if not cookie_exists(acc.fb_user_id):
+            return "FB 登入態不存在"
+    else:
+        from .. import platform_block
+        acc = (await session.execute(select(ThreadsAccount))).scalars().first()
+        if acc is None:
+            return f"{'IG' if platform == 'ig' else 'Threads'} 尚未連結"
+        if platform_block.is_blocked(acc, platform):
+            return platform_block.block_note(acc, platform)
+    if cfg is not None and (cfg.last_run_date or "") == datetime.date.today().isoformat():
+        return "今天已經跑過一輪"
+    return ""
+
+
+def build_args(platform: str, cfg: CleanupConfig, fbid: str = "", dry_run: bool = False,
+               only_file: str = "") -> list[str]:
+    days, mx = effective_days(cfg.older_than_days), effective_max(cfg.max_per_run)
+    if platform == "fb":
+        # 不能用 run_delete_posts：那支是照 postStatus.json（我們自己的發文紀錄）刪，
+        # 而「紀錄不見時還管得到」正是備份模式存在的理由。run_fb_cleanup 直接掃個人頁。
+        args = ["--fbid", fbid, "--older-than", str(days), "--max", str(mx), "--headless"]
+    else:
+        args = ["--platform", platform, "--older-than", str(days), "--max", str(mx), "--headless"]
+    if only_file:
+        args += ["--only-file", only_file]      # 只刪對得上這份白名單的貼文
+    if dry_run:
+        args.append("--dry-run")
+    return args
+
+
+async def run_cleanup_once(account_id: int, platform: str, force: bool = False,
+                           dry_run: bool = False) -> dict:
+    import asyncio
+
+    from ..fbauto_bridge import start_long_op, browser_busy_reason
+    async with async_session_factory() as s:
+        cfg = await get_or_create_config(s, account_id, platform)
+        await s.commit()
+        if not cfg.enabled and not force:
+            return {"skipped": "未開啟"}
+        why = await skip_reason(s, account_id, platform, None if force else cfg)
+        if why:
+            print(f"[cleanup] {platform} 略過：{why}", flush=True)
+            return {"skipped": why}
+        fbid = ""
+        if platform == "fb":
+            acc = (await s.execute(select(Account).where(Account.id == account_id))).scalar_one()
+            fbid = acc.fb_user_id
+        only_file = await asyncio.to_thread(write_only_file, account_id)
+        args = build_args(platform, cfg, fbid, dry_run, only_file)
+    busy = browser_busy_reason()
+    if busy:
+        return {"skipped": f"目前有「{busy}」正在使用瀏覽器"}
+    module = "src.run_fb_cleanup" if platform == "fb" else "src.run_meta_cleanup"
+    try:
+        job_id = start_long_op(f"cleanup_{platform}", module, args,
+                               account_id=account_id, fbid=fbid,
+                               on_done=make_on_done(account_id, platform, only_file))
+    except RuntimeError as e:
+        return {"skipped": str(e)}
+    print(f"[cleanup] {platform} 備份刪文啟動（job {job_id}）", flush=True)
+    return {"job_id": job_id}
+
+
+async def _scheduled(account_id: int, platform: str):
+    await run_cleanup_once(account_id, platform)
+
+
+def _remove_jobs():
+    for job in list(scheduler.get_jobs()):
+        if job.id.startswith(JOB_PREFIX) and job.id != "cleanup_daily_replan":
+            job.remove()
+
+
+async def plan_and_schedule() -> list[str]:
+    _remove_jobs()
+    plans = []
+    async with async_session_factory() as s:
+        rows = (await s.execute(
+            select(CleanupConfig).where(CleanupConfig.enabled == True))).scalars().all()  # noqa: E712
+        for r in rows:
+            plans.append((r.account_id, r.platform,
+                          (r.window_start or "02:00", r.window_end or "06:00")))
+    now = datetime.datetime.now(TAIPEI)
+    out = []
+    for account_id, platform, window in plans:
+        times = [_as_taipei(t) for t in plan_daily_times(
+            "window", [], window[0], window[1], 1, False, now.date())]
+        for t in times:
+            if t <= now:
+                continue
+            scheduler.add_job(func=_scheduled, trigger=DateTrigger(run_date=t),
+                              args=[account_id, platform],
+                              id=f"{JOB_PREFIX}{platform}", replace_existing=True)
+            out.append((t, platform))
+    out.sort()
+    labels = [f"{t.strftime('%H:%M')}({ {'fb': 'FB', 'ig': 'IG', 'threads': 'Threads'}[p] })"
+              for t, p in out]
+    if labels:
+        print(f"[cleanup] 今日備份刪文已排：{'、'.join(labels)}", flush=True)
+    return labels
+
+
+def scheduled_time_today(platform: str) -> str:
+    for job in scheduler.get_jobs():
+        if job.id == f"{JOB_PREFIX}{platform}" and job.next_run_time:
+            return job.next_run_time.astimezone(TAIPEI).strftime("%H:%M")
+    return ""
+
+
+async def restore_cleanup_schedule():
+    try:
+        await plan_and_schedule()
+    except Exception as e:
+        print(f"[cleanup] 啟動規劃失敗（不影響其他功能）：{e}", flush=True)
+    scheduler.add_job(func=plan_and_schedule,
+                      trigger=CronTrigger(hour=0, minute=25, timezone=TAIPEI),
+                      id="cleanup_daily_replan", replace_existing=True)
