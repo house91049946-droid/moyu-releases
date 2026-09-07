@@ -1,0 +1,519 @@
+"""網址匯入 API：把別的平台上的物件頁擷取成「草稿文案 + 圖片」。
+
+只負責 spawn 擷取用的 CLI（src.run_import_url）並回 job_id，
+前端照舊輪詢 GET /api/jobs/{job_id} 取結果（data.base_content / data.images）。
+
+著作權：後端不做判斷，責任在使用者——前端會在送出前強制跳提醒視窗，
+這裡只把「來源網址」原樣回傳，方便使用者自己核對授權。
+"""
+from urllib.parse import urlparse
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from ..config import DATA_DIR
+
+router = APIRouter(prefix="/api/import", tags=["import"], redirect_slashes=False)
+
+# target → (圖片落地目錄, 前端用的網址前綴, 檔名前綴)
+_TARGETS = {
+    "marketplace": (DATA_DIR / "uploads", "/uploads/", "mp_"),
+    "group_post": (DATA_DIR / "uploads" / "group_post", "/uploads/group_post/", "gp_"),
+}
+
+
+class ImportUrlReq(BaseModel):
+    url: str
+    target: str = "marketplace"        # marketplace / group_post
+    max_images: int = 20
+
+
+@router.post("/url")
+async def import_from_url(data: ImportUrlReq):
+    url = (data.url or "").strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(status_code=422, detail="請貼上完整網址（要以 http:// 或 https:// 開頭）")
+    if data.target not in _TARGETS:
+        raise HTTPException(status_code=422, detail=f"未知的匯入目標：{data.target}")
+    max_images = max(1, min(30, data.max_images))
+
+    from ..fbauto_bridge import start_long_op, browser_busy_reason
+    busy = browser_busy_reason()
+    if busy:
+        raise HTTPException(status_code=409,
+            detail=f"目前有「{busy}」正在使用瀏覽器，先等它跑完再匯入，"
+                   f"以免兩個瀏覽器互搶資源把畫面拖慢。")
+
+    out_dir, url_prefix, name_prefix = _TARGETS[data.target]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    job_id = start_long_op("import_url", "src.run_import_url", [
+        "--url", url,
+        "--out-dir", str(out_dir),
+        "--url-prefix", url_prefix,
+        "--name-prefix", name_prefix,
+        "--max-images", str(max_images),
+    ])
+    return {"job_id": job_id, "state": "pending"}
+
+
+class SourceListReq(BaseModel):
+    url: str
+    max_items: int = 100
+
+
+@router.post("/source-list")
+async def source_list(data: SourceListReq):
+    """從一個物件網址找出同一經紀人／店家的出售物件清單（只回清單，不下載圖片）。
+
+    回 job_id，前端照舊輪詢 GET /api/jobs/{job_id}，成功時 data 為
+    {store_url, store_name, truncated, items:[{url,title,address,price,…}]}。
+    """
+    url = (data.url or "").strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(status_code=422, detail="請貼上完整網址（要以 http:// 或 https:// 開頭）")
+    max_items = max(1, min(200, data.max_items))
+
+    # 這個網址若屬於已存的店家且 3 天內更新額度用完 → 不打樂屋，叫前端用存好的清單
+    # 額度只是禮貌性的限制：查不到（表還沒建、DB 暫時鎖住）就放行，絕不能因此擋住匯入
+    known, q = None, None
+    try:
+        from ..database import async_session_factory
+        async with async_session_factory() as s_:
+            known = await _find_store_for_url(s_, url)
+            if known is not None:
+                q = refresh_quota(known.refresh_log or [])
+    except Exception:
+        known = None
+    if known is not None and q and not q["can_refresh"]:
+        raise HTTPException(status_code=409, detail={
+            "code": "refresh_quota", "store_id": known.id,
+            "message": f"這個店家的清單已存好（{len(known.items or [])} 筆），"
+                       f"3 天內最多更新 {q['limit']} 次、額度已用完，請直接使用存好的清單",
+            "next_refresh_at": q["next_refresh_at"]})
+
+    from ..fbauto_bridge import start_long_op, browser_busy_reason
+    busy = browser_busy_reason()
+    if busy:
+        raise HTTPException(status_code=409,
+            detail=f"目前有「{busy}」正在使用瀏覽器，先等它跑完再匯入，"
+                   f"以免兩個瀏覽器互搶資源把畫面拖慢。")
+
+    # 翻頁上限要明講：CLI 預設只翻 5 頁（約 60 筆），老闆的店 7 頁 83 筆就被截掉
+    # （2026-09-02 實測 UI 顯示 59、CLI 直跑 83）。筆數仍由 max_items 把關。
+    job_id = start_long_op("import_list", "src.run_import_list", [
+        "--url", url,
+        "--max-items", str(max_items),
+        "--max-pages", "20",
+    ])
+    _LIST_SEEDS[job_id] = url
+    return {"job_id": job_id, "state": "pending"}
+
+
+# ─── 批次匯入（老闆定調 2026-09-02：勾選後一鍵全部變成可上架物件）───────
+
+import asyncio as _asyncio
+import contextlib as _contextlib
+import json as _json
+import os as _os
+import re as _re
+import tempfile as _tempfile
+from typing import Optional as _Optional
+
+_BATCH_META: dict[str, dict] = {}        # job_id → {target, account_id, items, progress}
+_CITY_RE = _re.compile(r"^(.{2}[市縣])")
+
+
+def city_from_address(addr: str) -> str:
+    """「台北市松山區」→「台北市」、「南投縣鹿谷鄉」→「南投縣」。抓不到留空，不猜。"""
+    m = _CITY_RE.match((addr or "").strip())
+    return m.group(1) if m else ""
+
+
+class BatchItem(BaseModel):
+    url: str
+    title: str = ""
+    address: str = ""
+    price: int = 0
+
+
+class BatchReq(BaseModel):
+    items: list[BatchItem]
+    target: str = "marketplace"
+    account_id: int
+    max_images: int = 20
+
+
+@router.post("/batch")
+async def import_batch(data: BatchReq):
+    """把勾選的物件一次擷取完並建成物件。回 job_id，前端輪詢 GET /api/jobs/{id}：
+    進行中會帶 done/total/current；成功時已建好物件，回 created/failed。"""
+    if data.target not in _TARGETS:
+        raise HTTPException(status_code=422, detail=f"未知的匯入目標：{data.target}")
+    urls = []
+    for it in data.items:
+        u = (it.url or "").strip()
+        p = urlparse(u)
+        if p.scheme in ("http", "https") and p.netloc and u not in urls:
+            urls.append(u)
+    if not urls:
+        raise HTTPException(status_code=422, detail="沒有可匯入的網址")
+    if len(urls) > 60:
+        raise HTTPException(status_code=422, detail="一次最多 60 筆——太多筆一口氣跑，被網站擋的機率會大增")
+
+    from ..fbauto_bridge import start_long_op, browser_busy_reason
+    busy = browser_busy_reason()
+    if busy:
+        raise HTTPException(status_code=409,
+            detail=f"目前有「{busy}」正在使用瀏覽器，先等它跑完再匯入。")
+
+    out_dir, url_prefix, name_prefix = _TARGETS[data.target]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fd, urls_file = _tempfile.mkstemp(suffix=".txt")
+    with open(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(urls))
+    fd2, progress_file = _tempfile.mkstemp(suffix=".json")
+    _os.close(fd2)
+
+    job_id = start_long_op("import_batch", "src.run_import_batch", [
+        "--urls-file", urls_file,
+        "--out-dir", str(out_dir),
+        "--url-prefix", url_prefix,
+        "--name-prefix", name_prefix,
+        "--max-images", str(max(1, min(30, data.max_images))),
+        "--progress-file", progress_file,
+    ], account_id=data.account_id)
+    _BATCH_META[job_id] = {
+        "target": data.target, "account_id": data.account_id,
+        "items": {it.url.strip(): it for it in data.items},
+        "progress": progress_file, "urls_file": urls_file,
+    }
+    return {"job_id": job_id, "state": "pending", "total": len(urls)}
+
+
+def batch_progress(job_id: str) -> _Optional[dict]:
+    """進行中的即時進度（done/total/current）；不是批次工作或還沒寫就回 None。"""
+    meta = _BATCH_META.get(job_id)
+    if not meta:
+        return None
+    try:
+        with open(meta["progress"], encoding="utf-8") as f:
+            d = _json.load(f)
+        return {"done": d.get("done", 0), "total": d.get("total", 0),
+                "current": d.get("current", "")}
+    except (OSError, ValueError):
+        return None
+
+
+
+# 批次匯入建物件時順手做的兩件事（老闆 2026-09-06）：
+#   1. AI 生 3～5 版文案——只帶擷取到的那一版，排程輪替等於每次都發同一篇。
+#   2. 從 Marketplace 匯入時，社團發文那邊也一起建——房仲腦子裡只有「這間房」，
+#      不是「MP 物件」和「GP 物件」，不該為同一間房匯入兩次。
+AI_VERSIONS = 7                     # 7 版才撐得起「同一版 7 天內不重複」（老闆 2026-09-07）
+_AI_CONCURRENCY = 3                 # 別一口氣打爆雲端 AI
+
+
+async def _ai_versions(base: str, sem) -> tuple[list[str], list[str]]:
+    """回 (titles, bodies)。生不出來一律回 ([], [])，讓呼叫端退回擷取到的那一版——
+    AI 是加分項，絕不能因為它失敗就讓整批匯入掉東西。"""
+    if not (base or "").strip():
+        return [], []
+    try:
+        from ..deepseek_client import generate_from_base
+        from ..cloud_client import cloud_enabled
+        from ..deepseek_client import has_key
+        if not (cloud_enabled() or has_key()):
+            return [], []
+        async with sem:
+            vs = await _asyncio.wait_for(
+                _asyncio.to_thread(generate_from_base, base, AI_VERSIONS), timeout=150)
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[batch] AI 生成略過：{e}", flush=True)
+        return [], []
+    titles, bodies = [], []
+    for v in vs or []:
+        t, b = (v.get("title") or "").strip(), (v.get("body") or "").strip()
+        if t and b:
+            titles.append(t)
+            bodies.append(b)
+    return (titles, bodies) if titles else ([], [])
+
+
+
+async def _default_groups(session, account_id: int) -> tuple[list[str], list[str]]:
+    """批次匯入的物件要轉發到哪些社團（老闆 2026-09-06 問「究竟要怎麼預設」）。
+
+    在這之前是空白——匯進來 83 筆，每一筆都得自己點社團，不然發了等於沒發。
+
+    - Marketplace：預設＝帳號裡所有「可轉發」社團（系統偵測過、確定能貼
+      Marketplace 的那幾個）。runner 每次只隨機挑 groups_per_listing 個，
+      所以整份給它是安全的。
+    - 社團發文：只有在「剛好只有一組社團群組」時才用它——沒有明確的預設群組
+      概念，猜錯一組就是往幾百個社團亂貼，寧可留空、在卡片上標「還沒選社團」。
+    """
+    from sqlalchemy import select as _sel
+    from ..database import Group, GpGroupPreset
+    mp = [n for (n,) in (await session.execute(
+        _sel(Group.group_name).where(Group.account_id == account_id, Group.can_post == True)  # noqa: E712
+    )).all() if n]
+    presets = (await session.execute(_sel(GpGroupPreset))).scalars().all()
+    gp = list(presets[0].group_names or []) if len(presets) == 1 else []
+    return mp, gp
+
+
+async def finalize_batch(job_id: str, result, session) -> _Optional[dict]:
+    """批次工作結束：把擷取成功的每一筆直接建成物件（等同使用者按「直接用這篇」
+    再存檔）。回 {created, failed, skipped_existing, blocked, errors:[{url,error}]}；
+    不是批次工作回 None。"""
+    meta = _BATCH_META.pop(job_id, None)
+    if not meta:
+        return None
+    for k in ("progress", "urls_file"):
+        with _contextlib.suppress(OSError):
+            _os.unlink(meta[k])
+
+    from sqlalchemy import select
+    from ..database import Property
+    d = result.data or {}
+    created = skipped = created_gp = ai_done = 0
+    errors = []
+    _sem = _asyncio.Semaphore(_AI_CONCURRENCY)
+    mp_groups, gp_groups = await _default_groups(session, meta["account_id"])
+    # 照物件挑社團用的完整清單（含分類）
+    from sqlalchemy import select as _sel2
+    from ..database import Group as _Group
+    from ..group_match import pick_groups
+    all_groups = [{"group_name": g.group_name, "tags": list(g.tags or []), "region": g.region or "",
+                   "can_post": bool(g.can_post)} for g in (await session.execute(
+                       _sel2(_Group).where(_Group.account_id == meta["account_id"]))).scalars().all()]
+    auto_matched = 0
+
+    for it in d.get("items", []):
+        url = it.get("url", "")
+        if not it.get("ok"):
+            errors.append({"url": url, "error": it.get("error", "")})
+            continue
+        # 已匯入過（同來源網址）就不重複建——重複做同一間是這功能最容易犯的錯
+        exists = (await session.execute(
+            select(Property.id).where(Property.source_url == url))).scalar_one_or_none()
+        if exists:
+            skipped += 1
+            continue
+        hint = meta["items"].get(url)
+        title = (it.get("title") or (hint.title if hint else "") or "").strip()
+        base = it.get("base_content") or ""
+        images = list(it.get("images") or [])
+        price = int(it.get("price") or (hint.price if hint else 0) or 0)
+        if not title and not base and not images:
+            errors.append({"url": url, "error": "沒抓到可用內容"})
+            continue
+        # AI 生多版；生不出來就退回擷取到的那一版（＝手動流程的「直接用這篇」），
+        # 不然 runner 會發出空內文
+        ai_titles, ai_bodies = await _ai_versions(base, _sem)
+        if ai_titles:
+            titles, bodies = ai_titles, ai_bodies
+            ai_done += 1
+        else:
+            titles = [title] if title else []
+            bodies = [base] if base else []
+        # 社團預設改成「照物件挑」（老闆 2026-09-07：AI 辨識自動選適合的群）：
+        # 同區域、同類型、買賣／租賃對得上的；一個都配不上才退回原本的預設
+        # （MP＝全部可轉發、GP＝唯一一組群組）。
+        picked_mp = pick_groups(all_groups, title, base, city_from_address(hint.address if hint else ""),
+                                limit=40, mp_only=True)["groups"] if all_groups else []
+        picked_gp = pick_groups(all_groups, title, base, city_from_address(hint.address if hint else ""),
+                                limit=30, mp_only=False)["groups"] if all_groups else []
+        if picked_mp or picked_gp:
+            auto_matched += 1
+        common = dict(
+            account_id=meta["account_id"], name=title or url[-40:],
+            base_content=base, titles=titles, bodies=bodies, image_pool=images,
+            source_url=url, enabled=True,
+            target_groups=list(picked_mp or mp_groups),
+            gp_target_groups=list(picked_gp or gp_groups),
+        )
+        # 併表後（2026-09-06）一筆就是一間房：從 Marketplace 匯入時直接掛兩個通道，
+        # 不必再另外建一筆社團發文物件。
+        is_mp = meta["target"] == "marketplace"
+        # 前三張當首頁候選，跟手動存檔那條路一致（page.tsx: images.slice(0, 3)）。
+        # 漏掉的話 cover_ids 是空的，pick_images 就沒有首頁可輪替——實測正式機
+        # 匯入的那筆是「20 張圖、0 張封面」（2026-09-06）。
+        row = Property(
+            city=city_from_address(hint.address if hint else "") if is_mp else "",
+            price=price if is_mp else 0,
+            cover_ids=images[:3],
+            channels=["mp", "gp"] if is_mp else ["gp"],
+            **common,
+        )
+        session.add(row)
+        created += 1
+        if is_mp:
+            created_gp += 1          # 同一筆也上社團發文，訊息照樣講清楚
+
+    await session.commit()
+    print(f"[batch] 建立 {created} 個物件（AI 多版 {ai_done} 筆、社團發文另建 {created_gp} 筆）、"
+          f"失敗 {len(errors)}、已存在略過 {skipped}", flush=True)
+    return {"created": created, "created_gp": created_gp, "ai_versions": ai_done,
+            "auto_matched": auto_matched,
+            "failed": len(errors), "skipped_existing": skipped,
+            "blocked": bool(d.get("blocked")), "errors": errors[:20]}
+
+
+# ─── 同店家清單快取與更新額度（老闆定調 2026-09-02）───────────────────
+# 清單要常態可勾選：存在 DB，平常直接用；只有使用者按「更新」才去打樂屋，
+# 而且 3 天內最多 2 次——別人的伺服器不是我們的，別造成負擔。
+
+import datetime as _dt
+
+REFRESH_LIMIT = 2
+REFRESH_WINDOW_H = 72
+_EHID_RE = _re.compile(r"ehid=([0-9a-fA-F]+)")
+_LIST_SEEDS: dict[str, str] = {}          # import_list job_id → 使用者貼的網址
+
+
+def refresh_quota(refresh_log: list, now: _dt.datetime | None = None,
+                  limit: int = REFRESH_LIMIT, window_h: int = REFRESH_WINDOW_H) -> dict:
+    """算 72 小時內用了幾次、還剩幾次、用完的話下次幾點能再更新。純函式，可測。"""
+    now = now or _dt.datetime.utcnow()
+    cutoff = now - _dt.timedelta(hours=window_h)
+    recent = []
+    for t in refresh_log or []:
+        with _contextlib.suppress(ValueError, TypeError):
+            d = _dt.datetime.fromisoformat(str(t).replace("Z", ""))
+            if d.tzinfo is not None:
+                d = d.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+            if d > cutoff:
+                recent.append(d)
+    recent.sort()
+    left = max(0, limit - len(recent))
+    next_at = None if left > 0 or not recent else recent[0] + _dt.timedelta(hours=window_h)
+    return {"used": len(recent), "left": left, "limit": limit, "window_h": window_h,
+            "can_refresh": left > 0,
+            "next_refresh_at": (next_at.replace(tzinfo=_dt.timezone.utc).isoformat()
+                                if next_at else None)}
+
+
+def _ehid(url: str) -> str:
+    m = _EHID_RE.search(url or "")
+    return m.group(1).lower() if m else ""
+
+
+def _store_out(s) -> dict:
+    return {
+        "id": s.id, "store_url": s.store_url, "store_name": s.store_name or "",
+        "seed_url": s.seed_url or "", "items": list(s.items or []),
+        "truncated": bool(s.truncated), "count": len(s.items or []),
+        "fetched_at": (s.fetched_at.replace(tzinfo=_dt.timezone.utc).isoformat()
+                       if s.fetched_at else None),
+        "quota": refresh_quota(s.refresh_log or []),
+    }
+
+
+async def _find_store_for_url(session, url: str):
+    """使用者貼的網址屬於哪個已存的店家：網址就是店鋪頁、或 ehid 在該店清單裡。"""
+    from sqlalchemy import select
+    from ..database import SourceStore
+    u = (url or "").strip()
+    eh = _ehid(u)
+    rows = (await session.execute(select(SourceStore))).scalars().all()
+    for s in rows:
+        if s.store_url and u.startswith(s.store_url):
+            return s
+        if eh and any(_ehid(i.get("url", "")) == eh for i in (s.items or [])):
+            return s
+    return None
+
+
+from fastapi import Depends as _Depends
+from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+from ..database import get_session as _get_session
+
+
+@router.get("/stores")
+async def list_stores(session: _AsyncSession = _Depends(_get_session)):
+    from sqlalchemy import select
+    from ..database import SourceStore
+    rows = (await session.execute(
+        select(SourceStore).order_by(SourceStore.fetched_at.desc()))).scalars().all()
+    return [_store_out(s) for s in rows]
+
+
+@router.get("/stores/match")
+async def match_store(url: str, session: _AsyncSession = _Depends(_get_session)):
+    """這個網址有沒有已存的清單？有就回它（前端直接用，不必再打樂屋）。"""
+    s = await _find_store_for_url(session, url)
+    return {"store": _store_out(s) if s else None}
+
+
+@router.post("/stores/{store_id}/refresh")
+async def refresh_store(store_id: int, session: _AsyncSession = _Depends(_get_session)):
+    """重抓這個店家的清單。額度：3 天內最多 2 次，用完回 409 並講幾點能再更新。"""
+    from sqlalchemy import select
+    from ..database import SourceStore
+    s = (await session.execute(
+        select(SourceStore).where(SourceStore.id == store_id))).scalar_one_or_none()
+    if s is None:
+        raise HTTPException(status_code=404, detail="找不到這個店家清單")
+    q = refresh_quota(s.refresh_log or [])
+    if not q["can_refresh"]:
+        raise HTTPException(status_code=409, detail={
+            "code": "refresh_quota",
+            "message": f"3 天內最多更新 {q['limit']} 次，額度已用完",
+            "next_refresh_at": q["next_refresh_at"]})
+    from ..fbauto_bridge import start_long_op, browser_busy_reason
+    busy = browser_busy_reason()
+    if busy:
+        raise HTTPException(status_code=409,
+            detail=f"目前有「{busy}」正在使用瀏覽器，先等它跑完再更新。")
+    job_id = start_long_op("import_list", "src.run_import_list", [
+        "--url", s.store_url, "--max-items", "200", "--max-pages", "20"])
+    _LIST_SEEDS[job_id] = s.seed_url or s.store_url
+    return {"job_id": job_id, "state": "pending", "store_id": s.id}
+
+
+@router.delete("/stores/{store_id}")
+async def delete_store(store_id: int, session: _AsyncSession = _Depends(_get_session)):
+    from sqlalchemy import select
+    from ..database import SourceStore
+    s = (await session.execute(
+        select(SourceStore).where(SourceStore.id == store_id))).scalar_one_or_none()
+    if s is None:
+        raise HTTPException(status_code=404, detail="找不到這個店家清單")
+    await session.delete(s)
+    await session.commit()
+    return {"deleted": True}
+
+
+async def save_store_from_result(job_id: str, result, session) -> _Optional[dict]:
+    """import_list 成功 → 存／更新清單、記一次更新。回 store 輸出（給 jobs 附在 payload）。"""
+    d = result.data or {}
+    store_url = (d.get("store_url") or "").strip()
+    items = d.get("items") or []
+    if not store_url or not items:
+        _LIST_SEEDS.pop(job_id, None)
+        return None
+    from sqlalchemy import select
+    from ..database import SourceStore
+    s = (await session.execute(
+        select(SourceStore).where(SourceStore.store_url == store_url))).scalar_one_or_none()
+    now = _dt.datetime.utcnow()
+    if s is None:
+        s = SourceStore(store_url=store_url, refresh_log=[])
+        session.add(s)
+    s.store_name = d.get("store_name") or s.store_name or ""
+    s.items = items
+    s.truncated = bool(d.get("truncated"))
+    s.fetched_at = now
+    seed = _LIST_SEEDS.pop(job_id, "")
+    if seed:
+        s.seed_url = seed
+    log = list(s.refresh_log or [])
+    log.append(now.isoformat())
+    s.refresh_log = log[-10:]                     # 只留最近幾筆，額度只看 72 小時
+    await session.commit()
+    await session.refresh(s)
+    print(f"[import] 已存店家清單「{s.store_name[:20]}」{len(items)} 筆；"
+          f"3 天內已更新 {refresh_quota(s.refresh_log)['used']} 次", flush=True)
+    return _store_out(s)

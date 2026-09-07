@@ -1,0 +1,81 @@
+"""照物件自動挑社團（老闆 2026-09-07：「預設社團可以設定成 AI 辨識，自動選擇適合的群嗎」）。
+
+做法：把物件也用同一套分類器分一次（名稱＋文案＋縣市 → 類別、區域），
+再跟已分類的社團比對打分——同區域最重要，其次是同類型（透天／大樓／預售／中古），
+買賣 vs 租賃對不上就扣分。「非房產」社團一律不選。
+
+不用真的叫 AI：規則分類在 697 個真社團上已經分掉 93%，而且結果可預期、可離線、
+零成本。之後雲端有 /ai/classify 再把「其他」那些補進來即可。
+"""
+from __future__ import annotations
+
+import re
+
+from .group_classify import classify_name, TAG_RULES, REGIONS
+
+TYPE_TAGS = ("土地", "中古屋", "透天", "大樓", "預售")
+INTENT_TAGS = ("買賣", "租賃")
+
+# 沒有任何線索時：Marketplace 幾乎都是賣，預設當買賣
+_RENT_HINTS = ("出租", "租金", "月租", "押金", "租屋", "招租", "承租")
+
+
+def classify_property(name: str, base_content: str = "", city: str = "") -> dict:
+    """物件 → {'tags': [...], 'region': '台中'}。"""
+    text = f"{name or ''}\n{(base_content or '')[:400]}"
+    c = classify_name(text)
+    tags = [t for t in c["tags"] if t not in ("非房產", "其他")]
+    # 買賣／租賃：物件文案常沒寫「買賣」兩個字，用租的線索反推
+    if not any(t in INTENT_TAGS for t in tags):
+        tags.append("租賃" if any(h in text for h in _RENT_HINTS) else "買賣")
+    region = c["region"]
+    if not region and city:
+        cn = re.sub(r"[縣市]$", "", city.replace("臺", "台"))
+        if cn in REGIONS:
+            region = cn
+    return {"tags": tags, "region": region}
+
+
+def score_group(g_tags: list[str], g_region: str, p_tags: list[str], p_region: str) -> int:
+    """分數 > 0 才算「適合」。"""
+    if "非房產" in (g_tags or []):
+        return -100
+    s = 0
+    if p_region and g_region:
+        s += 3 if g_region == p_region else -3          # 同區加、異區扣（台中的房不該發到高雄社團）
+    elif p_region and not g_region:
+        s += 1                                           # 全國性／看不出區域的社團：可以，但排後面
+    p_intent = next((t for t in p_tags if t in INTENT_TAGS), "買賣")
+    g_intents = [t for t in (g_tags or []) if t in INTENT_TAGS]
+    if g_intents:
+        s += 2 if p_intent in g_intents else -4          # 賣房的別發到租屋社團：這條要壓過同區域的 +3
+    shared_types = set(TYPE_TAGS) & set(g_tags or []) & set(p_tags)
+    # 類型相符要壓過「泛用買賣」：老闆 2026-09-07 實測土地物件，55 個土地社團跟 202 個
+    # 買賣社團同分，前 40 名被買賣社團擠滿、一個土地社團都沒選到。
+    s += 4 * len(shared_types)                           # 土地對土地、透天對透天、預售對預售
+    g_types = set(TYPE_TAGS) & set(g_tags or [])
+    p_types = set(TYPE_TAGS) & set(p_tags)
+    if g_types and not shared_types and p_types:
+        s -= 2                                           # 社團專講大樓、物件是土地：不對
+    if p_types and not g_types and "土地" in p_types:
+        s -= 1                                           # 土地物件：泛用住宅買賣社團排後面一點
+    if not g_types and not g_intents and "其他" in (g_tags or []):
+        s += 0                                           # 泛用房產社團：靠區域決定
+    return s
+
+
+def pick_groups(groups: list[dict], name: str, base_content: str = "", city: str = "",
+                limit: int = 40, mp_only: bool = False) -> dict:
+    """groups: [{'group_name','tags','region','can_post'}, ...]。
+    回 {'tags','region','groups':[names 依分數高→低], 'scored':[(name,score)]}。
+    一個都配不上就回空清單，讓呼叫端決定要不要退回「全部可轉發」。"""
+    p = classify_property(name, base_content, city)
+    cands = [g for g in groups if (g.get("can_post") or not mp_only)]
+    scored = []
+    for g in cands:
+        sc = score_group(g.get("tags") or [], g.get("region") or "", p["tags"], p["region"])
+        if sc > 0:
+            scored.append((g["group_name"], sc))
+    scored.sort(key=lambda x: (-x[1], x[0]))
+    return {"tags": p["tags"], "region": p["region"],
+            "groups": [n for n, _ in scored[:limit]], "scored": scored[:limit]}
