@@ -1,0 +1,245 @@
+"""P27 附加平台發送：FB 主發後把同一物件順發到排程勾選的 Threads / IG。
+
+規則（見 SPEC-P27 / P28）：
+  - 序列執行（全域瀏覽器鎖本來就會排隊），每場次每平台最多 1 則。
+  - 附加平台失敗不影響 FB 結果、不重試——下一場次自然再發。
+  - IG 必帶圖：物件沒圖就跳過並在紀錄寫明，不算失敗。
+  - **被平台限制動作時停手一段時間**（P28）：暫停期內連瀏覽器都不開，
+    時間到自動恢復。停手也要留紀錄——安靜地不做事，客戶會以為功能壞了。
+  - 每平台各寫一筆 RunLog，摘要由 runlog_summary 組句。
+"""
+from .. import platform_block
+
+VALID_PLATFORMS = platform_block.VALID_PLATFORMS
+
+
+def _load_account_row():
+    """Threads/IG 的狀態列（單帳號產品只有一列）。拿不到就當成沒暫停。"""
+    from sqlalchemy import select
+    from ..database import SyncSession, ThreadsAccount
+    try:
+        with SyncSession() as s:
+            return s.execute(select(ThreadsAccount).order_by(ThreadsAccount.id)).scalars().first()
+    except Exception:
+        return None
+
+
+def _apply_block(platform: str, reason_text: str) -> int:
+    """把「被限制」寫進資料庫，回傳停幾小時。"""
+    from sqlalchemy import select
+    from ..database import SyncSession, ThreadsAccount
+    try:
+        with SyncSession() as s:
+            row = s.execute(select(ThreadsAccount).order_by(ThreadsAccount.id)).scalars().first()
+            if row is None:
+                return 0
+            hours = platform_block.mark_blocked(row, platform, reason_text)
+            s.commit()
+            return hours
+    except Exception:
+        return 0
+
+
+def _clear_block(platform: str) -> None:
+    from sqlalchemy import select
+    from ..database import SyncSession, ThreadsAccount
+    try:
+        with SyncSession() as s:
+            row = s.execute(select(ThreadsAccount).order_by(ThreadsAccount.id)).scalars().first()
+            if row is not None and getattr(row, f"{platform}_block_count", 0):
+                platform_block.clear_block(row, platform)
+                s.commit()
+    except Exception:
+        pass
+
+
+def _remember_post(account_id, platform: str, post_url: str) -> None:
+    """把剛發的 Threads／IG 貼文網址記進 post_history。
+
+    備份刪文（P32）只刪摸魚發的，靠的就是這張表：沒有這一筆，那則貼文以後就得靠
+    內文比對才認得出來——物件被刪掉之後就再也認不出來了。記不起來不影響發文。"""
+    if not post_url or not account_id:
+        return
+    try:
+        from ..database import SyncSession, PostHistory
+        with SyncSession() as s:
+            s.add(PostHistory(account_id=account_id,
+                              group_name="Threads" if platform == "threads" else "Instagram",
+                              post_url=post_url, status="success"))
+            s.commit()
+    except Exception as e:                  # 記不起來不能影響發文
+        print(f"[extra] 貼文網址沒記起來（不影響發文）：{str(e)[:80]}", flush=True)
+
+
+# FB 發完立刻順發 IG／Threads，四個通道的時間點幾乎相同——同一物件在幾分鐘內
+# 同時出現在四個平台，是很容易被關聯的特徵（老闆 2026-09-07 防偵測第 4 項）。
+# 排程走 schedule_extras 才會每個平台各等 10～60 分鐘隨機；直接呼叫 share_to_extras
+# （測試、手動立即發）不等。**不要用環境變數控制**——第一版靠 env 關延遲，CI 沒設，
+# Windows 冒煙的單元測試睡了 25 分鐘被砍（2026-09-07）。
+EXTRA_SHARE_DELAY_SEC = (600, 3600)
+
+
+def posted_today_sync(account_id, platform: str) -> int:
+    """同帳號今天（台北日）在這個平台成功發出的則數——每日上限就是拿這個數字比。
+
+    看 RunLog 而不看 post_history：post_history 只在抓得到貼文網址時才有一筆，
+    網址抓不到的成功發文會被漏算，上限就形同虛設。"""
+    try:
+        import datetime as _dt
+        from sqlalchemy import select, func
+        from ..database import SyncSession, RunLog, TAIPEI
+        start_local = _dt.datetime.now(TAIPEI).replace(hour=0, minute=0, second=0, microsecond=0)
+        start_utc = start_local.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+        with SyncSession() as s:
+            q = select(func.count(RunLog.id)).where(
+                RunLog.task_type == f"{platform}_post",
+                RunLog.status == "success",
+                RunLog.created_at >= start_utc)
+            if account_id:
+                q = q.where(RunLog.account_id == account_id)
+            return int(s.execute(q).scalar() or 0)
+    except Exception as e:                  # 算不出來就當 0：寧可多發一則也不要讓順發整個停掉
+        print(f"[extra] 今日已發數算不出來（當 0）：{str(e)[:80]}", flush=True)
+        return 0
+
+
+def schedule_extras(*args, **kwargs):
+    """丟到背景跑（有延遲），呼叫端不必等——排程主流程握著鎖，不能在裡面睡一小時。"""
+    import asyncio
+    kwargs.setdefault("stagger", EXTRA_SHARE_DELAY_SEC)
+    return asyncio.create_task(share_to_extras(*args, **kwargs))
+
+
+async def share_to_extras(platforms, title: str, text: str,
+                          image_paths: list[str], account_id, fbid: str = "",
+                          variants: "Variants | None" = None,
+                          stagger: tuple[int, int] = (0, 0),
+                          daily_cap: dict | None = None):
+    """variants 給了就每個平台各拿一版文案、各挑一組照片（老闆 2026-09-07：
+    「IG、Threads 都要有類似的數據」——原本兩邊拿到的是跟 FB 一模一樣的字和圖）。
+    沒給就維持舊行為（同一段文字、同一組照片）。
+
+    daily_cap：{"threads": 2, "ig": 1}，該平台今天（同帳號）已成功發到這個數就略過並留紀錄；
+    沒給或 0＝不限（老闆 2026-09-08：數量分別制定）。"""
+    from ..fbauto_bridge import (
+        BridgeResult, create_run_log_sync, update_run_log_sync,
+        run_threads_share, run_ig_share,
+    )
+    acc_row = _load_account_row()
+
+    import asyncio, random as _rand
+    for k, plat in enumerate([p for p in VALID_PLATFORMS if p in (platforms or [])]):
+        lo, hi = stagger
+        if hi > 0:
+            wait = _rand.uniform(lo, hi)
+            print(f"[extra] {plat} 等 {int(wait // 60)} 分鐘再發（跟 FB 錯開）", flush=True)
+            await asyncio.sleep(wait)
+        if variants is not None:
+            title, text, image_paths = variants.for_platform(k, plat)
+        log_id = create_run_log_sync(f"{plat}_post", fbid, account_id)
+        try:
+            # 平台被限制中 → 這一輪不碰它（連瀏覽器都不開）
+            if platform_block.is_blocked(acc_row, plat):
+                note = platform_block.block_note(acc_row, plat)
+                update_run_log_sync(
+                    log_id, BridgeResult(success=True, data={"paused": True, "note": note}),
+                    context={"title": title})
+                print(f"[extra] {title}：{note}", flush=True)
+                continue
+
+            cap = int((daily_cap or {}).get(plat) or 0)
+            if cap > 0:
+                done = posted_today_sync(account_id, plat)
+                if done >= cap:
+                    update_run_log_sync(
+                        log_id, BridgeResult(success=True, data={"skipped": True, "capped": True,
+                                                                 "cap": cap, "done": done}),
+                        context={"title": title})
+                    print(f"[extra] {title}：{plat} 今天已發 {done} 則，達每日上限 {cap}，略過", flush=True)
+                    continue
+
+            if plat == "ig" and not image_paths:
+                update_run_log_sync(
+                    log_id, BridgeResult(success=True, data={"skipped": True}),
+                    context={"title": title})
+                print(f"[extra] {title}：沒有圖片，IG 略過", flush=True)
+                continue
+
+            if plat == "threads":
+                r = await run_threads_share(text, image_paths)
+            else:
+                r = await run_ig_share(text, image_paths)
+        except Exception as e:              # 附加平台絕不能把主流程炸掉
+            r = BridgeResult(success=False, error=str(e))
+
+        update_run_log_sync(log_id, r, context={"title": title})
+        _remember_post(account_id, plat, (r.data or {}).get("post_url", "") if r.success else "")
+
+        # 依這次的結果調整暫停狀態
+        reason = (r.data or {}).get("reason", "")
+        if r.success:
+            _clear_block(plat)              # 發成功＝限制解除
+            # 記下「這個平台發過這一版」，7 天內同一版就會被 Variants 排到後面
+            try:
+                from .. import post_dedup
+                post_dedup.record_post(f"platform:{plat}", post_dedup.content_key(text), account_id, plat)
+            except Exception:
+                pass
+        elif reason == "action_blocked":
+            hours = _apply_block(plat, r.error or "帳號動作被限制")
+            acc_row = _load_account_row()   # 重讀，同一輪的下一個平台看得到最新狀態
+            print(f"[extra] ⚠ {plat} 動作被限制，暫停 {hours} 小時", flush=True)
+
+        print(f"[extra] {title} → {plat}：{'成功' if r.success else r.error}", flush=True)
+
+
+class Variants:
+    """FB 主發之後，順發平台各自要的版本與照片。
+
+    版本：從 FB 用的那一版「往後數」（k+1），Threads 與 IG 也彼此不同。
+    照片：每個平台各用 pick_images 挑一組（首頁輪替＋隨機 2/3），跟 Marketplace／
+    社團發文同一套規則。resolve 把 /uploads/... 轉成實際檔案路徑，由呼叫端提供。
+    """
+
+    def __init__(self, versions: list[tuple[str, str]], base_idx: int, footer: str,
+                 image_pool: list[str], cover_ids: list[str], cover_cursor: int,
+                 resolve, rng=None):
+        import random as _r
+        self.versions = versions or [("", "")]
+        self.base_idx = base_idx
+        self.footer = footer or ""
+        self.pool = list(image_pool or [])
+        self.covers = list(cover_ids or []) or self.pool[:3]
+        self.cursor = cover_cursor or 0
+        self.resolve = resolve
+        self.rng = rng or _r.Random()
+
+    def for_platform(self, k: int, platform: str = "") -> tuple[str, str, list[str]]:
+        from ..marketplace_content import compose_post_content, pick_images
+        from .. import post_dedup
+        n = len(self.versions)
+        order = [(self.base_idx + 1 + k + j) % n for j in range(n)]     # 從「往後數」那版開始輪
+        # 同一物件同一版 7 天內不該在同一平台重發（老闆 2026-09-07）。
+        # 版本只有 4 版、每天都發的話 7 天內一定會輪回來——那就挑「最久沒在這個平台發過」的，
+        # 而不是整場不發。
+        chosen, oldest, oldest_at = None, None, None
+        for idx in order:
+            t, b = self.versions[idx]
+            text = self._compose(t, b)
+            last = post_dedup.recently_posted(f"platform:{platform}", post_dedup.content_key(text)) if platform else None
+            if last is None:
+                chosen = idx
+                break
+            if oldest_at is None or last < oldest_at:
+                oldest, oldest_at = idx, last
+        idx = chosen if chosen is not None else (oldest if oldest is not None else order[0])
+        t, b = self.versions[idx]
+        text = self._compose(t, b)
+        picked, self.cursor, _ = pick_images(self.pool, self.covers, self.cursor, "", self.rng)
+        paths = self.resolve(picked) or self.resolve(self.pool)
+        return t, text, paths
+
+    def _compose(self, t: str, b: str) -> str:
+        from ..marketplace_content import compose_post_content
+        text = compose_post_content(t, b)
+        return (text + "\n\n" + self.footer).strip() if self.footer else text

@@ -1,0 +1,1216 @@
+"""以 subprocess 呼叫 FB_Auto CLI 的橋接層。單一全域鎖確保同時只有一個瀏覽器。"""
+import asyncio
+import contextlib
+from typing import Callable
+import json
+import os
+import sys
+import subprocess
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from .proc_utils import spawn_kwargs, kill_tree
+
+from .config import DATA_DIR, DATA_ROOT
+
+FB_AUTO_DIR = Path(__file__).resolve().parents[2] / "FB_Auto"
+# ⚠️ 必須與 FB_Auto/src/paths.py 算出同一個位置——CLI 是獨立子進程，各自算自己的路徑。
+#    規則見 config.py 的 DATA_ROOT 註解（SPEC-P23 §3.2）。
+FB_AUTO_DATA_DIR = (DATA_ROOT / "fb_auto" / "data") if DATA_ROOT else (FB_AUTO_DIR / "data")
+FB_AUTO_COOKIES_DIR = FB_AUTO_DATA_DIR / "cookies"
+LOGIN_LOG_DIR = DATA_DIR / "logs"
+_BRIDGE_LOCK = asyncio.Lock()
+
+# 進行中子進程登記（key → proc）。所有 spawn 都用 spawn_kwargs() 建獨立進程組，
+# 故 kill_tree() 可終止整棵進程樹（含 CLI 底下的 Chrome）。跨平台（POSIX/Windows）。
+_RUNNING: dict[str, object] = {}
+# key → (人話名稱, 起跑時間, 預估總秒數；0＝不知道)。只為了把「忙碌」講清楚：
+# 老闆 2026-09-06 實測看到「其他瀏覽器任務（登入／匯入等）」——等於沒說。
+_RUNNING_META: dict[str, tuple[str, float, int]] = {}
+
+# task_type / op → 人話。沒列到的就照原字顯示（總比翻譯錯好）。
+_OP_LABEL = {
+    "nurture": "自動養號", "nurture_threads": "Threads 自動養號", "nurture_ig": "IG 自動養號",
+    "marketplace": "Marketplace 上架", "group_post": "社團發文", "post": "社團發文",
+    "mp_cleanup": "清理過期上架", "cleanup_fb": "FB 備份刪文",
+    "cleanup_threads": "Threads 備份刪文", "cleanup_ig": "IG 備份刪文",
+    "friend_fb": "FB 自動加好友", "friend_ig": "IG 自動追蹤",
+    "leads_search": "Threads 找潛在客戶", "leads_follow": "Threads 自動追蹤",
+    "gjoin_search": "尋找社團", "gjoin_join": "加入社團",
+    "threads_login": "Threads 登入", "threads_check": "Threads 檢查登入",
+    "threads_open": "開啟 Threads 視窗", "ig_open": "開啟 IG 視窗", "ig_check": "IG 檢查登入",
+    "import_url": "網址匯入", "import_list": "抓同店家清單", "import_batch": "批次匯入",
+    "detect": "偵測可轉發社團", "categories": "抓取 FB 類別", "sync_groups": "抓取社團",
+    "delete": "刪除貼文", "comment": "自動留言", "fb_open": "開啟 FB 視窗",
+}
+
+
+def op_label(op: str) -> str:
+    return _OP_LABEL.get(op or "", op or "瀏覽器任務")
+
+
+def _register(key: str | None, proc, op: str = "", eta_sec: int = 0) -> None:
+    if key:
+        _RUNNING[key] = proc
+        # op 沒給就把名稱留空，讓 browser_busy_reason 用 key 前綴（mp_／gp_）判斷，
+        # 不要塞一個「瀏覽器任務」把原本講得出口的名字蓋掉
+        _RUNNING_META[key] = (op_label(op) if op else "", time.time(), max(0, int(eta_sec or 0)))
+
+
+def _unregister(key: str | None) -> None:
+    if key:
+        _RUNNING.pop(key, None)
+        _RUNNING_META.pop(key, None)
+
+
+def kill_job(key: str) -> bool:
+    """中止已登記的子進程（連同其進程組）。回傳是否有找到並嘗試中止。"""
+    proc = _RUNNING.get(key)
+    if proc is None:
+        return False
+    kill_tree(proc)
+    _RUNNING.pop(key, None)
+    return True
+
+
+def automation_chrome_pids() -> list[int]:
+    """系統自己開的 Chrome：--user-data-dir 指到 FB_Auto 底下（帳號 profile、threads_profile）。
+    使用者自己的 Chrome 用的是 ~/Library/Application Support/Google/Chrome，不會被抓到。"""
+    if os.name == "nt":
+        return []
+    try:
+        out = subprocess.run(["ps", "-ax", "-o", "pid=,command="], capture_output=True,
+                             text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    marker = str(FB_AUTO_DIR)
+    pids = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or "--user-data-dir=" not in line:
+            continue
+        if "chrome" not in line.lower():
+            continue
+        # 只抓主進程（帶 --user-data-dir 且路徑在 FB_Auto 底下）；helper 子進程跟著主進程一起死
+        if f"--user-data-dir={marker}" in line and "--type=" not in line:
+            with contextlib.suppress(ValueError):
+                pids.append(int(line.split(None, 1)[0]))
+    return pids
+
+
+def kill_automation_chromes() -> int:
+    """關掉系統自己開的 Chrome（見 automation_chrome_pids）。回傳關掉幾個。"""
+    import signal
+    pids = automation_chrome_pids()
+    for pid in pids:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGTERM)
+    if pids:
+        time.sleep(1.5)
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)       # 1.5 秒還沒走就硬關；SingletonLock 會由下一次啟動清掉
+    return len(pids)
+
+
+def browser_busy_reason() -> str:
+    """目前是否有瀏覽器/CLI 任務在跑（會佔用瀏覽器）。有→回白話說明；無→空字串。
+    用於帳號設定區開瀏覽器前的忙碌提醒（單一瀏覽器，排程/發文進行中不可同時再開）。"""
+    live = []
+    for key, proc in list(_RUNNING.items()):
+        try:
+            if proc.poll() is None:
+                live.append(key)
+        except Exception:
+            pass
+    if not live:
+        return ""
+
+    def _one(key: str) -> str:
+        label, started, eta = _RUNNING_META.get(key, ("", 0.0, 0))
+        if not label:                                   # 沒登記到 meta 的舊路徑
+            if key.startswith("mp_"):
+                return "Marketplace 排程發文"
+            if key.startswith("gp_"):
+                return "社團發文"
+            return "瀏覽器任務"
+        if not started:
+            return label
+        ran = int(time.time() - started)
+        parts = [f"已經跑 {ran // 60} 分鐘" if ran >= 60 else f"已經跑 {ran} 秒"]
+        if eta:
+            left = eta - ran
+            # 估的時間過了還沒完就不要再報一個負數，講「快好了」比較誠實
+            parts.append(f"大約還要 {max(1, round(left / 60))} 分鐘" if left > 30 else "快好了")
+        return f"{label}（{'，'.join(parts)}）"
+
+    # 同一個名稱只講一次（例如兩筆社團發文），順序照登記先後
+    seen, out = set(), []
+    for k in live:
+        t = _one(k)
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return "、".join(out) or "瀏覽器任務"
+
+
+# ─── 一次性長時操作任務（記憶體追蹤，不落 DB；重啟不還原）───────────
+
+@dataclass
+class BridgeJob:
+    job_id: str
+    op: str                 # comment / nurture / marketplace / detect / delete
+    proc: subprocess.Popen
+    result_path: str
+    started_at: float
+    account_id: int | None = None
+    fbid: str = ""
+    log_id: int | None = None  # 對應 RunLog（P13 貫通用）
+    log_path: str = ""         # CLI stdout/stderr 日誌檔
+    exited_at: float | None = None  # 首次發現子進程已結束的時間（給 reaper 算寬限）
+    # 收尾回呼（P31）：排程啟動的工作沒人輪詢，結果只會被 reaper 收走；
+    # 需要把結果落庫的呼叫端（加好友要記「邀過誰」）掛這個，poll/reap 兩條路都會叫。
+    on_done: "Callable[[BridgeResult], None] | None" = None
+    profile: str = ""          # 用哪個瀏覽器 profile："fb:<fbid>" 或 "meta"（見 profile_key_for）
+
+
+_BRIDGE_JOBS: dict[str, BridgeJob] = {}
+LONG_OP_WAIT_SEC = 20
+
+# ─── 瀏覽器 profile 互斥 ────────────────────────────────
+# 同一個 Chrome profile 一次只能被一個任務開（SingletonLock）。兩種 profile：
+#   fb:<fbid>  每個 FB 帳號一份（發文、養號、加好友、刪文、加入社團…都用它）
+#   meta       Threads 與 IG 共用同一份 threads_profile（發文、養號、追蹤、刪文、開視窗…）
+# 2026-09-08 老闆問「會不會有類似問題」盤出來的洞：
+#   - 長時任務只用 fbid 互相擋，Meta 任務沒帶 fbid → Threads 養號、IG 追蹤、Threads 順發互相撞
+#   - 短任務（MP／社團發文）不看長時任務、長時任務也不看短任務 → 誰晚到誰失敗
+#   - MP 發文走 detached 不經 _BRIDGE_LOCK → 跟社團發文可以同時開同一個 FB profile
+# 統一做法：所有會開瀏覽器的路徑都先算 profile key，開之前等同 key 的任務結束。
+_META_MODULES = frozenset({
+    "src.run_threads_post", "src.run_ig_post", "src.run_meta_nurture", "src.run_meta_cleanup",
+    "src.run_ig_follow", "src.run_threads_follow", "src.run_threads_search",
+})
+_PROFILE_SHORT: dict[str, str] = {}      # 短任務正握著的 profile：key → module
+
+
+def profile_key_for(module: str, args: list[str] | None = None, fbid: str = "") -> str:
+    """這個 CLI 會開哪個瀏覽器 profile。認不出來（不開瀏覽器）回空字串＝不互斥。"""
+    if module in _META_MODULES:
+        return "meta"
+    if fbid:
+        return f"fb:{fbid}"
+    args = list(args or [])
+    if "--fbid" in args:
+        i = args.index("--fbid")
+        if i + 1 < len(args) and args[i + 1]:
+            return f"fb:{args[i + 1]}"
+    return ""
+
+
+def _profile_busy(key: str):
+    """同 profile 有沒有任務在用：長時任務回 BridgeJob；短任務回帶 .op 的物件；沒有回 None。"""
+    if not key:
+        return None
+    for job in _BRIDGE_JOBS.values():
+        # 舊路徑登記的 job 沒有 profile，只有 fbid——也要算
+        same = job.profile == key or (not job.profile and job.fbid and key == f"fb:{job.fbid}")
+        if same and job.proc.poll() is None:
+            return job
+    mod = _PROFILE_SHORT.get(key)
+    if mod:
+        import types
+        return types.SimpleNamespace(op=_SHORT_OP_LABEL.get(mod, mod), job_id=f"short:{key}")
+    return None
+
+
+_SHORT_OP_LABEL = {
+    "src.run_p2": "Marketplace 發文", "src.run_p1": "社團發文",
+    "src.run_threads_post": "Threads 發文", "src.run_ig_post": "IG 發文",
+}
+
+
+def _hold_profile(key: str, module: str) -> None:
+    if key:
+        _PROFILE_SHORT[key] = module
+
+
+def _release_profile(key: str) -> None:
+    if key:
+        _PROFILE_SHORT.pop(key, None)
+
+
+def _fbid_busy(fbid: str) -> BridgeJob | None:
+    """若同 fbid 已有進行中的瀏覽器任務（長時或短任務），回傳該 job。"""
+    if not fbid:
+        return None
+    return _profile_busy(f"fb:{fbid}")
+
+
+_LONG_OP_LABEL = {"nurture": "養號", "nurture_threads": "Threads 養號", "nurture_ig": "IG 養號",
+                  "friend": "自動加好友", "cleanup": "備份刪文", "gjoin": "自動加入社團",
+                  "leads": "找潛在客戶", "comment": "留言", "detect": "偵測社團"}
+
+
+async def wait_profile_free(key: str, max_wait_sec: int = 1500, tag: str = "[bridge]"):
+    """開瀏覽器前等同一個 profile 的任務跑完；回傳仍在跑的任務（有 .op），空＝已經空出來。
+
+    mini 2026-09-08 01:18 實例：01:15 起跑的養號要跑 8 分鐘，01:18 的 Marketplace 排程撞上
+    同一個 Chrome profile，CLI 等 8 秒就報「這個帳號的瀏覽器還開著」失敗——那一場就白白沒了。
+    養號最長也就十來分鐘，等它跑完再發，比失敗合理得多。最多等 25 分鐘（超過代表卡住了）。"""
+    import asyncio as _aio
+    if not key:
+        return None
+    busy = _profile_busy(key)
+    if busy is None:
+        return None
+    started = time.time()
+    last_said = 0.0
+    who = key.split(":", 1)[1] if key.startswith("fb:") else "Threads／IG"
+    while busy is not None and time.time() - started < max_wait_sec:
+        if time.time() - last_said >= 60:
+            mins = int((time.time() - started) // 60)
+            print(f"{tag} 帳號 {who} 的{_LONG_OP_LABEL.get(busy.op, busy.op)}還在跑，等它結束再開瀏覽器"
+                  f"{f'（已等 {mins} 分鐘）' if mins else ''}", flush=True)
+            last_said = time.time()
+        await _aio.sleep(10)
+        busy = _profile_busy(key)
+    return busy
+
+
+async def wait_fbid_free(fbid: str, max_wait_sec: int = 1500, tag: str = "[bridge]"):
+    """wait_profile_free 的 FB 版（排程發文用）。"""
+    if not fbid:
+        return None
+    return await wait_profile_free(f"fb:{fbid}", max_wait_sec=max_wait_sec, tag=tag)
+
+
+def busy_reason(job, max_wait_sec: int = 1500) -> str:
+    """等不到瀏覽器空出來時，給 RunLog 用的人話。"""
+    return (f"{_LONG_OP_LABEL.get(job.op, job.op)}還在用這個帳號的瀏覽器，等了 {max_wait_sec // 60} 分鐘還沒結束，"
+            "這一場跳過（下一場照常）。若一直這樣，請到帳號設定把該任務停掉。")
+
+
+def start_long_op(
+    op: str,
+    module: str,
+    args: list[str],
+    account_id: int | None = None,
+    fbid: str = "",
+    on_done: "Callable[[BridgeResult], None] | None" = None,
+) -> str:
+    """spawn 一個長時操作 CLI，登記後即刻回傳 job_id（不等結束）。
+    on_done：結束時（不論成敗）拿 BridgeResult 的回呼，poll 與 reaper 都會觸發，只叫一次。"""
+    # 同一個瀏覽器 profile 不可並行開 Chrome（SingletonLock）。這支是同步函式、會卡住事件迴圈，
+    # 所以只短等；排程類呼叫端要先 await wait_profile_free() 再來。
+    profile = profile_key_for(module, args, fbid)
+    if profile:
+        busy = _profile_busy(profile)
+        if busy is not None:
+            deadline = time.time() + LONG_OP_WAIT_SEC
+            print(f"[bridge] {profile} 忙於 {busy.op}({busy.job_id})，等待最多 {LONG_OP_WAIT_SEC}s…", flush=True)
+            while time.time() < deadline:
+                busy = _profile_busy(profile)
+                if busy is None:
+                    break
+                time.sleep(2)
+            busy = _profile_busy(profile)
+            if busy is not None:
+                who = profile.split(":", 1)[1] if profile.startswith("fb:") else "Threads／IG"
+                raise RuntimeError(
+                    f"帳號 {who} 正有其他瀏覽器任務進行中（{_LONG_OP_LABEL.get(busy.op, busy.op)}），請稍後再試"
+                )
+
+    fd, result_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+
+    job_id = f"{op}_{uuid.uuid4().hex[:12]}"
+    # 捕捉 CLI 完整輸出到日誌檔（供除錯 / 未來 SaaS），不再丟 DEVNULL
+    LOGIN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = str(LOGIN_LOG_DIR / f"{op}_{int(time.time())}_{job_id[-6:]}.log")
+    log_file = open(log_path, "w", encoding="utf-8")
+
+    full_args = [sys.executable, "-m", module, "--result-json", result_path, *args]
+    try:
+        proc = subprocess.Popen(
+            full_args,
+            cwd=str(FB_AUTO_DIR),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            **spawn_kwargs(),
+        )
+    finally:
+        log_file.close()  # 子進程持有自己的 fd
+    # 養號是唯一自己帶時長的任務（--duration 分鐘），順手拿來估剩餘時間
+    eta = 0
+    if "--duration" in args:
+        try:
+            eta = int(float(args[args.index("--duration") + 1]) * 60)
+        except (IndexError, ValueError):
+            eta = 0
+    _register(job_id, proc, op=op, eta_sec=eta)
+    # RunLog：開一筆 running（op 對映 task_type）
+    log_id = None
+    with contextlib.suppress(Exception):
+        log_id = create_run_log_sync(task_type=op, fbid=fbid, account_id=account_id)
+    _BRIDGE_JOBS[job_id] = BridgeJob(
+        job_id=job_id, op=op, proc=proc, result_path=result_path,
+        started_at=time.time(), account_id=account_id, fbid=fbid, log_id=log_id, log_path=log_path,
+        on_done=on_done, profile=profile,
+    )
+    return job_id
+
+
+def poll_long_op(job_id: str) -> dict:
+    """查詢長時操作狀態：none / pending / success|failed。
+    結束時回收 result JSON 並清理登記；回傳含 BridgeResult 供呼叫端落庫。"""
+    job = _BRIDGE_JOBS.get(job_id)
+    if job is None:
+        return {"state": "none"}
+
+    if job.proc.poll() is None:
+        return {"state": "pending", "op": job.op, "elapsed_sec": int(time.time() - job.started_at)}
+
+    # 已結束 → 回收
+    _unregister(job_id)
+    del _BRIDGE_JOBS[job_id]
+    try:
+        with open(job.result_path, encoding="utf-8") as f:
+            raw = json.load(f)
+        result = _result_from_raw(raw)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        result = BridgeResult(success=False, error=f"CLI exited {job.proc.returncode}")
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(job.result_path)
+
+    # 讀 CLI 日誌尾端塞進 output_tail（供執行紀錄除錯）
+    if job.log_path:
+        with contextlib.suppress(OSError):
+            tail = Path(job.log_path).read_text(encoding="utf-8", errors="replace")
+            result.output_tail = tail[-4000:]
+
+    # RunLog：收尾更新
+    if job.log_id is not None:
+        with contextlib.suppress(Exception):
+            update_run_log_sync(job.log_id, result)
+    if job.on_done is not None:
+        try:
+            job.on_done(result)
+        except Exception as e:          # 回呼炸掉不能拖垮收尾
+            print(f"[bridge] {job.op} on_done 失敗：{e}", flush=True)
+
+    return {
+        "state": "success" if result.success else "failed",
+        "op": job.op,
+        "result": result,
+        "elapsed_sec": int(time.time() - job.started_at),
+    }
+
+
+def get_long_op(job_id: str) -> BridgeJob | None:
+    return _BRIDGE_JOBS.get(job_id)
+
+# 驗證相關關鍵字（CLI 輸出行帶此關鍵字時，bridge 將狀態標為 needs_manual）
+_VERIFY_KEYWORDS = [
+    "VERIFICATION_NEEDED", "IDENTITY_VERIFICATION", "IDENTITY_CHECK", "CHECKPOINT",
+    "needs_2fa", "captcha", "身份驗證", "檢查點",
+    # FB 反制 / 保護機制訊號（偵測到即全域暫停）
+    "發文太頻繁", "動作被封鎖", "暫時無法使用", "暫時封鎖", "已達上限", "違反社群守則",
+    "你目前無法使用這項功能", "action blocked", "temporarily blocked", "too fast",
+    "temporarily restricted", "account restricted", "帳號受限",
+]
+
+# 「被 FB 登出 / cookie 失效」訊號。與上面分開：這不是 FB 在擋你，是要重新登入，
+# 給客戶的指示完全不同（去帳號設定重新登入，而不是等冷卻）。偵測不到就會一路
+# 失敗到底、只留在執行紀錄裡沒人看見（2026-08-02 客戶回報「被跳出登入」）。
+_LOGOUT_KEYWORDS = [
+    "cookie 已失效", "cookie 登入失敗", "cookie 已被 FB 註銷", "頁面仍顯示登入表單",
+    "cookie 不存在", "無法取得 fbid", "login_required", "not logged in",
+]
+
+
+def _detect_logged_out(text: str) -> bool:
+    """CLI 輸出／錯誤訊息看起來是「被登出、要重新登入」。"""
+    low = (text or "").lower()
+    return any(kw.lower() in low for kw in _LOGOUT_KEYWORDS)
+
+
+@dataclass
+class BridgeResult:
+    success: bool
+    results: list = field(default_factory=list)
+    item_url: str | None = None
+    fbid: str = ""
+    error: str = ""
+    needs_manual_action: bool = False
+    manual_action_reason: str = ""
+    needs_relogin: bool = False       # 被 FB 登出／cookie 失效，要客戶重新登入
+    output_tail: str = ""
+    groups: list = field(default_factory=list)
+    total_groups: int = 0
+    data: dict = field(default_factory=dict)
+
+
+def _result_from_raw(
+    raw: dict,
+    needs_manual: bool = False,
+    reason: str = "",
+    tail: str = "",
+) -> BridgeResult:
+    """CLI result JSON → BridgeResult 的唯一轉換點。envelope v2：任務欄位在 raw["data"]。"""
+    d = raw.get("data") or {}
+    groups = d.get("groups") or d.get("mp_groups") or []
+    err = raw.get("error", "")
+    return BridgeResult(
+        success=raw.get("success", False),
+        fbid=raw.get("fbid", ""),
+        error=err,
+        needs_relogin=(not raw.get("success", False)) and _detect_logged_out(f"{err}\n{tail}"),
+        results=d.get("results", []),
+        item_url=d.get("item_url"),
+        groups=groups,
+        total_groups=d.get("total_groups") or len(groups),
+        needs_manual_action=needs_manual,
+        manual_action_reason=reason,
+        output_tail=tail,
+        data=d,
+    )
+
+
+def cookie_exists(fbid: str) -> bool:
+    return (FB_AUTO_COOKIES_DIR / f"{fbid}.json").exists()
+
+
+def _detect_manual_action(text: str) -> tuple[bool, str]:
+    """從 CLI 輸出中檢測是否需要手動操作（驗證/2FA 等）。"""
+    for kw in _VERIFY_KEYWORDS:
+        if kw.lower() in text.lower():
+            return True, kw
+    return False, ""
+
+
+async def _run_cli(
+    module: str,
+    args: list[str],
+    timeout_sec: int,
+    keep_open: bool = False,
+    job_key: str | None = None,
+) -> BridgeResult:
+    """以 subprocess 執行 FB_Auto CLI 模組，讀回 result JSON。"""
+    fd, result_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+
+    full_args = [sys.executable, "-m", module, "--result-json", result_path, *args]
+
+    # keep_open 模式：不設全域 timeout（讓 CLI 自己的 --keep-open 互動等待決定何時結束）
+    effective_timeout = None if keep_open else timeout_sec
+
+    pkey = profile_key_for(module, args)
+    try:
+        async with _BRIDGE_LOCK:
+            # 同 profile 的長時任務（養號等）或 detached 的 MP 發文還在跑 → 等它結束，不要撞上去失敗
+            busy = await wait_profile_free(pkey, tag=f"[{module.rsplit('.', 1)[-1]}]")
+            if busy is not None:
+                return BridgeResult(success=False, error=busy_reason(busy))
+            _hold_profile(pkey, module)
+            proc = await asyncio.create_subprocess_exec(
+                *full_args,
+                cwd=str(FB_AUTO_DIR),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **spawn_kwargs(),
+            )
+            _register(job_key, proc)
+
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), effective_timeout)
+            except asyncio.TimeoutError:
+                if keep_open:
+                    # 驗證模式不下殺，讓使用者手動處理
+                    return BridgeResult(
+                        success=False,
+                        error="waiting for manual verification (browser kept open)",
+                        needs_manual_action=True,
+                        manual_action_reason="waiting_for_user",
+                    )
+                proc.kill()
+                await proc.wait()
+                return BridgeResult(
+                    success=False,
+                    error=f"timeout after {timeout_sec}s",
+                )
+            finally:
+                _unregister(job_key)
+                _release_profile(pkey)
+
+        return_code = proc.returncode
+        stdout_text = stdout.decode("utf-8", errors="replace") if stdout else ""
+        stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
+        tail = (stderr_text + "\n" + stdout_text).strip()[-2000:]
+
+        # 檢查是否需要手動操作
+        combined_output = stdout_text + stderr_text
+        needs_manual, reason = _detect_manual_action(combined_output)
+
+        # 讀取 result JSON
+        try:
+            with open(result_path, encoding="utf-8") as f:
+                raw = json.load(f)
+            return _result_from_raw(raw, needs_manual, reason, tail)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            error_msg = f"CLI exited {return_code}"
+            if tail:
+                error_msg += f": {tail[-500:]}"
+            return BridgeResult(
+                success=False,
+                error=error_msg,
+                needs_manual_action=needs_manual,
+                manual_action_reason=reason,
+                needs_relogin=_detect_logged_out(f"{error_msg}\n{tail}"),
+                output_tail=tail,
+            )
+
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(result_path)
+
+
+async def _run_cli_detached(
+    module: str,
+    args: list[str],
+    timeout_sec: int,
+    job_key: str | None = None,
+) -> BridgeResult:
+    """spawn 獨立 session 的 CLI 並等待結束（不經 _BRIDGE_LOCK，瀏覽器彈出型操作用）。"""
+    # 不經 _BRIDGE_LOCK 也要守 profile 互斥：MP 發文跟社團發文用同一個 FB profile，
+    # 兩條排程時間一樣時會同時開 → 後開的那個「瀏覽器還開著」失敗
+    pkey = profile_key_for(module, args)
+    busy = await wait_profile_free(pkey, tag=f"[{module.rsplit('.', 1)[-1]}]")
+    if busy is not None:
+        return BridgeResult(success=False, error=busy_reason(busy))
+    _hold_profile(pkey, module)
+    fd, result_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+
+    # 捕捉 CLI 輸出到日誌檔（供除錯 / SaaS）
+    LOGIN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    mod_short = module.rsplit(".", 1)[-1]
+    log_path = LOGIN_LOG_DIR / f"{mod_short}_{int(time.time())}.log"
+    log_file = open(log_path, "w", encoding="utf-8")
+
+    full_args = [sys.executable, "-m", module, "--result-json", result_path, *args]
+    try:
+        proc = subprocess.Popen(
+            full_args,
+            cwd=str(FB_AUTO_DIR),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            **spawn_kwargs(),
+        )
+    finally:
+        log_file.close()
+    _register(job_key, proc)
+
+    loop = asyncio.get_running_loop()
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(None, proc.wait),
+            timeout=timeout_sec,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        proc.wait()
+        with contextlib.suppress(OSError):
+            os.unlink(result_path)
+        return BridgeResult(success=False, error=f"timeout after {timeout_sec}s")
+    finally:
+        _unregister(job_key)
+        _release_profile(pkey)
+
+    tail = ""
+    with contextlib.suppress(OSError):
+        tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+    try:
+        with open(result_path, encoding="utf-8") as f:
+            raw = json.load(f)
+        r = _result_from_raw(raw)
+        r.output_tail = tail
+        return r
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return BridgeResult(success=False, error=f"CLI exited {proc.returncode}", output_tail=tail)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(result_path)
+
+
+async def run_group_post(
+    fbid: str,
+    group_url: str,
+    content: str,
+    images: list[str] | None = None,
+    headless: bool = False,
+    timeout_sec: int = 600,
+    keep_open: bool = False,
+    job_key: str | None = None,
+) -> BridgeResult:
+    if not cookie_exists(fbid):
+        return BridgeResult(success=False, error=f"cookie 不存在: {fbid}", needs_relogin=True)
+    cli_args = ["--fbid", fbid, "--group", group_url, "--content", content, "--skip-groups"]
+    if images:
+        cli_args.extend(["--image", *images])
+    if headless:
+        cli_args.append("--headless")
+    return await _run_cli("src.run_p1", cli_args, timeout_sec, keep_open, job_key=job_key)
+
+
+async def run_marketplace_post(
+    fbid: str,
+    item_name: str,
+    share_groups: list[str] | None = None,
+    headless: bool = False,
+    timeout_sec: int = 900,
+    keep_open: bool = False,
+    category: str = "",
+    dry_run: bool = False,
+    job_key: str | None = None,
+) -> BridgeResult:
+    if not cookie_exists(fbid):
+        return BridgeResult(success=False, error=f"cookie 不存在: {fbid}", needs_relogin=True)
+
+    cli_args = ["--fbid", fbid, "--item", item_name]
+    if share_groups:
+        cli_args.extend(["--share-groups", *share_groups])
+    if category:
+        cli_args.extend(["--category", category])
+    if dry_run:
+        cli_args.append("--dry-run")
+    if headless:
+        cli_args.append("--headless")
+
+    if keep_open:
+        # keep_open：spawn 後即刻回傳，不等結果
+        fd, result_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "src.run_p2", "--result-json", result_path, *cli_args, "--keep-open"],
+            cwd=str(FB_AUTO_DIR),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **spawn_kwargs(),
+        )
+        _register(job_key, proc)
+        return BridgeResult(success=True, fbid=fbid, error="")
+
+    result = await _run_cli_detached("src.run_p2", cli_args, timeout_sec, job_key=job_key)
+    setattr(result, "status", result.data.get("status", ""))
+    return result
+
+
+async def run_marketplace_delete_old(
+    fbid: str,
+    max_age_days: int = 7,
+    headless: bool = True,
+    dry_run: bool = False,
+    timeout_sec: int = 900,
+) -> BridgeResult:
+    """P17：掃銷售中頁，刪除超過 max_age_days 天的 Marketplace 刊登。"""
+    if not cookie_exists(fbid):
+        return BridgeResult(success=False, error=f"cookie 不存在: {fbid}", needs_relogin=True)
+
+    cli_args = ["--fbid", fbid, "--max-age-days", str(max_age_days)]
+    if dry_run:
+        cli_args.append("--dry-run")
+    if headless:
+        cli_args.append("--headless")
+
+    return await _run_cli_detached("src.run_delete_marketplace", cli_args, timeout_sec)
+
+
+async def run_nurture(
+    fbid: str,
+    duration_min: int = 5,
+    headless: bool = False,
+    timeout_sec: int = 1200,
+    keep_open: bool = False,
+) -> BridgeResult:
+    if not cookie_exists(fbid):
+        return BridgeResult(success=False, error=f"cookie 不存在: {fbid}", needs_relogin=True)
+    cli_args = ["--fbid", fbid, "--duration", str(duration_min)]
+    if headless:
+        cli_args.append("--headless")
+    return await _run_cli("src.run_nurture", cli_args, timeout_sec, keep_open)
+
+
+async def run_threads_share(text: str, images: list[str] | None = None,
+                            timeout_sec: int = 300) -> BridgeResult:
+    """把已組好的物件文案發到 Threads（P27 附加平台）。
+    登入態在 threads_profile，不吃 FB cookie；仍走同一個 _run_cli
+    （全域瀏覽器序列化）。文字超 500 字由 CLI 自行裁切。"""
+    cli_args = ["--text", text, "--headless"]
+    if images:
+        cli_args.extend(["--images", ",".join(images)])
+    return await _run_cli("src.run_threads_post", cli_args, timeout_sec)
+
+
+async def run_ig_share(text: str, images: list[str],
+                       timeout_sec: int = 420) -> BridgeResult:
+    """把已組好的物件文案發到 Instagram（P27 附加平台）。
+    IG 必帶圖——呼叫端要先確認 images 非空（無圖該跳過並寫明原因）。"""
+    cli_args = ["--text", text, "--images", ",".join(images), "--headless"]
+    return await _run_cli("src.run_ig_post", cli_args, timeout_sec)
+
+
+async def run_delete_old_posts(
+    fbid: str,
+    max_age_days: int = 7,
+    headless: bool = False,
+    timeout_sec: int = 600,
+    keep_open: bool = False,
+) -> BridgeResult:
+    if not cookie_exists(fbid):
+        return BridgeResult(success=False, error=f"cookie 不存在: {fbid}", needs_relogin=True)
+    cli_args = ["--fbid", fbid, "--max-age-days", str(max_age_days)]
+    if headless:
+        cli_args.append("--headless")
+    return await _run_cli("src.run_delete_posts", cli_args, timeout_sec, keep_open)
+
+
+async def run_comment(
+    fbid: str,
+    post_urls: list[str],
+    content: str,
+    sleep_seconds: int = 60,
+    headless: bool = False,
+    timeout_sec: int = 1200,
+    keep_open: bool = False,
+) -> BridgeResult:
+    if not cookie_exists(fbid):
+        return BridgeResult(success=False, error=f"cookie 不存在: {fbid}", needs_relogin=True)
+    cli_args = ["--fbid", fbid, "--content", content, "--sleep", str(sleep_seconds), "--urls", *post_urls]
+    if headless:
+        cli_args.append("--headless")
+    return await _run_cli("src.run_comment", cli_args, timeout_sec, keep_open)
+
+
+@dataclass
+class LoginJob:
+    """一次 first-login 子進程的追蹤資訊（單帳號情境下同時最多一個）。"""
+    account_id: int
+    proc: subprocess.Popen
+    result_path: str
+    log_path: str
+    started_at: float
+
+
+_LOGIN_JOBS: dict[int, LoginJob] = {}
+
+
+def start_first_login(
+    account_id: int,
+    email: str,
+    password: str,
+    headless: bool = False,
+    skip_groups: bool = False,
+) -> LoginJob:
+    """spawn 登入子進程並記住其 result JSON 路徑，供 poll_first_login 回收。
+    工作進行中重複呼叫會拋 RuntimeError。"""
+    job = _LOGIN_JOBS.get(account_id)
+    if job and job.proc.poll() is None:
+        raise RuntimeError("login already in progress")
+
+    fd, result_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+
+    LOGIN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = str(LOGIN_LOG_DIR / f"login_{account_id}_{int(time.time())}.log")
+
+    cli_args = ["--email", email, "--password", password]
+    if headless:
+        cli_args.append("--headless")
+    if skip_groups:
+        # 只是重新登入拿新 cookie：別再跑暖身瀏覽＋抓社團＋慶祝頁那一整套
+        cli_args.append("--skip-groups")
+    full_args = [sys.executable, "-m", "src.run_login", "--result-json", result_path, *cli_args]
+
+    log_file = open(log_path, "w", encoding="utf-8")
+    try:
+        proc = subprocess.Popen(
+            full_args,
+            cwd=str(FB_AUTO_DIR),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            **spawn_kwargs(),
+        )
+    finally:
+        log_file.close()  # 子進程持有自己的 fd，父進程即刻關閉
+
+    job = LoginJob(
+        account_id=account_id,
+        proc=proc,
+        result_path=result_path,
+        log_path=log_path,
+        started_at=time.time(),
+    )
+    _LOGIN_JOBS[account_id] = job
+    return job
+
+
+def poll_first_login(account_id: int) -> dict:
+    """查詢 first-login 工作狀態，三態：none / pending / success|failed。
+    工作結束時讀回 result JSON 並清理（結果落 DB 由呼叫端負責）。"""
+    job = _LOGIN_JOBS.get(account_id)
+    if job is None:
+        return {"state": "none"}
+
+    if job.proc.poll() is None:
+        return {"state": "pending", "elapsed_sec": int(time.time() - job.started_at)}
+
+    # 子進程已結束 → 回收結果並移除工作
+    del _LOGIN_JOBS[account_id]
+    try:
+        with open(job.result_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = None
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(job.result_path)
+
+    if data and data.get("success") and data.get("fbid"):
+        d = (data.get("data") or {}) if data.get("schema") == 2 else data
+        return {
+            "state": "success",
+            "fbid": data["fbid"],
+            "groups": d.get("groups", []),
+            # v2 為 group_id 清單；舊格式 mp_groups 是 URL 清單（呼叫端會再正規化）
+            "mp_group_ids": d.get("mp_group_ids", d.get("mp_groups", [])),
+            # 快速重登（--skip-groups）沒抓社團：呼叫端絕不能拿空清單去覆蓋既有社團
+            "skipped_groups": bool(d.get("skipped_groups")),
+        }
+
+    error = (data or {}).get("error", "")
+    if not error:
+        tail = ""
+        with contextlib.suppress(OSError):
+            tail = Path(job.log_path).read_text(encoding="utf-8", errors="replace")[-500:]
+        error = tail or f"CLI exited {job.proc.returncode}"
+    return {"state": "failed", "error": error}
+
+
+async def run_first_login(
+    email: str,
+    password: str,
+    headless: bool = False,
+    timeout_sec: int = 660,
+) -> BridgeResult:
+    """純登入：用帳密登入 FB，取得 fbid 並儲存 cookie。
+    timeout 預設 11 分鐘以配合人工驗證等待。
+    
+    使用 subprocess.Popen 直接 spawn，確保瀏覽器視窗能正常彈出。"""
+    fd, result_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+
+    cli_args = ["--email", email, "--password", password]
+    if headless:
+        cli_args.append("--headless")
+
+    full_args = [sys.executable, "-m", "src.run_login", "--result-json", result_path, *cli_args]
+
+    # 用 subprocess.Popen 而非 create_subprocess_exec，確保瀏覽器能正確彈出
+    # （spawn_kwargs 的 CREATE_NO_WINDOW 只隱藏主控台，Chrome 視窗不受影響）
+    proc = subprocess.Popen(
+        full_args,
+        cwd=str(FB_AUTO_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **spawn_kwargs(),
+    )
+
+    # 用 run_in_executor 避免阻塞 event loop（不做 await asyncio.to_thread 因為後端須同步等待結果）
+    try:
+        loop = asyncio.get_running_loop()
+        stdout, stderr = await asyncio.wait_for(
+            loop.run_in_executor(None, proc.communicate),
+            timeout=timeout_sec
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        proc.wait()
+        return BridgeResult(success=False, error=f"timeout after {timeout_sec}s")
+
+    # 讀取 result JSON
+    try:
+        with open(result_path, encoding="utf-8") as f:
+            raw = json.load(f)
+        return _result_from_raw(raw)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return BridgeResult(
+            success=False,
+            error=f"CLI exited {proc.returncode}",
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(result_path)
+
+
+async def run_detect_mp_groups(
+    fbid: str,
+    headless: bool = True,
+    timeout_sec: int = 600,
+) -> BridgeResult:
+    """檢測哪些已同步社團可以轉發 Marketplace：開瀏覽器進對象頁抓取可轉發清單。
+    回傳的 groups 為 [{name, url, group_id}]（v2）；舊 CLI 為名稱字串清單。"""
+    if not cookie_exists(fbid):
+        return BridgeResult(success=False, error=f"cookie 不存在: {fbid}", needs_relogin=True)
+
+    cli_args = ["--fbid", fbid]
+    if headless:
+        cli_args.append("--headless")
+    return await _run_cli_detached("src.run_detect_mp_groups", cli_args, timeout_sec)
+
+
+async def run_cookie_login(
+    fbid: str,
+    headless: bool = False,
+    timeout_sec: int = 86400,
+    email: str = "",
+    password: str = "",
+) -> BridgeResult:
+    """Cookie 登入：用已儲存的 cookie 直接登入主頁，保持瀏覽器開啟直到使用者手動關閉。
+    cookie 失效時用帳密自動登入，版面認不得就留給客戶手動登。timeout 預設 24 小時。"""
+    if not cookie_exists(fbid):
+        return BridgeResult(success=False, error=f"cookie 不存在: {fbid}", needs_relogin=True)
+    cli_args = ["--fbid", fbid, "--keep-open"]
+    if email and password:
+        cli_args.extend(["--email", email, "--password", password])
+    if headless:
+        cli_args.append("--headless")
+    return await _run_cli("src.run_cookie_login", cli_args, timeout_sec)
+
+
+async def run_sync_groups(
+    fbid: str,
+    timeout_sec: int = 600,
+) -> BridgeResult:
+    """用 cookie 登入後抓取所有社團。Marketplace 檢查延後到發文時。"""
+    if not cookie_exists(fbid):
+        return BridgeResult(success=False, error=f"cookie 不存在: {fbid}", needs_relogin=True)
+    return await _run_cli_detached("src.run_sync_groups", ["--fbid", fbid, "--headless"], timeout_sec)
+
+
+async def run_cookie_login_bg(fbid: str, email: str = "", password: str = "") -> BridgeResult:
+    """Cookie 登入（背景）：spawn 獨立 process，不阻塞。瀏覽器保持開啟。
+    帶帳密時，cookie 失效會自動改走帳密登入／手動登入。"""
+    if not cookie_exists(fbid):
+        return BridgeResult(success=False, error=f"cookie 不存在: {fbid}", needs_relogin=True)
+
+    fd, result_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+
+    full_args = [
+        sys.executable, "-m", "src.run_cookie_login",
+        "--fbid", fbid,
+        "--keep-open",
+        "--result-json", result_path,
+    ]
+    if email and password:
+        full_args.extend(["--email", email, "--password", password])
+
+    # 用 subprocess.Popen（同步）確保 process 真的被 fork 出去
+    proc = subprocess.Popen(
+        full_args,
+        cwd=str(FB_AUTO_DIR),
+        **spawn_kwargs(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # 登記起來（2026-09-07 實測：這個 keep-open 視窗沒登記，後端不知道它在，
+    # 「忙碌檢查」放行、真正開瀏覽器才撞 SingletonLock，「強制關閉」也關不到它，
+    # 使用者關掉視窗後 python 還空跑了 10 小時）。同一 fbid 只留最新一個。
+    key = f"fb_open_{fbid}"
+    old = _RUNNING.get(key)
+    if old is not None and getattr(old, "poll", lambda: 0)() is None:
+        kill_tree(old)
+    _register(key, proc, op="fb_open")
+
+    return BridgeResult(success=True, fbid=fbid, error="")
+
+
+def _apply_log_update(log, result: BridgeResult, screenshot_paths: list[str] | None,
+                      context: dict | None = None):
+    """把 BridgeResult 套到 RunLog 物件（不 commit）。
+
+    context：呼叫端補充的摘要素材（物件標題、社團名）——CLI 的 result JSON
+    裡沒有這些，只有 runner 知道。"""
+    import datetime as _dt
+    from .runlog_summary import compose_summary
+    log.status = "needs_manual" if result.needs_manual_action else ("success" if result.success else "failed")
+    log.error_message = result.error or ""
+    log.output_tail = result.output_tail or ""
+    log.result_json = result.data if isinstance(result.data, dict) else {}
+    summary = compose_summary(log.task_type, log.status, log.result_json,
+                              log.error_message, context)
+    if summary:
+        log.summary = summary
+    shots = screenshot_paths or (result.data.get("screenshots") if isinstance(result.data, dict) else None)
+    if shots:
+        log.screenshot_paths = shots
+    if log.created_at:
+        log.duration_sec = max(0, int((_dt.datetime.utcnow() - log.created_at).total_seconds()))
+
+
+# ── 同步版（供 start_long_op / poll_long_op 等 sync 呼叫點）──
+
+def create_run_log_sync(task_type: str, fbid: str = "", account_id: int | None = None) -> int:
+    from .database import SyncSession, RunLog
+    with SyncSession() as session:
+        log = RunLog(task_type=task_type, fbid=fbid, account_id=account_id, status="running")
+        session.add(log)
+        session.commit()
+        return log.id
+
+
+def update_run_log_sync(log_id: int, result: BridgeResult, screenshot_paths: list[str] | None = None,
+                        context: dict | None = None):
+    from .database import SyncSession, RunLog
+    from sqlalchemy import select
+    with SyncSession() as session:
+        log = session.execute(select(RunLog).where(RunLog.id == log_id)).scalar_one_or_none()
+        if log:
+            _apply_log_update(log, result, screenshot_paths, context)
+            session.commit()
+
+
+def finalize_run_log_sync(log_id: int, error: str) -> None:
+    """把一筆還停在 running 的 RunLog 收尾成 failed。
+
+    用在「拿不到 BridgeResult」的情境（使用者中止、重啟後的孤兒）。只動 running 的，
+    避免覆蓋掉已經正常收尾的結果。
+    """
+    import datetime as _dt
+    from .database import SyncSession, RunLog
+    from sqlalchemy import select
+    with SyncSession() as session:
+        log = session.execute(select(RunLog).where(RunLog.id == log_id)).scalar_one_or_none()
+        if log is not None and log.status == "running":
+            log.status = "failed"
+            log.error_message = error
+            if log.created_at:
+                log.duration_sec = max(0, int((_dt.datetime.utcnow() - log.created_at).total_seconds()))
+            session.commit()
+
+
+def shutdown_children(reason: str = "程式重新啟動（更新或關機）時這筆任務中途停止，沒有影響，下一場照常") -> int:
+    """後端關閉時：把還在跑的 CLI 子進程（含它開的 Chrome）整棵收掉，紀錄收尾成人話。回傳收掉幾個。
+
+    子進程是獨立 session（spawn_kwargs），後端被砍時不會跟著死——養號的 Chrome 會繼續跑到自己結束，
+    期間下一場發文全都「這個帳號的瀏覽器還開著」失敗；而且紀錄被開機收尾標成失敗、實際上可能還發出去了。
+    """
+    from .proc_utils import kill_tree
+    n = 0
+    for job_id, job in list(_BRIDGE_JOBS.items()):
+        try:
+            if job.proc.poll() is None:
+                kill_tree(job.proc)
+                n += 1
+                if job.log_id:
+                    with contextlib.suppress(Exception):
+                        finalize_run_log_sync(job.log_id, reason)
+        except Exception:
+            pass
+        _BRIDGE_JOBS.pop(job_id, None)
+    for key, proc in list(_RUNNING.items()):
+        try:
+            if proc.poll() is None:
+                kill_tree(proc)
+                n += 1
+        except Exception:
+            pass
+        _RUNNING.pop(key, None)
+    _PROFILE_SHORT.clear()
+    return n
+
+
+def reconcile_orphan_run_logs_sync() -> int:
+    """開機時把上次沒收尾的 running 全部標成 failed，回傳筆數。
+
+    長時操作只記在記憶體（_BRIDGE_JOBS），不跨重啟；所以開機當下還是 running 的，
+    一定是上次沒收尾的孤兒——留著會在執行紀錄裡永遠轉圈。
+    """
+    from .database import SyncSession, RunLog
+    from sqlalchemy import select
+    with SyncSession() as session:
+        rows = session.execute(select(RunLog).where(RunLog.status == "running")).scalars().all()
+        for log in rows:
+            log.status = "failed"
+            log.error_message = "程式重新啟動（更新或關機）時這筆任務中途停止，沒有影響，下一場照常"
+        if rows:
+            session.commit()
+        return len(rows)
+
+
+def reap_finished_jobs(grace_sec: int = 180) -> int:
+    """把「子進程已結束但沒人再輪詢」的工作收尾，回傳收尾筆數。
+
+    RunLog 原本只在 poll_long_op() 裡收尾——前端關頁面或不再輪詢，這筆就永遠停在
+    running。這裡定期補收。留 grace_sec 給正常輪詢先取走結果，避免把還在等結果的
+    呼叫端變成 state=none。
+    """
+    reaped = 0
+    for job_id, job in list(_BRIDGE_JOBS.items()):
+        try:
+            if job.proc.poll() is None:
+                continue
+            now = time.time()
+            if job.exited_at is None:
+                job.exited_at = now      # 第一次發現結束：先記時間，下一輪才收
+                continue
+            if now - job.exited_at < grace_sec:
+                continue
+            poll_long_op(job_id)         # 走同一條收尾路徑（會落 RunLog 並清理登記）
+            reaped += 1
+        except Exception:
+            continue
+    return reaped
+
+
+def cancel_long_op(job_id: str) -> bool:
+    """中止長時操作，並把它的 RunLog 收尾成「使用者中止」。
+
+    只呼叫 kill_job() 的話，子進程死了但沒人會再輪詢，那筆 RunLog 會永遠卡在
+    running（2026-08-09 中止 mp_cleanup 後實際發生）。
+    """
+    killed = kill_job(job_id)
+    job = _BRIDGE_JOBS.pop(job_id, None)
+    if job is not None:
+        if job.log_id:
+            with contextlib.suppress(Exception):
+                finalize_run_log_sync(job.log_id, "使用者中止")
+        with contextlib.suppress(Exception):
+            os.unlink(job.result_path)
+    return killed
+
+
+# ── 非同步版（供 scheduler 等 async 呼叫點）──
+
+async def create_run_log(task_type: str, fbid: str = "", account_id: int | None = None) -> int:
+    from .database import async_session_factory, RunLog
+    async with async_session_factory() as session:
+        log = RunLog(task_type=task_type, fbid=fbid, account_id=account_id, status="running")
+        session.add(log)
+        await session.commit()
+        return log.id
+
+
+async def update_run_log(log_id: int, result: BridgeResult, screenshot_paths: list[str] | None = None,
+                         context: dict | None = None):
+    from .database import async_session_factory, RunLog
+    from sqlalchemy import select
+    async with async_session_factory() as session:
+        log = (await session.execute(select(RunLog).where(RunLog.id == log_id))).scalar_one_or_none()
+        if log:
+            _apply_log_update(log, result, screenshot_paths, context)
+            await session.commit()

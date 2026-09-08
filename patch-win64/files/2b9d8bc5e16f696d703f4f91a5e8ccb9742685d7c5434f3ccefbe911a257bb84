@@ -1,0 +1,251 @@
+"""自動養號的每日排程（老闆 2026-08-06：時長區間隨機、一日次數隨機、時間隨機）。
+
+沿用 marketplace_runner 的模式：
+- 啟動時與每日 00:15（台北）規劃當天——在 window 內隨機灑 N 個時間點
+  （N 在 daily_count_min/max 區間隨機），每點掛一個 DateTrigger。
+- 觸發時長在 duration_min/max 區間隨機取。三層隨機，行為才不像鬧鐘。
+- 尊重全域暫停；帳號忙（同 fbid 已有瀏覽器任務）就跳過這一點，
+  fbauto_bridge 的 busy-wait 已經處理排隊，不必自己搶。
+"""
+import datetime
+import random
+
+from sqlalchemy import select
+
+from ..database import async_session_factory, Account, NurtureConfig
+from .marketplace_planner import plan_daily_times
+from .task_runner import scheduler
+
+try:
+    from zoneinfo import ZoneInfo
+    TAIPEI = ZoneInfo("Asia/Taipei")
+except Exception:                                    # pragma: no cover
+    TAIPEI = datetime.timezone(datetime.timedelta(hours=8))
+
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+
+
+def _as_taipei(t: datetime.datetime) -> datetime.datetime:
+    return t.replace(tzinfo=TAIPEI) if t.tzinfo is None else t.astimezone(TAIPEI)
+
+
+PLATFORMS = ("fb", "threads", "ig")
+
+
+async def get_or_create_config(session, account_id: int, platform: str = "fb") -> NurtureConfig:
+    platform = platform if platform in PLATFORMS else "fb"
+    cfg = (await session.execute(
+        select(NurtureConfig).where(NurtureConfig.account_id == account_id,
+                                    NurtureConfig.platform == platform)
+    )).scalars().first()
+    if not cfg:
+        # 三個平台預設都開（老闆 2026-09-02：「每日自動養號，預設開」）。
+        # Threads/IG 的行為參數仍比 FB 保守（時長短、一日一次、按讚機率低），
+        # 且平台未連結時排程會自己略過，不會空跑。
+        # 對齊帳號設定「安全等級」的保守檔（老闆 2026-09-07：預設保守）
+        cfg = NurtureConfig(account_id=account_id, platform=platform,
+                            enabled=True,
+                            duration_min=3,
+                            duration_max=6 if platform != "fb" else 8,
+                            daily_count_min=1, daily_count_max=1 if platform != "fb" else 2)
+        session.add(cfg)
+        await session.flush()
+        cfg._just_created = True     # 供呼叫端判斷要不要立刻排今天的場次
+    return cfg
+
+
+def _remove_jobs():
+    for job in list(scheduler.get_jobs()):
+        if job.id.startswith("nurture_"):
+            job.remove()
+
+
+async def run_scheduled_nurture(account_id: int, platform: str = "fb"):
+    """單次自動養號：檢查暫停/綁定/cookie → spawn CLI（時長區間隨機）。
+    platform=threads/ig 走 run_meta_nurture（用 Threads/IG 的登入 profile，不吃 FB cookie）。"""
+    import asyncio
+
+    from ..fbauto_bridge import start_long_op, cookie_exists
+    from ..database import get_system_state_sync
+
+    if platform in ("threads", "ig"):
+        await _run_meta_nurture(account_id, platform)
+        return
+
+    try:
+        st = await asyncio.to_thread(get_system_state_sync)
+        if getattr(st, "paused", None) or (isinstance(st, dict) and st.get("paused")):
+            print("[nurture-sched] 系統已暫停，略過本次自動養號", flush=True)
+            return
+    except Exception:
+        pass
+
+    async with async_session_factory() as s:
+        acc = (await s.execute(select(Account).where(Account.id == account_id))).scalar_one_or_none()
+        if not acc or not acc.fb_user_id:
+            print("[nurture-sched] 帳號不存在或未綁定，略過", flush=True)
+            return
+        cfg = await get_or_create_config(s, account_id)
+        if not cfg.enabled:
+            return                                     # 期間被關掉了
+        duration = random.randint(min(cfg.duration_min or 3, cfg.duration_max or 8),
+                                  max(cfg.duration_min or 3, cfg.duration_max or 8))
+        fbid = acc.fb_user_id
+        headless = bool(cfg.headless)
+
+    if not cookie_exists(fbid):
+        print(f"[nurture-sched] cookie 不存在（{fbid}），略過本次自動養號", flush=True)
+        return
+
+    args = ["--fbid", fbid, "--duration", str(duration)]
+    if headless:
+        args.append("--headless")
+    from ..fbauto_bridge import wait_profile_free
+    if await wait_profile_free(f"fb:{fbid}", max_wait_sec=900, tag="[nurture-sched]") is not None:
+        print("[nurture-sched] 等了 15 分鐘瀏覽器還被占著，本次養號略過", flush=True)
+        return
+    try:
+        job_id = start_long_op("nurture", "src.run_nurture", args,
+                               account_id=account_id, fbid=fbid)
+        print(f"[nurture-sched] 自動養號啟動：{duration} 分鐘（job {job_id}）", flush=True)
+    except RuntimeError as e:
+        # 同 fbid 正忙（排程發文中等）——本次讓路，明天還有
+        print(f"[nurture-sched] 略過：{e}", flush=True)
+
+
+async def _run_meta_nurture(account_id: int, platform: str):
+    """Threads / IG 養號：用 Threads/IG 的登入 profile，受 P28 平台暫停約束。"""
+    from sqlalchemy import select as _sel
+    from .. import platform_block
+    from ..database import ThreadsAccount
+    from ..fbauto_bridge import start_long_op
+
+    async with async_session_factory() as s:
+        cfg = await get_or_create_config(s, account_id, platform)
+        if not cfg.enabled:
+            return
+        acc = (await s.execute(_sel(ThreadsAccount))).scalars().first()
+        if acc is None:
+            print(f"[nurture-sched] {platform} 尚未連結，略過養號", flush=True)
+            return
+        if platform_block.is_blocked(acc, platform):
+            print(f"[nurture-sched] {platform_block.block_note(acc, platform)}——略過養號", flush=True)
+            return
+        duration = random.randint(min(cfg.duration_min or 2, cfg.duration_max or 5),
+                                  max(cfg.duration_min or 2, cfg.duration_max or 5))
+    args = ["--platform", platform, "--duration", str(duration), "--headless"]
+    from ..fbauto_bridge import wait_profile_free
+    if await wait_profile_free("meta", max_wait_sec=900, tag="[nurture-sched]") is not None:
+        print(f"[nurture-sched] 等了 15 分鐘 Threads／IG 瀏覽器還被占著，本次 {platform} 養號略過", flush=True)
+        return
+    try:
+        job_id = start_long_op(f"nurture_{platform}", "src.run_meta_nurture", args,
+                               account_id=account_id)
+        print(f"[nurture-sched] {platform} 自動養號啟動：{duration} 分鐘（job {job_id}）", flush=True)
+    except RuntimeError as e:
+        print(f"[nurture-sched] {platform} 略過：{e}", flush=True)
+
+
+# 養號跟發文量連動（老闆 2026-09-07 防偵測第 6 項，確認過做法）：
+# 每天養號 1～2 次 3～8 分鐘，卻發 40 篇——比例不對。昨天發得多，今天養號就多幾次。
+# 只在「排今天的養號」時多加次數，**不改使用者的設定、不動開關**；上限守住平台硬上限
+# （FB 10 次、Threads／IG 3 次，跟 NurtureSettings 的 maxCount 一致）。
+NURTURE_BONUS_STEPS = ((20, 2), (10, 1))          # 昨天 > 20 篇 +2；> 10 篇 +1
+NURTURE_HARD_MAX = {"fb": 10, "threads": 3, "ig": 3}
+
+
+def nurture_bonus(yesterday_posts: int) -> int:
+    for threshold, bonus in NURTURE_BONUS_STEPS:
+        if yesterday_posts > threshold:
+            return bonus
+    return 0
+
+
+def effective_count(platform: str, lo: int, hi: int, yesterday_posts: int, rng=None) -> int:
+    """今天要養幾次：設定區間隨機 ＋ 昨天發文量的加成，不超過該平台硬上限。"""
+    rng = rng or random
+    base = rng.randint(lo, hi)
+    cap = NURTURE_HARD_MAX.get(platform, 3)
+    return min(cap, base + nurture_bonus(yesterday_posts))
+
+
+def _yesterday_posts() -> int:
+    """昨天（台北）FB 實際發文數（含轉發）。拿不到就當 0，不影響排程。"""
+    try:
+        from ..database import SyncSession, DailyBudget, TAIPEI as _TZ
+        from sqlalchemy import select as _sel
+        y = (datetime.datetime.now(_TZ).date() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        with SyncSession() as s:
+            row = s.execute(_sel(DailyBudget).where(DailyBudget.date == y)).scalars().first()
+            return int(row.posts_used or 0) if row else 0
+    except Exception:
+        return 0
+
+
+async def plan_and_schedule() -> list[str]:
+    """把「今天剩餘」的自動養號時間點排入 APScheduler（三個平台各自排）。
+    回傳排定時間（顯示用，含平台標記）。"""
+    _remove_jobs()
+    async with async_session_factory() as s:
+        rows = (await s.execute(
+            select(NurtureConfig).where(NurtureConfig.enabled == True)  # noqa: E712
+        )).scalars().all()
+        plans = []
+        yday = _yesterday_posts()
+        bonus = nurture_bonus(yday)
+        if bonus:
+            print(f"[nurture-sched] 昨天發了 {yday} 篇，今天各平台養號多 {bonus} 次（不超過硬上限）", flush=True)
+        for row in rows:
+            lo = max(1, min(row.daily_count_min or 1, row.daily_count_max or 1))
+            hi = max(lo, row.daily_count_max or 1)
+            plat = row.platform or "fb"
+            plans.append((row.account_id, plat, effective_count(plat, lo, hi, yday),
+                          (row.window_start or "09:00", row.window_end or "22:00")))
+    if not plans:
+        return []
+
+    base = datetime.datetime.now(TAIPEI).date()
+    now = datetime.datetime.now(TAIPEI)
+    planned = []
+    for account_id, platform, count, window in plans:
+        times = [_as_taipei(t) for t in plan_daily_times(
+            "window", [], window[0], window[1], count, False, base)]
+        for i, t in enumerate(times):
+            if t <= now:
+                continue
+            scheduler.add_job(func=run_scheduled_nurture, trigger=DateTrigger(run_date=t),
+                              args=[account_id, platform],
+                              id=f"nurture_{platform}_{i}", replace_existing=True)
+            planned.append((t, platform))
+    planned.sort()
+    out = [t.strftime("%H:%M") + ("" if p == "fb" else f"({ {'threads': 'Threads', 'ig': 'IG'}[p] })")
+           for t, p in planned]
+    if out:
+        print(f"[nurture-sched] 今日自動養號已排 {len(out)} 次：{'、'.join(out)}", flush=True)
+    return out
+
+
+def scheduled_times_today(platform: str | None = None) -> list[str]:
+    """目前已排定、還沒執行的時間點（前端顯示用）；platform 給了就只看那個平台。"""
+    out = []
+    for job in scheduler.get_jobs():
+        if not job.id.startswith("nurture_") or job.id == "nurture_daily_replan" or not job.next_run_time:
+            continue
+        if platform and not job.id.startswith(f"nurture_{platform}_"):
+            continue
+        if not platform and job.id.startswith(("nurture_threads_", "nurture_ig_")):
+            continue          # 沒指定＝FB（維持既有呼叫端的語意）
+        out.append(job.next_run_time.astimezone(TAIPEI).strftime("%H:%M"))
+    return sorted(out)
+
+
+async def restore_nurture_schedule():
+    """啟動時：規劃今天剩餘場次＋掛每日 00:15 重規劃。"""
+    try:
+        await plan_and_schedule()
+    except Exception as e:
+        print(f"[nurture-sched] 啟動規劃失敗（不影響其他功能）：{e}", flush=True)
+    scheduler.add_job(func=plan_and_schedule,
+                      trigger=CronTrigger(hour=0, minute=15, timezone=TAIPEI),
+                      id="nurture_daily_replan", replace_existing=True)
