@@ -1,0 +1,469 @@
+"""排程任務執行器 — 透過 fbauto_bridge 呼叫 FB_Auto CLI。
+
+設計要點（P12）：
+- 每社團短交易（不橫跨 sleep 佔住連線）。
+- cycle 用單一 IntervalTrigger，不再 Cron + 手動疊加。
+- group_cursor 續發輪替。
+- lifespan 呼叫 restore_jobs 重啟還原。
+- 真 stop：bridge kill_job 中止子進程。
+- 每社團寫 RunLog（P13）。
+"""
+import asyncio
+import datetime
+import re
+import threading
+import time
+from apscheduler.events import EVENT_JOB_MISSED
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy import select
+
+from ..database import async_session_factory, PostTask, PostHistory, Account, Article, LegalInfo
+from ..marketplace_content import compose_post_content, legal_footer
+from .. import post_dedup
+
+# misfire_grace_time：APScheduler 預設 1 秒——被節流「叫醒」後，遲到的工作會被
+# 當 misfire 無聲跳過。放寬到 1 小時＋coalesce（同一工作積了多次只補跑一次），
+# 節流解除後今天該發的還是會發。
+scheduler = AsyncIOScheduler(job_defaults={"misfire_grace_time": 3600, "coalesce": True})
+
+
+def compute_batch(groups: list, cursor: int, per_run: int) -> tuple[list, int]:
+    """從 cursor 取 per_run 個社團，回傳 (本輪社團, 新 cursor)。
+    per_run<=0 表示一次全發。繞回起點時新 cursor 為 0（視為一輪完成）。"""
+    n = len(groups)
+    if n == 0:
+        return [], 0
+    if per_run <= 0 or per_run >= n:
+        return list(groups), 0
+    start = cursor % n
+    batch = groups[start:start + per_run]
+    new_cursor = start + per_run
+    if new_cursor >= n:
+        new_cursor = 0
+    return batch, new_cursor
+
+
+def next_run_for(job_prefix: str, sched=None):
+    """某一條排程（mp_{id}_ / gp_{id}_）的下一次執行時間；沒有回 None。
+
+    與 next_planned_run 的差別：那個吃「平台前綴」看全局，這個吃
+    「排程專屬前綴」看單條——排程清單頁要逐列顯示「下一次幾點」用的。
+    """
+    pat = re.compile(re.escape(job_prefix) + r"\d+$")
+    jobs = (sched or scheduler).get_jobs()
+    times = [j.next_run_time for j in jobs
+             if j.id and pat.match(j.id) and j.next_run_time]
+    return min(times) if times else None
+
+
+def find_overdue_jobs(jobs, grace_sec: int = 120):
+    """有 next_run_time、且已過期超過寬限秒數的工作。
+
+    正常運作下不會有這種東西——排程器會在時間到的當下處理。
+    出現就代表排程器的計時器沒在走（實案：macOS App Nap 節流整夜）。
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    out = []
+    for j in jobs:
+        t = getattr(j, "next_run_time", None)
+        if t is None:
+            continue
+        if (now - t).total_seconds() > grace_sec:
+            out.append(j)
+    return out
+
+
+def start_scheduler_watchdog(sched=None, interval_sec: float = 60, grace_sec: int = 120):
+    """守著排程器：發現過期未執行的工作就大聲記錄並叫醒它。回傳停止函式。
+
+    用 daemon thread 而不是 asyncio task——會需要這隻看門狗的情境正是
+    「asyncio 計時器被 macOS 節流到不走」（2026-08 mini 連兩晚實案），
+    同一個事件迴圈裡的心跳會跟著一起睡。thread 的 time.sleep 在同一事件中
+    仍持續運作（同機的 update_downloader daemon thread 整夜正常）。
+    scheduler.wakeup() 內部走 call_soon_threadsafe，跨執行緒喚醒是安全的。
+    """
+    target = sched if sched is not None else scheduler
+    stop_flag = threading.Event()
+
+    def loop():
+        last_wall = time.time()
+        while not stop_flag.wait(interval_sec):
+            try:
+                # 電腦睡著時 wait() 不會計時，醒來後牆鐘一口氣跳過去——這就是「剛睡醒」的訊號。
+                # 睡著期間錯過的發文由 _on_job_missed 決定要不要補（還在時段內就補）。
+                gap = sleep_gap_minutes(last_wall, time.time(), interval_sec)
+                last_wall = time.time()
+                if gap:
+                    print(f"[sched-watchdog] 電腦睡了約 {gap} 分鐘剛醒來，檢查有沒有錯過的場次", flush=True)
+                    target.wakeup()
+                overdue = find_overdue_jobs(target.get_jobs(), grace_sec=grace_sec)
+                if overdue:
+                    ids = ", ".join(getattr(j, "id", "?") for j in overdue[:5])
+                    print(f"[sched-watchdog] 發現 {len(overdue)} 個過期未執行的工作（{ids}）"
+                          f"——排程器計時器疑似被系統節流，強制喚醒", flush=True)
+                    target.wakeup()
+            except Exception as e:          # 看門狗自己絕不能死
+                print(f"[sched-watchdog] 檢查失敗（下一輪再試）：{e}", flush=True)
+
+    t = threading.Thread(target=loop, name="sched-watchdog", daemon=True)
+    t.start()
+    return stop_flag.set
+
+
+def sleep_gap_minutes(last_wall: float, now_wall: float, interval_sec: float, slack_sec: int = 300) -> int:
+    """兩次心跳之間牆鐘多跳了多久（分鐘）；沒有明顯多跳回 0。多跳超過 slack 就當作睡過。"""
+    gap = now_wall - last_wall - interval_sec
+    return int(gap // 60) if gap > slack_sec else 0
+
+
+def late_run_delay_sec(job_id: str, now_local, window_end: str, day_of_scheduled, status: str,
+                       rng=None) -> int | None:
+    """錯過的發文要不要補、幾秒後補。回 None＝不補。
+
+    只補 mp_／gp_ 這種真正的發文場次（維運 cron 不補）；排程還在跑、還是同一天、
+    現在還沒過發文時段結尾才補——半夜補發一篇早上的文，客戶會覺得程式亂發。
+    """
+    import random as _r
+    # 只認「mp_<排程id>_<序號>」這種真正的發文場次；mp_daily_replan 之類的維運 cron 與 _late 補發本身都不補
+    if not re.fullmatch(r"(mp|gp)_\d+_\d+", job_id):
+        return None
+    if status != "running":
+        return None
+    if now_local.date() != day_of_scheduled:
+        return None
+    try:
+        h, m = (window_end or "21:00").split(":")
+        end = now_local.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+    except ValueError:
+        return None
+    if now_local >= end:
+        return None
+    rng = rng or _r
+    return rng.randint(120, 480)        # 醒來別立刻發，錯開 2～8 分鐘
+
+
+def _schedule_late_run(job_id: str, scheduled_run_time) -> None:
+    """錯過的發文場次：還在今天的時段內就幾分鐘後補發（電腦睡著／被節流超過一小時的情況）。"""
+    from ..database import SyncSession, MarketplaceSchedule, GpSchedule, now_taipei, as_taipei
+    from sqlalchemy import select as _sel
+    parts = job_id.split("_")
+    if len(parts) < 3 or not parts[1].isdigit():
+        return
+    kind, sid = parts[0], int(parts[1])
+    model = MarketplaceSchedule if kind == "mp" else GpSchedule
+    with SyncSession() as s:
+        sch = s.execute(_sel(model).where(model.id == sid)).scalar_one_or_none()
+        if sch is None:
+            return
+        window_end, status = sch.window_end, sch.status
+    now_local = now_taipei()
+    try:
+        day = as_taipei(scheduled_run_time).date()
+    except Exception:
+        day = now_local.date()
+    delay = late_run_delay_sec(job_id, now_local, window_end, day, status)
+    if delay is None:
+        return
+    if kind == "mp":
+        from .marketplace_runner import run_marketplace_job as _fn
+    else:
+        from .group_post_runner import _run_job_sync_entry as _fn
+    from apscheduler.triggers.date import DateTrigger
+    run_at = now_local + datetime.timedelta(seconds=delay)
+    scheduler.add_job(func=_fn, trigger=DateTrigger(run_date=run_at), args=[sid],
+                      id=f"{job_id}_late", replace_existing=True)
+    print(f"[sched-watchdog] 錯過的場次 {job_id} 還在今天時段內，{delay // 60} 分鐘後補發", flush=True)
+
+
+def _on_job_missed(event):
+    """工作被 misfire 跳過時大聲說——無聲跳過正是這次查了兩天的原因。"""
+    print(f"[sched-watchdog] 工作 {event.job_id} 錯過排定時間被跳過"
+          f"（超過 misfire 寬限）；排定時間：{event.scheduled_run_time}", flush=True)
+    try:
+        _schedule_late_run(event.job_id, event.scheduled_run_time)
+    except Exception as e:                  # 補發是加分項，失敗不能影響排程器
+        print(f"[sched-watchdog] 補發安排失敗：{e}", flush=True)
+
+
+scheduler.add_listener(_on_job_missed, EVENT_JOB_MISSED)
+
+
+def next_planned_run(prefix: str, sched=None):
+    """同前綴（mp_ / gp_）的 APScheduler 工作裡最早的下一次執行時間；沒有回 None。
+
+    排程的 next_run 欄位沒人維護，真正的「下一篇幾點」只存在 APScheduler 的
+    工作佇列裡——跟 nurture_runner 讀自己工作的做法同一套。
+    """
+    # 只認「前綴+排程id+序號」（mp_3_1）這種真正的發文工作。
+    # mp_daily_replan / mp_daily_cleanup 也是 mp_ 開頭，但那是維運 cron，
+    # 被當成「下一篇」會顯示成每天 00:05 發文（實測踩到）。
+    pat = re.compile(re.escape(prefix) + r"\d+_\d+$")
+    jobs = (sched or scheduler).get_jobs()
+    times = [j.next_run_time for j in jobs
+             if j.id and pat.match(j.id) and j.next_run_time]
+    return min(times) if times else None
+
+
+class TaskScheduler:
+    """任務排程管理"""
+
+    def __init__(self):
+        self._scheduler = scheduler
+
+    def start(self):
+        if not self._scheduler.running:
+            self._scheduler.start()
+
+    def stop(self):
+        if self._scheduler.running:
+            self._scheduler.shutdown(wait=False)
+
+    def add_task(self, task: PostTask):
+        """將任務加入排程。cycle 用單一 IntervalTrigger，once 用 DateTrigger。"""
+        if task.schedule_type == "immediate":
+            trigger = DateTrigger(run_date=datetime.datetime.now())
+        elif task.schedule_type == "once":
+            trigger = DateTrigger(run_date=task.next_run)
+        elif task.schedule_type == "cycle":
+            trigger = IntervalTrigger(
+                hours=task.cycle_hours,
+                start_date=task.next_run or datetime.datetime.now(),
+            )
+        else:  # weekly
+            hh, mm = task.time_of_day.split(":")
+            trigger = CronTrigger(
+                hour=hh, minute=mm,
+                day_of_week=",".join(map(str, task.week_days)) if task.week_days else "*",
+            )
+
+        self._scheduler.add_job(
+            func=run_post_task,
+            trigger=trigger,
+            args=[task.id],
+            id=f"task_{task.id}",
+            replace_existing=True,
+        )
+
+    def remove_task(self, task_id: int):
+        try:
+            self._scheduler.remove_job(f"task_{task_id}")
+        except Exception:
+            pass
+
+
+task_scheduler = TaskScheduler()
+
+
+async def _load_task_snapshot(task_id: int):
+    """短交易讀出執行所需的任務快照與帳號/文案，隨即關閉 session。"""
+    async with async_session_factory() as session:
+        task = (await session.execute(select(PostTask).where(PostTask.id == task_id))).scalar_one_or_none()
+        if not task:
+            return None
+        account = (await session.execute(select(Account).where(Account.id == task.account_id))).scalar_one_or_none()
+        article_title = article_content = ""
+        if task.article_id:
+            art = (await session.execute(select(Article).where(Article.id == task.article_id))).scalar_one_or_none()
+            if art:
+                article_title = art.title or ""
+                article_content = art.content
+        # 法定區塊（房仲法規強制）：社團發文與 Marketplace 都會附，這條路徑先前漏了
+        legal_row = (await session.execute(select(LegalInfo))).scalars().first()
+        legal = {
+            "footer_text": legal_row.footer_text, "agent_name": legal_row.agent_name,
+            "company": legal_row.company, "license_no": legal_row.license_no, "agent_cert_no": getattr(legal_row, "agent_cert_no", "") or "", "store_name": getattr(legal_row, "store_name", "") or "", "is_franchise": bool(getattr(legal_row, "is_franchise", False)),
+            "agent_phone": legal_row.agent_phone, "extra": legal_row.extra,
+        } if legal_row else {}
+        # 攤平成純資料，避免跨 session 用 ORM 物件
+        return {
+            "id": task.id,
+            "account_id": task.account_id,
+            "status": task.status,
+            "schedule_type": task.schedule_type,
+            "target_groups": list(task.target_groups or []),
+            "groups_per_run": task.groups_per_run,
+            "group_cursor": task.group_cursor or 0,
+            "shuffle_groups": task.shuffle_groups,
+            "sleep_seconds": task.sleep_seconds,
+            "add_timestamp": task.add_timestamp,
+            "add_sequence": task.add_sequence,
+            "sequence_start": task.sequence_start,
+            "cycle_hours": task.cycle_hours,
+            "headless": task.headless,
+            "fbid": (account.fb_user_id or "").strip() if account else "",
+            "account_exists": account is not None,
+            "article_title": article_title,
+            "article_content": article_content,
+            "legal_footer": legal_footer(legal),
+        }
+
+
+async def _current_status(task_id: int) -> str | None:
+    """短交易讀最新任務狀態（停止偵測用）。"""
+    async with async_session_factory() as session:
+        row = await session.execute(select(PostTask.status).where(PostTask.id == task_id))
+        return row.scalar_one_or_none()
+
+
+async def _set_task_fields(task_id: int, **fields):
+    async with async_session_factory() as session:
+        task = (await session.execute(select(PostTask).where(PostTask.id == task_id))).scalar_one_or_none()
+        if not task:
+            return
+        for k, v in fields.items():
+            setattr(task, k, v)
+        await session.commit()
+
+
+async def _record_history(task_id: int, account_id: int, group: dict, bridge):
+    async with async_session_factory() as session:
+        permalink = ""
+        if bridge.results and isinstance(bridge.results, list):
+            permalink = bridge.results[0].get("permalink", "")
+        session.add(PostHistory(
+            account_id=account_id,
+            task_id=task_id,
+            group_name=group.get("name", ""),
+            group_url=group.get("url", ""),
+            post_url=permalink or "",
+            status="success" if bridge.success else "failed",
+            error_message=bridge.error,
+        ))
+        await session.commit()
+
+
+async def run_post_task(task_id: int):
+    """執行發文任務（每社團短交易，不橫跨 sleep 佔住 DB 連線）。"""
+    from ..fbauto_bridge import run_group_post, create_run_log, update_run_log
+
+    snap = await _load_task_snapshot(task_id)
+    if not snap or snap["status"] in ("stopped", "completed"):
+        return
+
+    if not snap["account_exists"]:
+        await _set_task_fields(task_id, status="error")
+        return
+
+    fbid = snap["fbid"]
+    if not fbid:
+        await _record_history(task_id, snap["account_id"], {}, _FailStub("帳號未綁定 fbid，請先完成 FB_Auto 登入"))
+        await _set_task_fields(task_id, status="error")
+        return
+
+    await _set_task_fields(task_id, status="running", progress=0)
+
+    # 本輪社團（游標輪替 + 可選洗牌）
+    groups = snap["target_groups"]
+    if snap["shuffle_groups"]:
+        import random
+        groups = list(groups)
+        random.shuffle(groups)
+    batch, new_cursor = compute_batch(groups, snap["group_cursor"], snap["groups_per_run"])
+
+    seq = snap["sequence_start"] if snap["add_sequence"] else 0
+    try:
+        for i, group in enumerate(batch):
+            # 每輪開頭讀最新狀態偵測停止
+            if (await _current_status(task_id)) in ("stopped", "error"):
+                break
+
+            # 標題要跟內文一起發出去：文案的標題是客戶花錢請 AI 生的賣點，
+            # 之前這裡只取 content，等於每篇貼文都少了第一行（社團發文那條有帶，
+            # 只有這條漏掉，所以症狀是「有些發文沒標題」）。
+            content = compose_post_content(snap["article_title"], snap["article_content"])
+            if snap["legal_footer"]:
+                content = (content + "\n\n" + snap["legal_footer"]).strip()
+            if snap["add_timestamp"]:
+                ts = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+                content += f"\n\n--- 發文時間: {ts} ---"
+            if snap["add_sequence"]:
+                content += f"\n(#{seq})"
+                seq += 1
+
+            # 同文案同社團 7 日內不重發：重複灌同一篇是 FB 判垃圾訊息最直接的
+            # 特徵，也會被社團管理員踢。排程重疊或客戶手動再按一次都會踩到。
+            skip, why, gkey, chash = post_dedup.should_skip(
+                group.get("url", ""), content, group.get("group_id", ""))
+            if skip:
+                print(f"[post] 跳過 {group.get('name', '')}：{why}", flush=True)
+                await _set_task_fields(task_id, progress=i + 1)
+                continue
+
+            log_id = await create_run_log("post", fbid=fbid, account_id=snap["account_id"])
+            bridge = await run_group_post(
+                fbid=fbid,
+                group_url=group.get("url", ""),
+                content=content,
+                headless=snap["headless"],
+                job_key=f"post_{task_id}",
+            )
+            await update_run_log(
+                log_id, bridge,
+                context={"title": snap.get("article_title", ""),
+                         "group_name": group.get("name", "")})
+            if bridge.success:
+                post_dedup.record_post(gkey, chash, snap["account_id"], group.get("name", ""))
+            await _record_history(task_id, snap["account_id"], group, bridge)
+            await _set_task_fields(task_id, progress=i + 1)
+
+            if i < len(batch) - 1:
+                await asyncio.sleep(snap["sleep_seconds"])
+
+        # 收尾：更新游標與狀態
+        now = datetime.datetime.utcnow()
+        if snap["schedule_type"] == "cycle":
+            # cycle 不自行 re-add（IntervalTrigger 會自動再觸發）；只更新游標與顯示時間
+            await _set_task_fields(
+                task_id,
+                status="pending",
+                group_cursor=new_cursor,
+                last_run=now,
+                next_run=now + datetime.timedelta(hours=snap["cycle_hours"]),
+            )
+        else:
+            await _set_task_fields(task_id, status="completed", group_cursor=new_cursor, last_run=now)
+            if snap["schedule_type"] == "once":
+                task_scheduler.remove_task(task_id)
+
+    except Exception:
+        await _set_task_fields(task_id, status="error")
+        raise
+
+
+class _FailStub:
+    """給未綁定 fbid 情況造一筆 failed history 用的最小替身。"""
+    def __init__(self, error: str):
+        self.success = False
+        self.error = error
+        self.results = []
+
+
+async def restore_jobs():
+    """重啟後從 DB 還原排程：cycle 重排、未過期 once 重排、running 中斷者重排。"""
+    async with async_session_factory() as session:
+        rows = await session.execute(
+            select(PostTask).where(
+                PostTask.schedule_type.in_(("once", "cycle")),
+                PostTask.status.in_(("pending", "running")),
+            )
+        )
+        tasks = rows.scalars().all()
+        now = datetime.datetime.utcnow()
+        restored = 0
+        for task in tasks:
+            if task.schedule_type == "once":
+                if task.next_run and task.next_run <= now:
+                    task.status = "missed"
+                    continue
+            else:  # cycle
+                if not task.next_run or task.next_run <= now:
+                    task.next_run = now + datetime.timedelta(seconds=30)
+            if task.status == "running":
+                task.status = "pending"
+            task_scheduler.add_task(task)
+            restored += 1
+        await session.commit()
+        return restored

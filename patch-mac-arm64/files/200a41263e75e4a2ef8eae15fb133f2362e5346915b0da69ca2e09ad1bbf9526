@@ -1,0 +1,36 @@
+"""匯入的特色描述要濾掉原刊登者的聯絡方式（2026-09-08 租件實測）。執行：cd FB_Auto && python3 -m pytest tests/test_import_clean.py -v"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.run_import_url import _clean_feature, _feature_text, _is_contact_line  # noqa: E402
+
+RAW = """特色描述
+皆為實屋拍攝照，可預約看屋
+已出租當天會下架，提前告知不浪費你我時間
+IG精選搶先看 日日更新 搜尋:3a_housetaichung
+TEL:0983757388
+Line:@321mddpe(官方Line記得+@)
+台中全區租賃一條龍服務
+*成交酌收半個月服務費
+查看全部"""
+
+
+def test_聯絡方式行判定():
+    assert _is_contact_line("TEL:0983757388")
+    assert _is_contact_line("Line:@321mddpe(官方Line記得+@)")
+    assert _is_contact_line("歡迎來電 0912-345-678")
+    assert _is_contact_line("*成交酌收半個月服務費")
+    assert _is_contact_line("IG精選搶先看 日日更新 搜尋:3a_housetaichung")
+    assert not _is_contact_line("皆為實屋拍攝照，可預約看屋")
+    assert not _is_contact_line("屋齡 20 年，2024 整理過")            # 年份不是電話
+
+
+def test_特色描述與行清單都濾掉():
+    body = _clean_feature(RAW)
+    assert "皆為實屋拍攝照" in body and "一條龍" in body
+    for bad in ("0983757388", "@321mddpe", "服務費", "3a_housetaichung", "查看全部"):
+        assert bad not in body, bad
+    lines = _feature_text(RAW.splitlines())
+    assert "TEL:0983757388" not in lines and "皆為實屋拍攝照，可預約看屋" in lines
