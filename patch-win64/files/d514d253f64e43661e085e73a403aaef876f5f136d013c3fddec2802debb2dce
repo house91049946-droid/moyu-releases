@@ -1,0 +1,224 @@
+"""DeepSeek 文案生成（建立物件時呼叫；發送時不用）。
+
+金鑰來源：env FB_DEEPSEEK_API_KEY 優先，否則讀 backend/data/.deepseek_key（gitignore）。
+"""
+import json
+import os
+import re
+from pathlib import Path
+
+import httpx
+
+from . import http_client
+from .config import DATA_DIR
+
+_KEY_FILE = DATA_DIR / ".deepseek_key"
+_API_URL = "https://api.deepseek.com/chat/completions"
+_MODEL = "deepseek-chat"
+
+
+class DeepSeekError(Exception):
+    pass
+
+
+def _load_key() -> str:
+    key = os.environ.get("FB_DEEPSEEK_API_KEY", "").strip()
+    if key:
+        return key
+    if _KEY_FILE.exists():
+        return _KEY_FILE.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def has_key() -> bool:
+    return bool(_load_key())
+
+
+_SYSTEM_PROMPT = (
+    "你是台灣房地產 Facebook 社團／Marketplace 文案助手。使用者會提供一段『基底文案』"
+    "（含事實資訊與賣點）。請據此生成多個差異明顯的『變體版本』，每版含標題與完整內文，"
+    "用來輪流發文。\n"
+    "\n"
+    "【鐵律一：數字與事實原封不動】坪數、室內坪、地坪、格局、車位、屋齡、樓層、管理費、"
+    "價格、社區名、地址、電話，一律照抄，不可增刪竄改。\n"
+    "【鐵律二：保留使用者原文的聯絡與法定資訊】基底文案若已寫電話、姓名、LINE、法定文案，"
+    "完整保留；不要自行新增經紀人／公司／字號（系統另外附加）。\n"
+    "【鐵律三：不可寫「自售」「非仲介」「免仲介費」「省服務費」】系統每篇結尾會自動附經紀人"
+    "姓名、公司與經紀業字號，宣稱非仲介會自相矛盾，也可能構成不實廣告。\n"
+    "\n"
+    "【風格：照台灣房仲社團實際在用的寫法】（2026-09-07 老闆給的樣板）\n"
+    "  ・標題：區域＋社區名或核心賣點，可用【】或｜分隔，可加 1～2 個表情符號框住，例如"
+    "「🏡【大里邊間平房｜52坪大地坪｜9.8米大面寬】」「🔥 北屯昌平商圈｜前後臨路透天」"
+    "「‼️行情價‼️屋主誠心出售～」。\n"
+    "  ・價格放前面：💰 開價｜1680萬、或「免千萬」「大降400萬」這種一句話鉤子。\n"
+    "  ・規格用表情符號當項目符號、一項一行：🏠 建坪｜37.33坪　📐 地坪　🛏 格局｜2房2廳1衛"
+    "　🏢 樓層｜4樓／共19樓　🚗 車位｜坡道平面車位　屋齡。\n"
+    "  ・賣點分區塊，每區一個小標＋表情符號條列：✨ 物件特色／🌟 本戶特色、🚇 交通、"
+    "🛍 生活圈、🎓 學區、🏢 社區公設；條列符號可用 ✅ ✔️ ▪️ 🔸 💎 👑 🔴🟠🟡。\n"
+    "  ・區塊之間可用分隔線：━━━━━━━━、⸻、- - - - -。\n"
+    "  ・結尾一句鉤子：稀有釋出、把握當下、歡迎預約賞屋、臉書容易漏訊息建議加 LINE。\n"
+    "  ・可以直白講缺點再翻轉：「46年屋齡，介意的先跳過！但如果你重視的是地段…」。\n"
+    "  ・整篇 10～30 行，手機上一眼掃得完。\n"
+    "\n"
+    "【每版都要真的不一樣】這是為了輪流發文不被判重複：\n"
+    "  ・表情符號家族換著用：一版 ✅✨、一版 👑💎、一版 🔴🟠🟡🟢、一版 🍎🔥、一版 ▪️✔。\n"
+    "  ・區塊順序洗牌：有的價格開頭、有的交通開頭、有的先講缺點再翻轉、有的先講學區。\n"
+    "  ・句子與詞彙重新寫，不是換符號、調順序而已；標題每版切入角度不同。\n"
+    "  ・只要版本數 >= 3，其中『一定』要有：\n"
+    "    (a) 一版條列式基本資訊：幾乎不寫感受，開頭一句，規格一項一行，結尾一句。\n"
+    "    (b) 一版屋主口氣：第一人稱、屋主自己在講，例如「我想把住了六年的這間賣掉，因為工作"
+    "要調去北部…」，講買它的原因、住起來的感受、為什麼要賣；表情符號少一點、像真人打的；"
+    "數字照抄。但不可出現「自售」「非仲介」「免仲介費」（鐵律三）。\n"
+    "\n"
+    "只回傳 JSON，格式：{\"versions\": [{\"title\": \"..\", \"body\": \"..\"}, ...]}，"
+    "body 內用真正的換行符號分行，不要多餘文字。"
+)
+
+
+# 客戶把電話／法定文案寫進基底文案，AI 卻把它吃掉——提示詞已經三令五申
+# （雲端與本地兩份都寫了「原封保留、不可刪除」），但模型不是每次都聽話。
+# 房仲的聯絡方式與經紀資訊漏掉是會出事的，所以不能只靠提示詞，這裡再補一道
+# 確定性的檢查：基底有、生成版本沒有的，直接補回去。
+_PHONE_RE = re.compile(r"(?:\+?886[\s\-]?)?0?9\d{2}[\s\-]?\d{3}[\s\-]?\d{3}"
+                       r"|\(?0\d\)?[\s\-]?\d{3,4}[\s\-]?\d{4}")
+_LEGAL_HINTS = ("經紀人", "經紀業", "字號", "證號", "不動產", "仲介", "公司名稱")
+
+
+def _digits(s: str) -> str:
+    return re.sub(r"\D", "", s)
+
+
+def must_keep_lines(base_content: str) -> list[str]:
+    """從基底文案裡挑出「絕對不能被改寫掉」的行：含電話或法定關鍵字的整行。"""
+    keep = []
+    for line in (base_content or "").splitlines():
+        t = line.strip()
+        if not t:
+            continue
+        if _PHONE_RE.search(t) or any(h in t for h in _LEGAL_HINTS):
+            keep.append(t)
+    return keep
+
+
+def restore_dropped_lines(base_content: str, versions: list[dict]) -> list[dict]:
+    """生成版本若把 must-keep 的內容弄丟了，補回到內文結尾。
+
+    電話比對只看數字：AI 常把 0912-345-678 改寫成 0912345678 或加空格，
+    那種情況不算弄丟，硬補反而會重複。
+    """
+    keep = must_keep_lines(base_content)
+    if not keep:
+        return versions
+    for v in versions:
+        body = v.get("body") or ""
+        body_digits = _digits(body)
+        missing = []
+        for line in keep:
+            phones = _PHONE_RE.findall(line)
+            if phones:
+                if all(_digits(p) in body_digits for p in phones):
+                    continue      # 電話還在（可能換了寫法），不必補
+            elif line in body:
+                continue
+            missing.append(line)
+        if missing:
+            v["body"] = (body.rstrip() + "\n\n" + "\n".join(missing)).strip()
+    return versions
+
+
+
+_RENT_STYLE = (
+    "\n【這是「租件」文案，寫法跟買賣不同】（SPEC-P34，2026-09-08）\n"
+    "  ・價格是月租：💰 月租｜8,499元／月，放最前面；押金（例：押金｜兩個月）、租金內含（水費／第四台／網路）"
+    "緊接著寫。\n"
+    "  ・規格一項一行：🏠 類型｜獨立套房（透天厝）　🛏 格局｜1房1衛　📐 坪數｜10坪　🏢 樓層｜3/4樓　🚗 車位。\n"
+    "  ・租客最在意的條件要明講：可養寵物／可開伙／短期租賃／可遷入日／附傢俱設備／管理費／性別或身分要求；"
+    "頁面沒寫的不要編。\n"
+    "  ・賣點區塊改成租客角度：🚇 通勤（近學校、醫院、捷運、公車站）、🛒 生活機能、🏠 屋內設備、📋 租屋規定。\n"
+    "  ・結尾鉤子：歡迎預約看屋、好房不等人、已出租當天下架。\n"
+    "  ・「屋主口氣」那一版改成房東口氣：「我這間房子……整理好了，希望租給愛惜房子的人」；"
+    "不可出現「自租」「非仲介」「免服務費」。\n"
+    "  ・標題要讓人一眼看出是出租：帶「出租」「月租」「租屋」其中之一。\n"
+    "  ・基底沒寫的設備、家具、樓層、屋齡、可否養寵開伙，一律不可以寫（不確定就不提）——"
+    "租客會照文案要求，寫了沒有的東西等於糾紛。\n"
+)
+
+
+def owner_voice_hint(deal_type: str, n: int) -> str:
+    """版本數 >= 3 時要求的兩個固定版本（條列版＋口氣版）；租件換成房東口氣與租件禁語。"""
+    if n < 3:
+        return ""
+    if deal_type == "rent":
+        return ("其中『一定』要有一版是條列式基本資訊（規格一項一行、幾乎不寫感受），"
+                "另外『一定』要有一版用第一人稱房東口氣寫（「我這間房子整理好了…」，"
+                "講房子的狀況、希望租給什麼樣的人），但不可出現「自租」「非仲介」「免服務費」這類字眼。")
+    return ("其中『一定』要有一版是條列式基本資訊（規格一項一行、幾乎不寫感受），"
+            "另外『一定』要有一版用第一人稱屋主口氣寫（「我想把這間賣掉…」，"
+            "講買它的原因、住起來的感受、為什麼要賣），但不可出現"
+            "「自售」「非仲介」「免仲介費」這類字眼。")
+
+
+def generate_from_base(base_content: str, n_versions: int = 7, timeout: float = 90,
+                       deal_type: str = "sale") -> list[dict]:
+    """依使用者貼的基底文案生成 N 個變體。回傳 [{title, body}, ...]（數字/事實鎖定）。
+
+    SaaS 模式（設了 MOYU_CLOUD_URL + 授權金鑰）→ 走雲端 /ai/generate（金鑰在伺服器）。
+    否則走本地 DeepSeek（開發後備；SaaS 上線後移除）。
+    """
+    if not (base_content or "").strip():
+        raise DeepSeekError("基底文案是空的")
+
+    # 優先走雲端代理（授權 + 金鑰在伺服器端）
+    from .cloud_client import cloud_enabled, ai_generate, CloudError
+    if cloud_enabled():
+        try:
+            return restore_dropped_lines(base_content, ai_generate(base_content, n_versions, deal_type=deal_type))
+        except CloudError as e:
+            raise DeepSeekError(str(e)) from e
+
+    # 後備：本地直呼 DeepSeek（開發用）
+    key = _load_key()
+    if not key:
+        raise DeepSeekError("尚未設定雲端授權，也沒有本地 DeepSeek 金鑰")
+
+    deal_type = "rent" if (deal_type or "").lower() == "rent" else "sale"
+    user_prompt = (
+        f"基底文案如下（數字/事實必須完全照抄）：\n\n{base_content}\n\n"
+        f"請生成 {n_versions} 個不同的變體版本（各含 title 與 body）。"
+        + owner_voice_hint(deal_type, n_versions) +
+        "再次提醒：照台灣房仲社團實際的寫法——表情符號當項目符號、價格放前面、賣點分區塊、"
+        "結尾一句鉤子；每版換一組表情符號、換區塊順序、句子重寫，數字一個都不能動。"
+        + ("這是租件：月租放最前面、押金與內含費用要寫、標題帶「出租」或「月租」。" if deal_type == "rent" else "")
+    )
+    payload = {
+        "model": _MODEL,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT + (_RENT_STYLE if deal_type == "rent" else "")},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 1.1,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+    try:
+        with http_client.client(timeout) as client:
+            resp = client.post(_API_URL, json=payload, headers=headers)
+    except httpx.HTTPError as e:
+        raise DeepSeekError(f"DeepSeek 連線失敗: {e}") from e
+    if resp.status_code != 200:
+        raise DeepSeekError(f"DeepSeek 回應 {resp.status_code}: {resp.text[:200]}")
+
+    try:
+        content = resp.json()["choices"][0]["message"]["content"]
+        data = json.loads(content)
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        raise DeepSeekError(f"DeepSeek 回應解析失敗: {e}") from e
+
+    versions = []
+    for v in data.get("versions", []):
+        if isinstance(v, dict) and v.get("title") and v.get("body"):
+            versions.append({"title": str(v["title"]).strip(), "body": str(v["body"]).strip()})
+    if not versions:
+        raise DeepSeekError("DeepSeek 未生成有效的版本")
+    return restore_dropped_lines(base_content, versions)

@@ -1,0 +1,297 @@
+"""清單匯入的解析規則——刻意全部是純函式：不碰瀏覽器、不碰網路。
+
+為什麼把 DOM 抽取切成兩段：瀏覽器端的 JS 只負責把「物件連結 + 卡片的文字行」
+撈出來（LIST_EXTRACT_JS），欄位怎麼分類完全在 Python 這邊做。這樣最容易出錯的
+那一段（哪一行是價格、哪一行是地址）可以直接餵文字行測，不需要瀏覽器、不需要
+網路、也不需要維護一份會過期的 HTML fixture。
+"""
+import contextlib
+import re
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+# ─── 價格 ─────────────────────────────────────────────
+
+
+def parse_price(text: str) -> int:
+    """「1,288 萬」→ 12880000；「1288萬」「總價 1,288 萬」皆可。抓不到回 0。"""
+    if not text:
+        return 0
+    m = re.search(r"([\d,]+(?:\.\d+)?)\s*萬", text)
+    if m:
+        with contextlib.suppress(ValueError):
+            return int(float(m.group(1).replace(",", "")) * 10000)
+    m = re.search(r"([\d,]{4,})\s*元", text)
+    if m:
+        with contextlib.suppress(ValueError):
+            return int(m.group(1).replace(",", ""))
+    return 0
+
+
+# ─── 網址 ─────────────────────────────────────────────
+
+
+def is_rent_url(url: str) -> bool:
+    """租件網址：rent.rakuya.com.tw/item/<id>（新）或路徑含 rent_item（舊）。（SPEC-P34）"""
+    if not url:
+        return False
+    p = urlsplit(url)
+    return p.netloc.lower().startswith("rent.") or "rent_item" in p.path
+
+
+def normalize_item_url(url: str) -> str:
+    """物件網址正規化：只留 ehid，砍掉 &from= 這類追蹤參數。非物件頁回 ""。
+
+    同一個物件從不同入口進來會帶不同的 from，不砍掉就會被當成不同物件——
+    「已匯入」的比對與去重全靠這個。
+    租屋站的新式網址是 rent.rakuya.com.tw/item/<id>?from=…：路徑就是識別，砍掉整個 query。
+    """
+    if not url:
+        return ""
+    p = urlsplit(url)
+    if p.netloc.lower().startswith("rent.") and re.match(r"^/item/[0-9a-z]+/?$", p.path):
+        return urlunsplit((p.scheme, p.netloc, p.path.rstrip("/"), "", ""))
+    if "sell_item" not in p.path and "rent_item" not in p.path:
+        return ""
+    ehid = dict(parse_qsl(p.query)).get("ehid", "")
+    return urlunsplit((p.scheme, p.netloc, p.path, f"ehid={ehid}" if ehid else "", ""))
+
+
+def is_listing_page(urls: list[str]) -> bool:
+    """這一頁本身就是清單頁嗎（使用者直接貼店鋪頁時要吃得下）。
+
+    門檻 5 筆：物件詳情頁通常只帶一兩個推薦物件連結，清單頁動輒二十幾筆。
+    """
+    return len({u for u in (normalize_item_url(x) for x in urls) if u}) >= 5
+
+
+_STORE_TEXT_RE = re.compile(r"進入店鋪|店鋪|其他物件|所有物件|全部物件|經紀人")
+
+
+def find_store_url(links: list[dict], page_url: str = "") -> str:
+    """從詳情頁的連結裡找出「這個經紀人／店家」的頁面。找不到回 ""。
+
+    links 每項為 {"href": ..., "text": ...}。先認樂屋網的 vip 網域（最可靠），
+    再退回文字比對。物件頁本身一定要排除——跟進去只會抓到另一個單一物件。
+    """
+    for l in links:
+        if "vip.rakuya.com.tw" in (l.get("href") or ""):
+            return (l.get("href") or "").strip()
+    for l in links:
+        h = (l.get("href") or "").strip()
+        t = (l.get("text") or "").strip()
+        if not h.startswith(("http://", "https://")):
+            continue
+        if normalize_item_url(h):        # 這是物件頁，不是店家頁
+            continue
+        if _STORE_TEXT_RE.search(t):
+            return h
+    return ""
+
+
+def next_page_url(store_url: str, n: int) -> str:
+    """店鋪頁的第 n 頁：覆蓋 page 參數，其餘參數（排序等）原樣保留。"""
+    p = urlsplit(store_url)
+    q = dict(parse_qsl(p.query))
+    q["page"] = str(n)
+    return urlunsplit((p.scheme, p.netloc, p.path, urlencode(q), ""))
+
+
+def pick_list_page(url: str, links: list[dict]) -> str:
+    """決定要去哪一頁抓清單。回傳要開的網址，判斷不出來回 ""。
+
+    順序不能反過來——先跟店家連結，最後才看「這頁本身是不是清單頁」：
+    物件詳情頁上的「推薦物件／周邊物件」動輒十幾個連結，先用數量判斷會把
+    詳情頁當成清單頁，抓回一堆**別人的**物件（實測踩到的）。
+    而且貼進來的網址本身若是物件頁，它就一定不是清單頁，不必再猜。
+    """
+    store = find_store_url(links, url)
+    if store:
+        return store
+    if normalize_item_url(url):
+        return ""                       # 詳情頁又找不到店家連結 → 沒得抓
+    hrefs = [l.get("href") or "" for l in links]
+    return url if is_listing_page(hrefs) else ""
+
+
+def http_error_message(status) -> str:
+    """清單頁回了非 200 時，要跟使用者說的話。正常回 ""。
+
+    403／429 一定要單獨講：被暫時擋住跟「這家店沒有出售物件」是完全不同的兩件事，
+    講錯會讓人跑去查根本沒問題的地方（實測就是把 403 吞掉，顯示成「沒抓到物件」）。
+    """
+    if not status or status < 400:
+        return ""
+    if status in (403, 429):
+        return (f"這個網站暫時擋住了自動擷取（HTTP {status}）。"
+                f"通常是短時間內抓太多次，等幾分鐘再試一次就會好。")
+    return f"店家頁回應 HTTP {status}，可能需要登入，或該站擋自動擷取。"
+
+
+# ─── 卡片欄位分類 ──────────────────────────────────────
+
+_PRICE_RE = re.compile(r"[\d,.]+\s*(萬|元)")
+# 地址行：有縣市又有區鄉鎮。加長度上限，免得把含地名的標題誤判成地址
+_ADDR_RE = re.compile(r"[縣市].*[區鄉鎮市]")
+_ADDR_MAX = 24
+_LAYOUT_RE = re.compile(r"\d\s*房")
+_AREA_RE = re.compile(r"^[\d.]+\s*坪$")
+_TYPE_RE = re.compile(
+    r"^(電梯大廈|大樓|華廈|公寓|透天厝|透天|別墅|農舍|套房|店面|辦公室|廠辦|廠房|土地|農地|車位)$")
+
+
+# 卡片上的狀態字：不是物件資料，卻常常是「剩下最長的一行」而被誤當標題。
+# 2026-09-02 實測：某些店鋪頁的卡片只有 價格／縣市／瀏覽數 三行，
+# 沒濾掉的話每一筆標題都變成「瀏覽：0人」。
+_NOISE_RE = re.compile(r"^(瀏覽|點閱|人氣)[:：]|^已(售出|成交|下架)|^\d+\s*人$")
+
+
+def _classify(lines: list[str], url: str) -> dict:
+    """把一張卡片的文字行分派到各欄位。抓不到就留空——不要猜。"""
+    item = {"url": url, "title": "", "address": "", "price": 0, "price_text": "",
+            "type": "", "layout": "", "area": "", "age": ""}
+    rest = []
+    for raw in lines:
+        l = (raw or "").strip()
+        if not l or l.isdigit():          # 純數字＝相片張數徽章，不是資料
+            continue
+        if _NOISE_RE.match(l):            # 「瀏覽：0人」「已售出」之類的狀態字
+            continue
+        if not item["price_text"] and _PRICE_RE.search(l) and len(l) <= 20:
+            item["price_text"] = l
+            item["price"] = parse_price(l)
+            continue
+        if not item["address"] and len(l) <= _ADDR_MAX and _ADDR_RE.search(l):
+            item["address"] = l
+            continue
+        if not item["layout"] and _LAYOUT_RE.search(l) and len(l) <= 20:
+            item["layout"] = l
+            continue
+        if not item["area"] and _AREA_RE.match(l):
+            item["area"] = l
+            continue
+        if not item["age"] and l.startswith("屋齡"):
+            item["age"] = l
+            continue
+        if not item["type"] and _TYPE_RE.match(l):
+            item["type"] = l
+            continue
+        rest.append(l)
+    # 剩下最長的一行當標題：卡片上真正的物件名稱一定是最長的那串
+    item["title"] = max(rest, key=len) if rest else ""
+    return item
+
+
+_RENT_TYPE_RE = re.compile(r"^(獨立套房|分租套房|雅房|整層住家|店面|辦公|廠房|土地|車位)$")
+_RENT_BUILDING_RE = re.compile(r"^(電梯大廈|透天厝|公寓|華廈|別墅|大樓|套房|其他)$")
+_RENT_AGE_RE = re.compile(r"^\d+(\.\d+)?年$")
+_RENT_TAGS = ("可養寵物", "可開伙", "附設備", "附傢俱", "租金補貼", "可報稅", "可入籍", "社會住宅")
+_DISTRICT_RE = re.compile(r"^[\u4e00-\u9fff]{1,3}(區|鄉|鎮|市)$")
+
+
+def _classify_rent(lines: list[str], url: str) -> dict:
+    """租屋站的清單卡片：標題／區／路或社區／型式／建物／格局／屋齡／租金／標籤（2026-09-08 實測）。"""
+    item = {"url": url, "title": "", "address": "", "price": 0, "price_text": "",
+            "type": "", "layout": "", "area": "", "age": "", "tags": [], "deal_type": "rent"}
+    rest, district, street = [], "", ""
+    for raw in lines:
+        l = (raw or "").strip()
+        if not l or l.isdigit() or _NOISE_RE.match(l):
+            continue
+        if l in _RENT_TAGS:
+            item["tags"].append(l)
+            continue
+        if not item["price_text"] and _PRICE_RE.search(l) and len(l) <= 20:
+            item["price_text"] = l
+            item["price"] = parse_price(l)
+            continue
+        if _RENT_TYPE_RE.match(l):
+            item["type"] = l if not item["type"] else item["type"]
+            continue
+        if _RENT_BUILDING_RE.match(l):
+            item["type"] = f"{item['type']}/{l}" if item["type"] else l
+            continue
+        if not item["layout"] and (_LAYOUT_RE.search(l) or l == "開放式格局") and len(l) <= 20:
+            item["layout"] = l
+            continue
+        if not item["area"] and _AREA_RE.match(l):
+            item["area"] = l
+            continue
+        if not item["age"] and (_RENT_AGE_RE.match(l) or l.startswith("屋齡")):
+            item["age"] = l if l.startswith("屋齡") else f"屋齡{l}"
+            continue
+        if not district and _DISTRICT_RE.match(l):
+            district = l
+            continue
+        if not street and len(l) <= _ADDR_MAX and _ADDR_RE.search(l):
+            street = l
+            continue
+        rest.append(l)
+    item["address"] = (district + street) if (district or street) else ""
+    item["title"] = max(rest, key=len) if rest else ""
+    return item
+
+
+def parse_cards(raw: list[dict]) -> list[dict]:
+    """[{url, lines}] → 物件清單。買賣與租件都收（SPEC-P34），去重、正規化網址。"""
+    items, seen = [], set()
+    for c in raw:
+        url = normalize_item_url(c.get("url") or "")
+        if not url:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        if is_rent_url(url):
+            items.append(_classify_rent(c.get("lines") or [], url))
+        else:
+            it = _classify(c.get("lines") or [], url)
+            it["deal_type"] = "sale"
+            items.append(it)
+    return items
+
+
+# ─── 瀏覽器端：只撈「連結 + 卡片文字行」，不做任何判斷 ──────
+
+# 卡片容器：從連結往上爬到「仍然只指向一筆物件」的最大節點——那就是卡片。
+#
+# 判斷用**不重複的物件網址數**，不是連結元素數：卡片裡通常有兩個連結
+# （圖片一個、標題一個）指向同一筆，用元素數會在第一層就停住，抓到空字串。
+#
+# 兩次踩坑都記在這裡（2026-09-02 實測 vip.rakuya.com.tw/hyr）：
+#   1. 原本用「文字長度 25～260 且含萬/元」的啟發式 → 該頁卡片文字只有 17 字，
+#      條件不成立就一路爬到共同祖先，同組 5 筆共用同一段文字，標題價格全錯。
+#   2. 改成「只含一個連結元素」→ 卡片有兩個連結，第一層就停在 <a> 上，全空。
+# 結構性判斷不依賴版面文字長度，跨店鋪頁都成立。
+LIST_EXTRACT_JS = r"""
+() => {
+  const SEL = 'a[href*="sell_item"],a[href*="rent_item"],a[href*="rent.rakuya.com.tw/item/"]';
+  const ids = el => new Set(
+    [...el.querySelectorAll(SEL)].map(x => (x.href || '').split('?')[1] || x.href));
+  const out = [], seen = new Set();
+  document.querySelectorAll(SEL).forEach(a => {
+    const href = a.href || '';
+    if (!href || seen.has(href)) return;
+    seen.add(href);
+    let card = a, node = a.parentElement;
+    for (let i = 0; i < 8 && node; i++, node = node.parentElement) {
+      if (ids(node).size > 1) break;      // 這一層已經含到別筆，停在上一層
+      card = node;
+    }
+    const lines = (card.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+    out.push({ url: href, lines });
+  });
+  return out;
+}
+"""
+
+# 進度判定用：只數「物件連結有幾個」。不看圖片載完沒有——清單匯入根本不下載圖片。
+LIST_PROGRESS_JS = (
+    "() => document.querySelectorAll('a[href*=\"sell_item\"],a[href*=\"rent_item\"],a[href*=\"rent.rakuya.com.tw/item/\"]').length"
+)
+
+# 詳情頁找店家入口用：把所有連結的 href 與文字撈出來交給 find_store_url 判斷
+LINKS_JS = r"""
+() => Array.from(document.querySelectorAll('a')).map(a => ({
+  href: a.href || '', text: (a.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 40)
+}))
+"""
