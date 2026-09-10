@@ -1,0 +1,155 @@
+"""首頁儀表板彙總（老闆 2026-09-06：「首頁要簡化，且要有 FB、IG、Threads 的版本」）。
+
+一支 API 把首頁要的東西一次拿完：三個平台各自的登入狀態、今天發了幾篇／失敗幾篇、
+四個自動化開關、最近一筆結果的那句話，加上最近幾筆執行紀錄。
+原本首頁要打 6、7 支 API 才拼得出來，外行人看到的是一堆轉圈圈。
+"""
+from __future__ import annotations
+
+import datetime
+
+from fastapi import APIRouter, Depends
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..database import (get_session, Account, RunLog, ThreadsAccount, NurtureConfig, FriendConfig,
+                        CleanupConfig, GroupJoinConfig, ThreadsLeadConfig)
+from .. import platform_block
+
+router = APIRouter(prefix="/api/dashboard", tags=["dashboard"], redirect_slashes=False)
+
+from ..exposure import (TAIPEI, PLATFORMS, PLATFORM_OF as _PLATFORM_OF, POST_TYPES,   # noqa: F401
+                        platform_of, shares_in_log, aggregate as aggregate_exposure)
+
+
+STALE_AFTER_HOURS = 72
+
+
+def login_is_stale(last_ok_at, now=None) -> bool:
+    """最近一次確認登入有效的時間太久以前（或從來沒有）→ 不能再標「正常」。"""
+    if not last_ok_at:
+        return True
+    now = now or datetime.datetime.utcnow()
+    return (now - last_ok_at).total_seconds() > STALE_AFTER_HOURS * 3600
+
+
+def today_start_utc(now_utc: datetime.datetime | None = None) -> datetime.datetime:
+    """「今天」以台北為準：RunLog.created_at 是 naive UTC，所以算出台北的今天 00:00 再換回 UTC。"""
+    now_utc = now_utc or datetime.datetime.utcnow()
+    local = now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(TAIPEI)
+    start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+
+def _iso(dt: datetime.datetime | None) -> str | None:
+    return dt.replace(tzinfo=datetime.timezone.utc).isoformat() if dt else None
+
+
+def summarize_logs(logs: list, since: datetime.datetime) -> dict:
+    """純函式：把 RunLog 列表折成 today / platforms 的計數與最近一筆。方便離線測。
+    exposure_today＝貼文數＋轉發社團數（Marketplace 一篇商品轉 N 個社團＝N 次曝光）。"""
+    today = {"posted": 0, "failed": 0, "running": 0, "shares": 0, "exposure": 0}
+    plats = {p: {"posted_today": 0, "failed_today": 0, "shares_today": 0, "exposure_today": 0, "last": None}
+             for p in PLATFORMS}
+    for l in logs:                                   # 呼叫端保證是新→舊
+        plat = platform_of(l.task_type)
+        is_today = bool(l.created_at and l.created_at >= since)
+        if l.status == "running":
+            today["running"] += 1
+        if is_today and l.task_type in POST_TYPES:
+            if l.status == "success":
+                today["posted"] += 1
+                shares = shares_in_log(getattr(l, "result_json", None)) if l.task_type == "marketplace" else 0
+                today["shares"] += shares
+                if plat:
+                    plats[plat]["posted_today"] += 1
+                    plats[plat]["shares_today"] += shares
+            elif l.status in ("failed", "needs_manual"):
+                today["failed"] += 1
+                if plat:
+                    plats[plat]["failed_today"] += 1
+        if plat and plats[plat]["last"] is None and l.status != "running":
+            plats[plat]["last"] = {"task_type": l.task_type, "status": l.status,
+                                   "summary": l.summary or "", "at": _iso(l.created_at)}
+    today["exposure"] = today["posted"] + today["shares"]
+    for row in plats.values():
+        row["exposure_today"] = row["posted_today"] + row["shares_today"]
+    return {"today": today, "platforms": plats}
+
+
+@router.get("/summary")
+async def summary(session: AsyncSession = Depends(get_session)):
+    from ..fbauto_bridge import cookie_exists   # 延後載入，維持與其他 api 模組一致
+    since = today_start_utc()
+    # 今天的全撈（一天的量有上限），舊的只取 200 筆給「最近一次／最近做了什麼」用。
+    # 原本一律 limit 400：帳號一忙，今天的紀錄就會被更舊的擠掉，首頁數字會少算。
+    today_rows = (await session.execute(
+        select(RunLog).where(RunLog.created_at >= since)
+        .order_by(RunLog.created_at.desc()))).scalars().all()
+    older_rows = (await session.execute(
+        select(RunLog).where(RunLog.created_at < since)
+        .order_by(RunLog.created_at.desc()).limit(200))).scalars().all()
+    logs = list(today_rows) + list(older_rows)       # 新→舊，兩段不重疊
+    agg = summarize_logs(logs, since)
+
+    acc = (await session.execute(select(Account).order_by(Account.id))).scalars().first()
+    account_id = acc.id if acc else 0
+    meta = (await session.execute(select(ThreadsAccount))).scalars().first()
+
+    def _login(platform: str) -> tuple[str, str]:
+        if platform == "fb":
+            # 只看 fb_user_id 有值就寫「登入正常」會騙人：cookie 檔被清掉、或帳號被
+            # 標成 limited／login_failed 時，發文其實會全掛，首頁卻一片綠。
+            if not (acc and acc.fb_user_id):
+                return "missing", ""
+            if acc.status in ("limited", "locked", "login_failed") or not cookie_exists(acc.fb_user_id):
+                return "expired", ""
+            return "active", ""
+        if meta is None:
+            return "missing", ""
+        st = (meta.ig_status if platform == "ig" else meta.status) or ""
+        note = platform_block.block_note(meta, platform)
+        if st == "active":
+            # 「登入正常」要有憑據：最近一次確認（檢查或發文成功）超過 3 天就不能再說正常——
+            # 老闆 2026-09-09：「IG、Threads 沒有登錄，儀表板卻顯示正常」
+            last = meta.ig_last_ok_at if platform == "ig" else meta.last_ok_at
+            if login_is_stale(last):
+                return "stale", ""
+        return (st if st in ("active", "expired") else "missing"), note
+
+    nurture = {r.platform or "fb": bool(r.enabled) for r in
+               (await session.execute(select(NurtureConfig))).scalars().all()}
+    friend = {r.platform: bool(r.enabled) for r in
+              (await session.execute(select(FriendConfig))).scalars().all()}
+    cleanup = {r.platform: bool(r.enabled) for r in
+               (await session.execute(select(CleanupConfig))).scalars().all()}
+    gj = (await session.execute(select(GroupJoinConfig))).scalars().first()
+    leads = (await session.execute(select(ThreadsLeadConfig))).scalars().first()
+    friend["threads"] = bool(leads and leads.enabled)     # Threads 的加好友沿用 P29 的設定
+
+    platforms = {}
+    for p in PLATFORMS:
+        login, note = _login(p)
+        row = dict(agg["platforms"][p])
+        row.update({"login": login, "block_note": note,
+                    "nurture": nurture.get(p, False), "friend": friend.get(p, False),
+                    "cleanup": cleanup.get(p, False)})
+        if p == "fb":
+            row["group_join"] = bool(gj and gj.enabled)
+        platforms[p] = row
+
+    recent = [{"task_type": l.task_type, "status": l.status, "summary": l.summary or "",
+               "at": _iso(l.created_at)} for l in logs[:5]]
+    # 本月／累積曝光（exposure_daily 小表，老闆 2026-09-08）
+    from ..database import ExposureDaily
+    ex_rows = (await session.execute(select(ExposureDaily.date, ExposureDaily.platform,
+                                            ExposureDaily.posts, ExposureDaily.shares))).all()
+    ex = aggregate_exposure(ex_rows, datetime.datetime.now(TAIPEI).strftime("%Y-%m-%d"))
+    for p in PLATFORMS:
+        platforms[p]["exposure_month"] = ex["platforms"][p]["month"]["exposure"]
+        platforms[p]["exposure_total"] = ex["platforms"][p]["total"]["exposure"]
+    today = dict(agg["today"])
+    today["exposure_month"] = ex["month"]["exposure"]
+    today["exposure_total"] = ex["total"]["exposure"]
+    return {"account_id": account_id, "today": today, "platforms": platforms, "recent": recent,
+            "exposure": ex}

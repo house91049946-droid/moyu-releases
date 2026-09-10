@@ -1,0 +1,122 @@
+"""排程層級的「幾天後自動刪文」：社團發文／IG／Threads（老闆 2026-09-09）。
+
+Marketplace 早就有 auto_delete_days（下架商品）；這裡補另外三個通道：
+  - IG／Threads：順發時 post_history 記了貼文網址與 origin（mp:<排程id>／gp:<排程id>），
+    到期的網址交給 run_meta_cleanup 的白名單刪（只刪這幾則，不看天數下限）。
+  - 社團發文：社團貼文沒有網址可記（FB 不回），用備份刪文那套（活動紀錄＋內文比對「是摸魚發的」），
+    天數＝所有社團排程裡設了的最小值。
+每天清晨跑一次（03:20 Threads、03:40 IG、04:00 FB），跟 02:00～06:00 的備份刪文同一個時段，
+瀏覽器 profile 互斥會自己排隊。
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import tempfile
+
+from sqlalchemy import select
+
+from ..database import (
+    async_session_factory, SyncSession, MarketplaceSchedule, GpSchedule, PostHistory, Account, TAIPEI,
+)
+from .task_runner import scheduler
+from apscheduler.triggers.cron import CronTrigger
+
+JOB_PREFIX = "postclean_"
+PLATFORM_GROUP = {"threads": "Threads", "ig": "Instagram"}   # post_history.group_name 的寫法
+MAX_PER_RUN = 50
+RUN_AT = {"threads": (3, 20), "ig": (3, 40), "fb": (4, 0)}
+
+
+def due_urls(rows, schedules, now: datetime.datetime, platform: str) -> list[str]:
+    """純函式：哪些貼文到期該刪。
+
+    rows：post_history 列（要有 origin / group_name / post_url / deleted / post_time，post_time 是 naive UTC）
+    schedules：[(kind, id, extra_delete_days dict)]，kind 是 mp／gp
+    只挑 origin 對得上排程、平台對得上、設了天數（>0）而且已經超過天數的。"""
+    days_by_origin = {}
+    for kind, sid, extra in schedules:
+        d = int((extra or {}).get(platform) or 0)
+        if d > 0:
+            days_by_origin[f"{kind}:{sid}"] = d
+    if not days_by_origin:
+        return []
+    want_group = PLATFORM_GROUP.get(platform, "")
+    out = []
+    for r in rows:
+        if r.deleted or not r.post_url or (r.group_name or "") != want_group:
+            continue
+        d = days_by_origin.get(r.origin or "")
+        if not d or not r.post_time:
+            continue
+        if r.post_time <= now - datetime.timedelta(days=d):
+            out.append(r.post_url)
+    return out[:MAX_PER_RUN]
+
+
+def gp_delete_days(gp_rows) -> int:
+    """社團發文的刪文天數：有設（>0）的排程裡取最小；都沒設回 0。"""
+    days = [int(s.auto_delete_days or 0) for s in gp_rows if (s.auto_delete_days or 0) > 0]
+    return min(days) if days else 0
+
+
+def _load_sync():
+    with SyncSession() as s:
+        mps = s.execute(select(MarketplaceSchedule)).scalars().all()
+        gps = s.execute(select(GpSchedule)).scalars().all()
+        scheds = [("mp", m.id, dict(m.extra_delete_days or {})) for m in mps] + \
+                 [("gp", g.id, dict(g.extra_delete_days or {})) for g in gps]
+        rows = s.execute(select(PostHistory).where(PostHistory.deleted == False)).scalars().all()  # noqa: E712
+        acc = s.execute(select(Account).order_by(Account.id)).scalars().first()
+        return scheds, rows, gp_delete_days(gps), (acc.id if acc else 0), ((acc.fb_user_id or "") if acc else "")
+
+
+async def run_once(platform: str) -> dict:
+    """跑一個平台的排程刪文。回 {"job_id"} 或 {"skipped": 原因}。"""
+    import asyncio
+    from ..fbauto_bridge import start_long_op, wait_profile_free
+    from .cleanup_runner import make_on_done, write_only_file
+    scheds, rows, fb_days, account_id, fbid = await asyncio.to_thread(_load_sync)
+    now = datetime.datetime.utcnow()
+    if platform in ("threads", "ig"):
+        urls = due_urls(rows, scheds, now, platform)
+        if not urls:
+            return {"skipped": "沒有到期的貼文"}
+        fd, path = tempfile.mkstemp(prefix=f"postclean_{platform}_", suffix=".json")
+        with open(fd, "w", encoding="utf-8") as f:
+            json.dump({"urls": urls, "phrases": [], "max_age_days": 3650}, f, ensure_ascii=False)
+        args = ["--platform", platform, "--older-than", "0", "--max", str(MAX_PER_RUN),
+                "--headless", "--only-file", path, "--force-recent"]
+        module, key = "src.run_meta_cleanup", "meta"
+    else:
+        if fb_days <= 0:
+            return {"skipped": "社團排程都沒設自動刪文"}
+        if not fbid:
+            return {"skipped": "FB 尚未綁定"}
+        path = await asyncio.to_thread(write_only_file, account_id)      # 只刪摸魚發的（內文比對）
+        args = ["--fbid", fbid, "--older-than", str(fb_days), "--max", str(MAX_PER_RUN),
+                "--headless", "--only-file", path, "--force-recent"]
+        module, key = "src.run_fb_cleanup", f"fb:{fbid}"
+    busy = await wait_profile_free(key, max_wait_sec=900, tag="[postclean]")
+    if busy is not None:
+        return {"skipped": f"瀏覽器被「{busy.op}」占著，明天再試"}
+    try:
+        job_id = start_long_op(f"cleanup_{platform}", module, args, account_id=account_id,
+                               fbid=fbid if platform == "fb" else "",
+                               on_done=make_on_done(account_id, platform, path))
+    except RuntimeError as e:
+        return {"skipped": str(e)}
+    print(f"[postclean] {platform} 排程刪文啟動（job {job_id}）", flush=True)
+    return {"job_id": job_id}
+
+
+async def _scheduled(platform: str):
+    r = await run_once(platform)
+    if r.get("skipped"):
+        print(f"[postclean] {platform} 略過：{r['skipped']}", flush=True)
+
+
+async def restore_post_cleanup_schedule():
+    for plat, (h, m) in RUN_AT.items():
+        scheduler.add_job(func=_scheduled, trigger=CronTrigger(hour=h, minute=m, timezone=TAIPEI),
+                          args=[plat], id=f"{JOB_PREFIX}{plat}", replace_existing=True)

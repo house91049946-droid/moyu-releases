@@ -1,0 +1,380 @@
+"""Instagram 發文 CLI（v1：單帳號、單則貼文、必帶圖）。
+
+背景：老闆要 Threads 之外再加 IG 當第三個曝光渠道（2026-08-29）。
+IG 與 Threads 同屬 Meta 帳號體系——實測 threads_profile 登入 Threads 後，
+instagram.com 也是登著的（登入流程經過 instagram.com），所以**共用同一個
+persistent profile**（DATA_DIR/threads_profile），一次登入兩邊都能發。
+
+設計比照 run_threads_post：
+  - --result-json + atexit：任何路徑掛掉都留下結果與原因
+  - 真人化輸入、真 Chrome、亂數停頓、失敗自動截圖
+  - --check / --dry-run / --login 同語意
+
+與 Threads 的差異（IG 的規則）：
+  - **必須帶圖**：IG 貼文沒有純文字這回事，沒 --images 直接報錯
+  - 文案上限 2200 字（超過截斷並標記 truncated）
+  - 發文精靈是多步驟：選檔 → 裁切「下一步」→ 濾鏡「下一步」→ 文案 → 分享
+
+用法：
+    python -m src.run_ig_post --check --headless
+    python -m src.run_ig_post --text "文案" --images a.jpg,b.jpg \
+        [--dry-run] [--headless] [--result-json out.json]
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import sys
+import time
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+from src.meta_block import classify as classify_failure
+from src.paths import DATA_DIR
+from src.run_threads_post import (
+    _launch, _debug_shot, clip_text, do_open, parse_images, parse_username,
+)
+from src.utils import human_sleep, human_type
+
+_JSON_PATH = None
+_RESULT = None
+
+IG_URL = "https://www.instagram.com/"
+CAPTION_LIMIT = 2200                 # IG 說明文字上限
+DEFAULT_PROFILE = DATA_DIR / "threads_profile"   # 與 Threads 共用（同一 Meta 登入）
+
+# aria-label 中英雙語（2026-08-29 於 mini 實測：入口叫「新貼文」）
+_CREATE_LABELS = ["新貼文", "新增貼文", "New post", "建立", "Create"]
+_NEXT_TEXTS = ["下一步", "Next"]
+_SHARE_TEXTS = ["分享", "Share"]
+_NOT_NOW_TEXTS = ["稍後再說", "Not Now", "以後再說"]
+# 完成/失敗都用完整句判定——單字「已分享」可能出現在動態牆等別處造成誤判
+_SHARED_MARKS = ["已分享你的貼文", "貼文已分享", "has been shared", "Post shared"]
+_FAILED_MARKS = ["無法分享", "couldn't be shared", "稍後再試", "Try again later"]
+
+
+def _newest_post_url(page) -> str:
+    """回自己的個人頁，抓九宮格第一格的貼文網址（剛發的那則）。抓不到回空字串。"""
+    with contextlib.suppress(Exception):
+        user = _my_username(page) if "_my_username" in globals() else ""
+        page.goto(f"https://www.instagram.com/{user}/" if user else IG_URL,
+                  wait_until="domcontentloaded", timeout=45000)
+        human_sleep(2.5, 4.0)
+        href = page.evaluate(
+            "()=>{const a=document.querySelector(\"a[href*='/p/']\");return a?a.href:''}") or ""
+        return href.split("?")[0]
+    return ""
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[ig] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+def _dismiss_popups(page):
+    """通知彈窗之類的攔路虎：能關就關，關不掉不影響主流程。"""
+    for t in _NOT_NOW_TEXTS:
+        with contextlib.suppress(Exception):
+            loc = page.get_by_text(t, exact=True)
+            if loc.count() and loc.first.is_visible():
+                loc.first.click()
+                human_sleep(0.8, 1.5)
+                return
+
+
+def _logged_in(page) -> bool:
+    """有沒有真的登入。看得到登入表單就是沒登入；否則以帳號設定頁為準。
+
+    「畫面上有建立貼文的按鈕」不能當證據：未登入的 IG 一樣看得到動態與一堆按鈕。
+    寧可要客戶再登一次，也不要把一個假帳號寫進資料庫（2026-09-07）。
+    """
+    with contextlib.suppress(Exception):
+        if page.locator('a[href*="/accounts/login"], input[name="username"]').first.is_visible():
+            return False
+    return bool(_identity_via_settings(page))
+
+
+SETTINGS_URL = "https://www.instagram.com/accounts/edit/"
+
+# 動態消息與限時動態上到處都是別人的頭像連結，長得跟自己的一模一樣。
+# 唯一不會認錯的判準是「帳號設定頁」：沒登入會被 IG 導去 /accounts/login/。
+_AVATAR_JS = """()=>{const a=[...document.querySelectorAll("a[href^='/']")]
+    .filter(x=>!x.closest('article'))
+    .find(x=>x.querySelector("img[alt*='大頭貼照'],img[alt*='profile picture']"));
+  return a?a.getAttribute("href"):""}"""
+
+
+def _identity_via_settings(page) -> str:
+    """去帳號設定頁確認「現在登入的是誰」。沒登入回空字串。
+
+    老闆 2026-09-07 回報：第一次登入 Threads／IG 時系統會「幻覺」一個帳號——
+    根本沒登入卻回報已連結。原因是舊寫法抓畫面上第一個頭像連結，
+    而未登入時 IG／Threads 照樣給你看**別人的**貼文。
+    設定頁沒有動態消息，也一定要登入才進得去，所以拿它當判準。
+    """
+    with contextlib.suppress(Exception):
+        page.goto(SETTINGS_URL, wait_until="domcontentloaded", timeout=45000)
+        human_sleep(2.0, 3.5)
+        if "/accounts/login" in (page.url or ""):
+            return ""
+        href = (page.evaluate(_AVATAR_JS) or "").split("?")[0].strip("/")
+        if href and "/" not in href:
+            return href
+    return ""
+
+
+def _my_username(page) -> str:
+    """現在登入的帳號名；沒登入回空字串。"""
+    return _identity_via_settings(page)
+
+
+def _click_text_in(scope, texts) -> bool:
+    for t in texts:
+        with contextlib.suppress(Exception):
+            loc = scope.get_by_text(t, exact=True)
+            for i in range(loc.count()):
+                el = loc.nth(i)
+                if el.is_visible():
+                    el.click()
+                    return True
+    return False
+
+
+def do_check(profile_dir: Path, headless: bool = True) -> dict:
+    pw = sync_playwright().start()
+    ctx, page = _launch(pw, profile_dir, headless=headless)
+    try:
+        page.goto(IG_URL, wait_until="commit", timeout=60000)
+        human_sleep(3.0, 5.0)
+        _dismiss_popups(page)
+        if not _logged_in(page):
+            print("[ig] 登入態無效或尚未登入。", flush=True)
+            return {"logged_in": False, "username": ""}
+        user = _my_username(page)
+        print(f"[ig] 登入有效：@{user or '?'}", flush=True)
+        return {"logged_in": True, "username": user}
+    finally:
+        for close in (ctx.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+def do_login(profile_dir: Path) -> dict:
+    """開視窗手動登入 IG（與 Threads 同一個 profile，登一次兩邊通用）。"""
+    pw = sync_playwright().start()
+    ctx, page = _launch(pw, profile_dir, headless=False)
+    try:
+        page.goto(IG_URL, wait_until="commit", timeout=60000)
+        print("[ig] 請在開啟的視窗登入 Instagram（帳號是用 FB 建的就點「使用 Facebook 帳號登入」）。最多等 15 分鐘。", flush=True)
+        deadline = time.time() + 900          # FB 登入＋兩步驟驗證常常超過 5 分鐘（客戶 2026-09-09）
+        while time.time() < deadline:
+            page.wait_for_timeout(3000)
+            if _logged_in(page):
+                user = _my_username(page)
+                print(f"[ig] ✅ 已登入 @{user or '?'}。", flush=True)
+                return {"logged_in": True, "username": user}
+        print("[ig] ❌ 等不到登入完成（5 分鐘）。", flush=True)
+        return {"logged_in": False, "username": ""}
+    finally:
+        for close in (ctx.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+def do_post(profile_dir: Path, text: str, images: list[Path],
+            headless: bool, dry_run: bool = False) -> dict:
+    pw = sync_playwright().start()
+    ctx, page = _launch(pw, profile_dir, headless=headless)
+    try:
+        page.goto(IG_URL, wait_until="commit", timeout=60000)
+        human_sleep(3.0, 5.0)
+        _dismiss_popups(page)
+        if not _logged_in(page):
+            raise RuntimeError("尚未登入 Instagram——先跑一次 --login")
+
+        # 1) 左欄「新貼文」
+        create = None
+        for lab in _CREATE_LABELS:
+            with contextlib.suppress(Exception):
+                el = page.locator(f'svg[aria-label="{lab}"]').first
+                if el.count() > 0:
+                    create = el
+                    break
+        if create is None:
+            shot = _debug_shot(page, "ig_no_create")
+            raise RuntimeError(f"找不到「新貼文」入口（截圖：{shot}）")
+        create.click()
+        human_sleep(1.2, 2.2)
+        # 新版點了可能出子選單（貼文/精選時刻）——有「貼文」就點
+        with contextlib.suppress(Exception):
+            sub = page.get_by_text("貼文", exact=True)
+            if sub.count() and sub.first.is_visible():
+                sub.first.click()
+                human_sleep(0.8, 1.5)
+
+        # 2) 塞圖（跳過「從電腦選擇」按鈕，直接餵 input[type=file]）
+        file_input = page.locator('div[role="dialog"] input[type="file"]').first
+        if file_input.count() == 0:
+            file_input = page.locator('input[type="file"]').first
+        if file_input.count() == 0:
+            shot = _debug_shot(page, "ig_no_file_input")
+            raise RuntimeError(f"找不到圖片上傳入口（截圖：{shot}）")
+        file_input.set_input_files([str(p) for p in images])
+        human_sleep(2.0 + len(images), 4.0 + len(images))
+
+        # 3) 裁切、濾鏡各按一次「下一步」
+        for step in ("裁切", "濾鏡"):
+            if not _click_text_in(page.locator('div[role="dialog"]').last, _NEXT_TEXTS) \
+               and not _click_text_in(page, _NEXT_TEXTS):
+                shot = _debug_shot(page, f"ig_no_next_{step}")
+                raise RuntimeError(f"{step}步驟找不到「下一步」（截圖：{shot}）")
+            human_sleep(1.5, 2.5)
+
+        # 4) 文案
+        if text:
+            box = page.locator('div[role="dialog"] [contenteditable="true"]').last
+            if box.count() == 0:
+                shot = _debug_shot(page, "ig_no_caption")
+                raise RuntimeError(f"找不到說明文字輸入框（截圖：{shot}）")
+            box.click()
+            human_sleep(0.5, 1.0)
+            human_type(page, text, max_chars=CAPTION_LIMIT + 10)
+            human_sleep(0.8, 1.5)
+
+        if dry_run:
+            print("[ig] dry-run：流程驗證完成（登入✓、選圖✓、下一步×2✓、文案✓），不按分享", flush=True)
+            _debug_shot(page, "ig_dryrun_final")
+            return {"posted": False, "dry_run": True, "images": len(images)}
+
+        # 5) 分享
+        if not _click_text_in(page.locator('div[role="dialog"]').last, _SHARE_TEXTS) \
+           and not _click_text_in(page, _SHARE_TEXTS):
+            shot = _debug_shot(page, "ig_no_share")
+            raise RuntimeError(f"找不到「分享」按鈕（截圖：{shot}）")
+
+        # 成功判定：只認完成畫面的完整句（「已分享你的貼文」），不認單字。
+        # 對話框收掉不算成功——IG 失敗時也會收框。
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            page.wait_for_timeout(1500)
+            with contextlib.suppress(Exception):
+                body = page.evaluate("()=>document.body.innerText")
+                if any(m in body for m in _SHARED_MARKS):
+                    _debug_shot(page, "ig_share_done")
+                    # 記下剛發那則的網址：備份刪文要靠它認出「這是摸魚發的」（P32）
+                    return {"posted": True, "images": len(images),
+                            "post_url": _newest_post_url(page)}
+                if any(m in body for m in _FAILED_MARKS):
+                    shot = _debug_shot(page, "ig_share_rejected")
+                    raise RuntimeError(f"IG 回報無法分享（截圖：{shot}）")
+        shot = _debug_shot(page, "ig_share_stuck")
+        raise RuntimeError(f"按了分享但等不到完成畫面——請開視窗確認（截圖：{shot}）")
+    except Exception as e:
+        # 失敗當下的頁面文字才是最準的訊號（IG 的「動作已遭封鎖」只出現在畫面上）
+        body = ""
+        with contextlib.suppress(Exception):
+            body = page.evaluate("()=>document.body.innerText")[:4000]
+        e.reason = classify_failure(page_text=body, error_text=str(e))
+        raise
+    finally:
+        for close in (ctx.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser(description="Instagram 發文")
+    ap.add_argument("--login", action="store_true", help="開視窗手動登入一次")
+    ap.add_argument("--open", action="store_true",
+                    help="用存好的登入態開 Instagram 視窗給人用（最多 --open-minutes 分鐘）")
+    ap.add_argument("--open-minutes", type=int, default=30)
+    ap.add_argument("--check", action="store_true", help="探測登入態並回報帳號名")
+    ap.add_argument("--text", default="", help="說明文字（超過 2200 字會截斷）")
+    ap.add_argument("--images", default="", help="逗號分隔的圖片路徑，至少 1 張、最多 10 張")
+    ap.add_argument("--profile-dir", default=str(DEFAULT_PROFILE))
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="走完整流程但不按分享（驗證登入態與版面用）")
+    ap.add_argument("--result-json")
+    args = ap.parse_args()
+
+    profile_dir = Path(args.profile_dir).expanduser()
+
+    if args.open:
+        _JSON_PATH = args.result_json
+        _RESULT = {"schema": 1, "success": False, "error": "未完成",
+                   "data": {"opened": False, "closed_by_user": False, "minutes": 0}}
+        if _JSON_PATH:
+            atexit.register(_write)
+        try:
+            r = do_open(profile_dir, IG_URL, max(1, min(180, args.open_minutes)), label="ig")
+            _RESULT["success"] = True
+            _RESULT["error"] = ""
+            _RESULT["data"].update(r)
+            sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as e:
+            _RESULT["error"] = str(e)
+            sys.exit(1)
+
+    if args.login or args.check:
+        _JSON_PATH = args.result_json
+        _RESULT = {"schema": 1, "success": False, "error": "未完成",
+                   "data": {"logged_in": False, "username": ""}}
+        if _JSON_PATH:
+            atexit.register(_write)
+        try:
+            r = (do_login(profile_dir) if args.login
+                 else do_check(profile_dir, headless=args.headless))
+            ok = r["logged_in"] or args.check
+            _RESULT["success"] = ok
+            _RESULT["error"] = "" if ok else "等不到登入完成（5 分鐘）"
+            _RESULT["data"].update(r)
+            sys.exit(0 if ok else 1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            _RESULT["error"] = str(e)
+            sys.exit(1)
+
+    _JSON_PATH = args.result_json
+    _RESULT = {"schema": 1, "success": False, "error": "未完成",
+               "data": {"posted": False, "truncated": False, "images": 0}}
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    try:
+        images = parse_images(args.images)
+    except FileNotFoundError as e:
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    if not images:
+        _RESULT["error"] = "IG 貼文一定要圖：請用 --images 帶至少 1 張圖片"
+        sys.exit(1)
+
+    text, truncated = clip_text(args.text, limit=CAPTION_LIMIT)
+    _RESULT["data"]["truncated"] = truncated
+
+    try:
+        r = do_post(profile_dir, text, images, headless=args.headless, dry_run=args.dry_run)
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        _RESULT["data"].update(r)
+        if r.get("dry_run"):
+            sys.exit(0)
+        print(f"[ig] ✅ 已發佈（{len(images)} 張圖"
+              f"{'，文案有截斷' if truncated else ''}）", flush=True)
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        _RESULT["data"]["reason"] = getattr(e, "reason", None) or classify_failure(error_text=str(e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

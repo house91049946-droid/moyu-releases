@@ -1,0 +1,110 @@
+"""每天確認一次 Threads／IG 還登著沒（老闆 2026-09-09：「沒有登錄儀表板卻顯示正常」）。
+
+狀態原本只在客戶手動按「檢查」或發文時才更新；幾天沒發文、session 早掉了，首頁還是一片綠。
+每天 07:30 若最近一次確認超過 24 小時，就 headless 跑一次 --check（幾十秒），結果直接寫回資料庫，
+首頁卡片才有憑據。瀏覽器被占著就明天再說。
+"""
+from __future__ import annotations
+
+import datetime
+
+from sqlalchemy import select
+from apscheduler.triggers.cron import CronTrigger
+
+from ..database import SyncSession, ThreadsAccount, TAIPEI
+from .task_runner import scheduler
+
+CHECK_AFTER_HOURS = 24
+RUN_AT = (7, 30)
+
+
+def needs_check(row, now: datetime.datetime | None = None) -> list[str]:
+    """哪些平台該檢查：已連結、而且最近一次確認超過 24 小時（或從沒確認過）。"""
+    if row is None:
+        return []
+    now = now or datetime.datetime.utcnow()
+    out = []
+    for plat, last, linked in (("threads", row.last_ok_at, bool(row.username)),
+                               ("ig", row.ig_last_ok_at, bool(row.ig_username))):
+        if not linked:
+            continue
+        if not last or (now - last).total_seconds() > CHECK_AFTER_HOURS * 3600:
+            out.append(plat)
+    return out
+
+
+def apply_check_result(platform: str, data: dict, success: bool) -> str:
+    """把 --check 的結果寫回 threads_accounts（跟 api/threads.py 的輪詢端點同一套規則）。回寫了什麼。"""
+    logged_in = bool((data or {}).get("logged_in"))
+    username = (data or {}).get("username") or ""
+    now = datetime.datetime.utcnow()
+    with SyncSession() as s:
+        row = s.execute(select(ThreadsAccount).order_by(ThreadsAccount.id)).scalars().first()
+        if row is None:
+            return "no-row"
+        if platform == "ig":
+            if logged_in:
+                row.ig_status, row.ig_last_ok_at = "active", now
+                if username:
+                    row.ig_username = username
+            elif success:
+                row.ig_status = "expired"
+            else:
+                return "unknown"
+        else:
+            if logged_in:
+                row.status, row.last_ok_at = "active", now
+                if username:
+                    row.username = username
+            elif success:
+                row.status = "expired"
+            else:
+                return "unknown"
+        s.commit()
+        return "active" if logged_in else "expired"
+
+
+async def run_once() -> dict:
+    import asyncio
+    from ..fbauto_bridge import start_long_op, wait_profile_free
+
+    def _row():
+        with SyncSession() as s:
+            return s.execute(select(ThreadsAccount).order_by(ThreadsAccount.id)).scalars().first()
+    row = await asyncio.to_thread(_row)
+    plats = needs_check(row)
+    if not plats:
+        return {"skipped": "最近都確認過"}
+    done = []
+    for plat in plats:
+        busy = await wait_profile_free("meta", max_wait_sec=600, tag="[login-check]")
+        if busy is not None:
+            return {"skipped": f"瀏覽器被「{busy.op}」占著", "done": done}
+        op = "ig_check" if plat == "ig" else "threads_check"
+        module = "src.run_ig_post" if plat == "ig" else "src.run_threads_post"
+
+        def _on_done(result, _p=plat):
+            r = apply_check_result(_p, result.data or {}, bool(result.success))
+            print(f"[login-check] {_p}：{r}", flush=True)
+        try:
+            jid = start_long_op(op, module, ["--check", "--headless"], on_done=_on_done)
+        except RuntimeError as e:
+            return {"skipped": str(e), "done": done}
+        done.append(jid)
+        # 兩個平台同一個 profile，等這個跑完再下一個（最多等 5 分鐘）
+        for _ in range(30):
+            await asyncio.sleep(10)
+            if await wait_profile_free("meta", max_wait_sec=0) is None:
+                break
+    return {"jobs": done}
+
+
+async def _scheduled():
+    r = await run_once()
+    if r.get("skipped"):
+        print(f"[login-check] 略過：{r['skipped']}", flush=True)
+
+
+async def restore_meta_login_check():
+    scheduler.add_job(func=_scheduled, trigger=CronTrigger(hour=RUN_AT[0], minute=RUN_AT[1], timezone=TAIPEI),
+                      id="meta_login_check_daily", replace_existing=True)

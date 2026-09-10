@@ -1,0 +1,1223 @@
+"""資料庫模型"""
+import datetime
+from sqlalchemy import (
+    UniqueConstraint,
+    Column, Integer, String, Text, Boolean, DateTime, JSON, ForeignKey, create_engine, select, func
+)
+from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+
+from .config import settings, DATA_DIR
+
+_sync_url = settings.database_url.replace("sqlite+aiosqlite:///", "sqlite:///")
+sync_engine = create_engine(_sync_url, echo=False)
+async_engine = create_async_engine(settings.database_url, echo=False)
+
+async_session_factory = async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
+SyncSession = sessionmaker(sync_engine)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+# ─── FB 帳號 ───────────────────────────────────────────
+
+class Account(Base):
+    __tablename__ = "accounts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    password = Column(String(255), default="")
+    note = Column(String(500), default="")
+    two_factor_auth = Column(String(255), default="")  # 2FA 金鑰
+    cookie = Column(Text, default="")                    # Cookie 字串
+    proxy = Column(String(500), default="")              # Proxy 代理
+    user_agent = Column(Text, default="")                # 自訂 User-Agent
+    fb_version = Column(String(20), default="www")       # www / m / mbasic
+    device = Column(String(50), default="desktop")       # desktop / mobile
+
+    status = Column(String(20), default="active")        # active / limited / locked
+    fb_user_id = Column(String(100), default="")
+    fb_name = Column(String(255), default="")
+    # FB 首次綁定時間：新帳號養號期（前 N 天只養號不發文）就是從這裡起算。
+    # 新綁一個 FB 帳號馬上狂發，是最容易被判機器人／新帳號濫用的行為。
+    fb_bound_at = Column(DateTime, nullable=True)
+    # 強制解除養號期：養號期是保護機制不是死鎖，客戶明白風險後可強制提前發文。
+    # True 時發文閘門放行（但 UI 會標「風險自負」）。
+    grace_override = Column(Boolean, default=False)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    groups = relationship("Group", back_populates="account", cascade="all, delete-orphan")
+    tasks = relationship("PostTask", back_populates="account", cascade="all, delete-orphan")
+
+
+# ─── 社團 ──────────────────────────────────────────────
+
+class Group(Base):
+    __tablename__ = "groups"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    group_name = Column(String(500), nullable=False)
+    group_url = Column(String(500), nullable=False)
+    group_id = Column(String(100), default="")
+    member_count = Column(Integer, default=0)
+    can_post = Column(Boolean, default=True)
+    # 自動加入社團（P32）加進來的才有值。剛加入的社團 10 天內不發文——
+    # 新成員一進去就狂發是最快被踢、被檢舉的行為。手動加的社團為 None，不受限。
+    joined_at = Column(DateTime, nullable=True)
+    # 自動分類（老闆 2026-09-07）：一個社團可以同時是「買賣＋中古屋」，區域另存。
+    # 「非房產」＝名字裡沒有任何房地產線索（實測 697 個裡有 445 個是興趣社團）。
+    tags = Column(JSON, default=list)                  # 買賣／租賃／土地／中古屋／透天／大樓／預售／其他／非房產
+    region = Column(String(10), default="")            # 台中／台北／…（縣市）
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    account = relationship("Account", back_populates="groups")
+
+
+# ─── 文案模板 ──────────────────────────────────────────
+
+class Article(Base):
+    __tablename__ = "articles"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(500), default="")
+    content = Column(Text, nullable=False)
+    category = Column(String(100), default="general")  # general / shopping
+    image_paths = Column(JSON, default=list)            # 圖片路徑列表
+    link_url = Column(String(500), default="")
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
+# ─── 文案群組 ──────────────────────────────────────────
+
+class ArticleGroup(Base):
+    __tablename__ = "article_groups"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False)
+    article_ids = Column(JSON, default=list)  # [1, 3, 5] 引用 Article.id
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+# ─── 社團列表 (跨帳號共享) ─────────────────────────────
+
+class ClubList(Base):
+    __tablename__ = "club_lists"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False)
+    clubs = Column(JSON, default=list)  # [{"name": "...", "url": "..."}, ...]
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+# ─── 排程任務 ──────────────────────────────────────────
+
+class PostTask(Base):
+    __tablename__ = "post_tasks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    article_id = Column(Integer, ForeignKey("articles.id"), nullable=True)
+
+    # 任務類型: post / comment / share / join_group / nurture
+    task_type = Column(String(20), default="post")
+
+    # 目標社團 (JSON list of group URLs)
+    target_groups = Column(JSON, default=list)
+
+    # 排程設定
+    schedule_type = Column(String(20), default="immediate")  # immediate / once / cycle / weekly
+    schedule_time = Column(DateTime, nullable=True)           # 單次/下次執行時間
+    cycle_hours = Column(Integer, default=6)                  # 循環間隔(小時)
+    week_days = Column(JSON, default=list)                    # [0,1,2,3,4,5,6] 週幾
+    time_of_day = Column(String(10), default="02:00")         # HH:MM
+
+    # 進階設定
+    sleep_seconds = Column(Integer, default=90)               # 每篇間隔秒數
+    groups_per_run = Column(Integer, default=10)              # 每次發幾個社團
+    add_timestamp = Column(Boolean, default=False)             # 加入時間戳
+    add_sequence = Column(Boolean, default=False)              # 加入序號
+    sequence_start = Column(Integer, default=1)               # 序號起始
+    shuffle_groups = Column(Boolean, default=False)            # 亂數社團
+    screenshot = Column(Boolean, default=False)                # 自動截圖
+    headless = Column(Boolean, default=False)                  # 背景執行
+
+    # 狀態
+    status = Column(String(20), default="pending")            # pending / running / completed / stopped / error
+    progress = Column(Integer, default=0)                     # 進度 (已發數量)
+    total_count = Column(Integer, default=0)                  # 總社團數量
+    group_cursor = Column(Integer, default=0)                 # 社團輪替游標（cycle 續發用）
+    last_run = Column(DateTime, nullable=True)
+    next_run = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    account = relationship("Account", back_populates="tasks")
+
+
+# ─── 發文歷史記錄 ──────────────────────────────────────
+
+class PostHistory(Base):
+    __tablename__ = "post_history"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    task_id = Column(Integer, ForeignKey("post_tasks.id"), nullable=True)
+    group_name = Column(String(500), default="")
+    group_url = Column(String(500), default="")
+    post_url = Column(String(500), default="")
+    status = Column(String(20), default="success")  # success / failed / pending_review
+    like_count = Column(Integer, default=0)
+    comment_count = Column(Integer, default=0)
+    screenshot_path = Column(String(500), default="")
+    error_message = Column(Text, default="")
+    deleted = Column(Boolean, default=False)  # 該貼文是否已被「刪除舊貼文」移除
+    # 哪條排程發的：mp:<id>／gp:<id>（排程層級「幾天後自動刪文」靠這個對回去，老闆 2026-09-09）
+    origin = Column(String(40), default="")
+
+    post_time = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+# ─── 留言任務 ──────────────────────────────────────────
+
+class CommentTask(Base):
+    __tablename__ = "comment_tasks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    comment_type = Column(String(20), default="trending")   # trending / url
+    target_urls = Column(JSON, default=list)                # 指定貼文 URL 列表
+    comments_per_post = Column(Integer, default=3)
+    comment_content = Column(Text, default="")              # 留言內容模板
+    sleep_seconds = Column(Integer, default=60)
+
+    status = Column(String(20), default="pending")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+# ─── 執行紀錄（錯誤回報） ───────────────────────────────
+
+class RunLog(Base):
+    __tablename__ = "run_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
+    task_type = Column(String(50), default="post")  # post / marketplace / nurture / comment / delete
+    status = Column(String(20), default="running")   # running / success / failed / needs_manual
+    fbid = Column(String(100), default="")
+    screenshot_paths = Column(JSON, default=list)     # ["screenshot/xxx.png", ...]
+    result_json = Column(JSON, default=dict)          # 完整的 CLI result JSON
+    error_message = Column(Text, default="")
+    output_tail = Column(Text, default="")             # stdout/stderr 最後 2000 字
+    duration_sec = Column(Integer, default=0)
+    # 一句人話摘要：「上架〈大安區電梯三房〉，提交 12 個社團」。空字串＝前端走舊顯示
+    summary = Column(Text, default="")
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+# ─── P16 Marketplace 定時發文 ──────────────────────────
+
+class LegalInfo(Base):
+    """法定欄位（房仲法規強制），全域一份，每則貼文自動附加、AI 絕不修改。"""
+    __tablename__ = "legal_info"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    agent_name = Column(String(100), default="")     # 經紀人（保留，選填）
+    company = Column(String(200), default="")         # 公司（保留，選填）
+    license_no = Column(String(100), default="")      # 經紀業字號（保留，選填）
+    agent_phone = Column(String(50), default="")
+    # 營業員證號（老闆 2026-09-08：法定文案要有業務人員姓名、電話、營業員證號）。
+    # 經紀人員＝經紀人或營業員，兩種證號都填這欄；license_no 是公司的經紀業字號，別搞混。
+    agent_cert_no = Column(String(100), default="")
+    # 店名／品牌（例：有巢氏不動產 太平中山富盛店）與「加盟店」標示——
+    # 不動產經紀業管理條例要求加盟經營者在廣告明顯處標明「加盟店」或「加盟經營」字樣（老闆 2026-09-08 問法規）。
+    store_name = Column(String(200), default="")
+    is_franchise = Column(Boolean, default=False)
+    extra = Column(Text, default="")                  # 其他固定附加文字
+    footer_text = Column(Text, default="")            # 法定區塊純文字（貼整段，AI 絕不動）
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
+class Property(Base):
+    """物件案件（房產）。發送時自動變裝：輪替標題/內文、隨機圖片子集。"""
+    __tablename__ = "properties"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    name = Column(String(200), default="")            # 內部識別名（社區名等）
+    category = Column(String(50), default="其他商品")   # Marketplace 類別（分類廣告→其他商品）
+    # 買賣／租件（SPEC-P34，老闆 2026-09-08）：租件的價格是月租、文案寫法與 AI 指示都不同
+    deal_type = Column(String(10), default="sale")     # sale / rent
+    city = Column(String(20), default="")             # 上架縣市（帶進 FB Marketplace 地點）
+    condition = Column(String(20), default="new")     # new/likeNew/good/fair
+    price = Column(Integer, default=0)
+    base_content = Column(Text, default="")           # 使用者貼的基底文案（事實+賣點，數字鎖定）
+    title_facts = Column(JSON, default=dict)          # （保留）
+    titles = Column(JSON, default=list)               # 多版標題（AI 生成+人工確認，輪替用）
+    bodies = Column(JSON, default=list)               # 多版內文
+    image_pool = Column(JSON, default=list)           # 圖片路徑清單
+    cover_ids = Column(JSON, default=list)            # 3 張首頁候選（image_pool 的索引或路徑）
+    qr_image = Column(String(500), default="")        # LINE QR，選填
+    source_url = Column(String(1000), default="")     # 網址匯入的來源頁（判斷「已匯入過」用）
+    enabled = Column(Boolean, default=True)           # 上架開關：關掉＝退出排程輪替池（不影響已發出的刊登）
+    target_groups = Column(JSON, default=list)        # 社團名稱清單
+    groups_per_listing = Column(Integer, default=20)  # 每則轉發幾個社團
+    live_listings = Column(JSON, default=list)        # 目前 FB 上的商品 [{item_url, posted_at}]
+    last_posted_at = Column(DateTime, nullable=True)
+    post_count_total = Column(Integer, default=0)
+    # ── 合併 gp_listings（老闆 2026-09-06「直接改到好」）────────────────
+    # 兩張表的欄位本來就幾乎一樣，社團發文只多這兩個（發文間隔）。
+    sleep_min_sec = Column(Integer, default=60)       # 社團發文：兩則之間至少隔多久
+    sleep_max_sec = Column(Integer, default=180)
+    # 這間房要發去哪些通道：["mp"]／["gp"]／["mp","gp"]
+    channels = Column(JSON, default=lambda: ["mp"])
+    # ── 社團發文自己的那一份（gp_ 前綴），不跟 Marketplace 共用 ──
+    # 併表後第一版讓兩邊共用 target_groups 與 health_status，實際會互相踩：
+    #   ・Marketplace 的「轉發社團」和社團發文的「目標社團」是兩份不同語意的名單，
+    #     在任一頁改都會把另一頁的蓋掉；
+    #   ・社團發文連續卡審核 3 次 → health='problem' → Marketplace 的
+    #     eligible_property_ids_sync 也把這間房濾掉，明明 Marketplace 沒事。
+    # 所以行為相關的欄位各留一份。（設計檢查 2026-09-06）
+    gp_target_groups = Column(JSON, default=list)
+    gp_health_status = Column(String(10), default="ok")
+    gp_consecutive_review = Column(Integer, default=0)
+    gp_success_count = Column(Integer, default=0)
+    gp_review_count = Column(Integer, default=0)
+    gp_reject_count = Column(Integer, default=0)
+    gp_last_status = Column(String(20), default="")
+    gp_last_status_at = Column(DateTime, nullable=True)
+    # 從哪一筆 gp_listings 搬過來的（0＝本來就是 Marketplace 物件）。
+    # 留著是為了把舊的 gp_schedules.listing_ids 對映過來，也是回退的線索。
+    gp_legacy_id = Column(Integer, default=0, index=True)
+
+    title_cursor = Column(Integer, default=0)         # 標題輪替游標
+    body_cursor = Column(Integer, default=0)          # 內文輪替游標
+    cover_cursor = Column(Integer, default=0)         # 首頁輪替游標
+    # P18 健康度追蹤：連續卡審核/被拒 → 標記問題物件，排程自動跳過（省額度）
+    success_count = Column(Integer, default=0)
+    review_count = Column(Integer, default=0)         # 累計「審核中」次數
+    reject_count = Column(Integer, default=0)         # 累計「被拒」次數
+    consecutive_review = Column(Integer, default=0)   # 連續審核中（成功歸零）
+    health_status = Column(String(10), default="ok")  # ok / watch / problem
+    last_status = Column(String(20), default="")      # 最近一次發文結果
+    last_status_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class MarketplaceSchedule(Base):
+    """Marketplace 定時發文排程（輪替一組物件）。"""
+    __tablename__ = "marketplace_schedules"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    property_ids = Column(JSON, default=list)         # 要輪替發的物件池
+    extra_platforms = Column(JSON, default=list)      # P27：["threads","ig"] FB 發完順發
+    # 順發平台各自的每日上限 {"threads": 2, "ig": 1}（老闆 2026-09-08：數量分別制定）。
+    # 沒設（{} 或 0）＝跟著每場發、不另外限制。上限以「同帳號當天成功發出的則數」計，
+    # MP 與社團排程共用同一個額度——客戶心裡想的是「Threads 一天最多幾則」，不是每條排程各幾則。
+    extra_daily_cap = Column(JSON, default=dict)
+    # 同一張表單建出來的 MP＋社團兩條排程共用一個 bundle_id：清單顯示成一條、啟動停止刪除一起動
+    # （老闆 2026-09-08：「加入社團發文會變成另一個排程，且重複 IG、Threads」）
+    bundle_id = Column(String(32), default="")
+    # 順發平台各自「幾天後自動刪文」{"threads": 14, "ig": 30}；0／沒設＝不刪（老闆 2026-09-09）
+    extra_delete_days = Column(JSON, default=dict)
+    time_mode = Column(String(10), default="window")  # points（固定時間點）/ window（時間區段）；預設隨機（2026-09-07）
+    time_points = Column(JSON, default=list)          # ["09:00","13:00",...] 3-5 個
+    window_start = Column(String(5), default="09:00")
+    window_end = Column(String(5), default="21:00")
+    daily_count = Column(Integer, default=3)          # （相容）每天執行次數
+    daily_count_min = Column(Integer, default=0)      # 每天隨機次數下限（>0 則啟用範圍）
+    daily_count_max = Column(Integer, default=0)      # 每天隨機次數上限
+    random_delay = Column(Boolean, default=True)      # 固定點再加隨機偏移
+    batch_min_sec = Column(Integer, default=45)       # 社團補刊批次亂速下限
+    batch_max_sec = Column(Integer, default=120)
+    cooldown_min_sec = Column(Integer, default=300)   # 工作間冷卻 5-10 分鐘
+    cooldown_max_sec = Column(Integer, default=600)
+    headless = Column(Boolean, default=True)
+    dry_run = Column(Boolean, default=False)
+    auto_delete_days = Column(Integer, default=7)     # N 天後自動刪除 Marketplace 刊登（0=關閉）
+    status = Column(String(20), default="stopped")    # running / paused / stopped
+    next_run = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class GroupPreset(Base):
+    """社團群組預設：把一組可轉發社團名稱存起來，套用到物件時不用重選。"""
+    __tablename__ = "group_presets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), default="")
+    group_names = Column(JSON, default=list)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class GpListing(Base):
+    """社團發文「物件」— 與 Marketplace Property 完全分開（只共用帳號／社團資料）。"""
+    __tablename__ = "gp_listings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    name = Column(String(200), default="")
+    base_content = Column(Text, default="")
+    source_url = Column(String(1000), default="")  # 網址匯入的來源頁（判斷「已匯入過」用）
+    enabled = Column(Boolean, default=True)        # 上架開關：關掉＝退出排程輪替池
+    titles = Column(JSON, default=list)          # 多版標題
+    bodies = Column(JSON, default=list)          # 多版內文
+    image_pool = Column(JSON, default=list)      # 圖片路徑列表
+    target_groups = Column(JSON, default=list)   # 社團名稱列表
+    # 社團間間隔。原本 45-120 秒——連發 20 個社團等於一小時內打完，節奏太整齊
+    # 也太密集，是觸發垃圾訊息判定的主因之一。拉長並加大隨機幅度，讓每次的
+    # 總時長與間隔分布都不一樣（既有排程沿用自己存的值，只有新建的吃這個預設）。
+    sleep_min_sec = Column(Integer, default=180)
+    sleep_max_sec = Column(Integer, default=600)
+    success_count = Column(Integer, default=0)
+    review_count = Column(Integer, default=0)
+    reject_count = Column(Integer, default=0)
+    consecutive_review = Column(Integer, default=0)
+    health_status = Column(String(10), default="ok")  # ok / watch / problem
+    last_status = Column(String(20), default="")
+    last_status_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class GpGroupPreset(Base):
+    """社團發文專用群組預設（與 MP group_presets 分開）。"""
+    __tablename__ = "gp_group_presets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), default="")
+    group_names = Column(JSON, default=list)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class GpSchedule(Base):
+    """社團發文定時排程：逐社團直發（非轉發）。"""
+    __tablename__ = "gp_schedules"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    listing_ids = Column(JSON, default=list)
+    extra_platforms = Column(JSON, default=list)      # P27：["threads","ig"] FB 發完順發
+    # 順發平台各自的每日上限 {"threads": 2, "ig": 1}（老闆 2026-09-08：數量分別制定）。
+    # 沒設（{} 或 0）＝跟著每場發、不另外限制。上限以「同帳號當天成功發出的則數」計，
+    # MP 與社團排程共用同一個額度——客戶心裡想的是「Threads 一天最多幾則」，不是每條排程各幾則。
+    extra_daily_cap = Column(JSON, default=dict)
+    bundle_id = Column(String(32), default="")        # 與 MarketplaceSchedule.bundle_id 同義
+    extra_delete_days = Column(JSON, default=dict)    # 同 MarketplaceSchedule.extra_delete_days
+    time_mode = Column(String(10), default="window")  # points / window；預設隨機（2026-09-07）
+    time_points = Column(JSON, default=list)
+    window_start = Column(String(5), default="09:00")
+    window_end = Column(String(5), default="21:00")
+    daily_count = Column(Integer, default=3)
+    daily_count_min = Column(Integer, default=0)
+    daily_count_max = Column(Integer, default=0)
+    random_delay = Column(Boolean, default=True)
+    cooldown_min_sec = Column(Integer, default=300)
+    cooldown_max_sec = Column(Integer, default=600)
+    headless = Column(Boolean, default=True)
+    dry_run = Column(Boolean, default=False)
+    auto_delete_days = Column(Integer, default=0)  # 0=關閉刪文
+    groups_per_run = Column(Integer, default=0)    # 每次發文最多幾個社團（0=全部）
+    status = Column(String(20), default="stopped")  # running / stopped
+    next_run = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class DailyBudget(Base):
+    """每日發文額度（台北時間，午夜歸零）。上限：10 商品 / 50 總則（含轉發）。"""
+    __tablename__ = "daily_budget"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    date = Column(String(10), unique=True, index=True)  # YYYY-MM-DD (Asia/Taipei)
+    listings_used = Column(Integer, default=0)
+    posts_used = Column(Integer, default=0)             # 含轉發
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
+class ExposureDaily(Base):
+    """每天每平台發了幾篇、轉了幾個社團（老闆 2026-09-08：曝光要有本月與累積）。
+    發文紀錄一收尾就加一筆（exposure.bump_exposure），舊資料開機回填一次。"""
+    __tablename__ = "exposure_daily"
+    __table_args__ = (UniqueConstraint("date", "platform", name="uq_exposure_date_platform"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    date = Column(String(10), nullable=False, index=True)     # 台北 YYYY-MM-DD
+    platform = Column(String(10), nullable=False)            # fb / threads / ig
+    posts = Column(Integer, default=0)
+    shares = Column(Integer, default=0)
+
+
+class SystemState(Base):
+    """全域狀態（單列）：暫停旗標 + 原因，供儀表板紅橫幅。"""
+    __tablename__ = "system_state"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    paused = Column(Boolean, default=False)
+    pause_reason = Column(String(50), default="")      # cookie_expired / fb_protection / manual
+    pause_detail = Column(Text, default="")
+    paused_at = Column(DateTime, nullable=True)
+    # 新帳號養號期天數：FB 綁定後前 N 天只養號、不發文（0=關閉）。預設 5，建議 3-7。
+    nurture_grace_days = Column(Integer, default=7)       # 預設保守（老闆 2026-09-07）
+
+
+class Feedback(Base):
+    """客戶回饋：記錄操作頁面 + 前端日誌 + 人工輸入內容。"""
+    __tablename__ = "feedback"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    message = Column(Text, default="")                 # 使用者手動輸入
+    page = Column(String(200), default="")             # 當時頁面路徑
+    user_agent = Column(String(400), default="")
+    logs = Column(Text, default="")                    # 前端擷取的近期 console 日誌
+    meta_json = Column(JSON, default=dict)             # 其他脈絡（螢幕尺寸、時間等）
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class NurtureConfig(Base):
+    """自動養號設定（單帳號產品 → 實務上一列）。
+
+    老闆 2026-08-06：「養號需可填參數——時間長度 XX-XX 隨機、一日幾次、隨機時間」。
+    每天在 window 內隨機灑 N 個時間點（N 也在 min-max 內隨機），每次時長在
+    duration 區間內隨機取——三層隨機，行為才不會像鬧鐘一樣準時。
+    """
+    __tablename__ = "nurture_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    # 平台：fb / threads / ig（老闆 2026-09-02：三個平台都要有養號，設定收在各自帳號區）。
+    # Threads/IG 的登入不掛在 FB 帳號上，但單帳號產品用同一個 account_id 當 key 即可。
+    platform = Column(String(10), default="fb", index=True)
+    # 預設開啟（老闆 2026-08-10）：養號是保護帳號的機制，不是進階功能——
+    # 預設關掉等於多數客戶never開，反而更容易被 FB 盯上。既有客戶的設定不動。
+    enabled = Column(Boolean, default=True)               # 每日自動養號開關
+    daily_count_min = Column(Integer, default=1)          # 一日幾次（區間隨機）
+    daily_count_max = Column(Integer, default=2)
+    duration_min = Column(Integer, default=3)             # 每次時長（分鐘，區間隨機）
+    duration_max = Column(Integer, default=8)
+    window_start = Column(String(5), default="09:00")     # 允許執行時段
+    window_end = Column(String(5), default="22:00")
+    headless = Column(Boolean, default=True)              # 自動執行預設背景跑
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow,
+                        onupdate=datetime.datetime.utcnow)
+
+
+class PostDedup(Base):
+    """發文去重紀錄：同一文案 + 同一社團在 N 天內只發一次。
+
+    為什麼另開一張表而不是查 post_history：社團發文那條路徑只寫 RunLog、
+    不寫 PostHistory（見 api/group_post.py），兩條發文路徑的紀錄方式不一致。
+    這張表由兩條路徑共用，唯一的職責就是回答「這篇文案這個社團最近發過沒」。
+    """
+    __tablename__ = "post_dedup"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
+    group_key = Column(String(200), index=True)       # 社團 id（取不到才退回網址）
+    content_hash = Column(String(64), index=True)     # 正規化內文的 sha256
+    group_name = Column(String(500), default="")      # 只為了日誌好讀
+    posted_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+
+class ThreadsAccount(Base):
+    """Threads 連結狀態（P26）。真正的登入態在 FB_Auto 的 threads_profile
+    目錄裡，這張表只是給 UI 看的快取——兩者不同步時以 --check 實測為準回寫。
+    單帳號產品實務上只有一列；仍開表不用單例設定值，未來多帳號只加欄不改表。"""
+    __tablename__ = "threads_accounts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(255), default="")        # 不含 @
+    status = Column(String(20), default="active")     # active / expired
+    bound_at = Column(DateTime, nullable=True)        # 首次連結時間
+    last_ok_at = Column(DateTime, nullable=True)      # 最近一次確認登入有效
+    # IG 與 Threads 共用同一份登入 profile（同一 Meta 帳號），只是狀態各記各的
+    ig_username = Column(String(255), default="")
+    ig_status = Column(String(20), default="")        # '' / active / expired
+    ig_last_ok_at = Column(DateTime, nullable=True)
+    # P28 平台級暫停：被平台限制動作時停手一段時間，時間到自動恢復。
+    # 用「暫停到某時刻」而不是布林——限制通常是暫時的，用時間才能自己好，
+    # 不會因為客戶忘了解鎖，功能就這樣默默消失。
+    threads_blocked_until = Column(DateTime, nullable=True)
+    threads_block_reason = Column(String(255), default="")
+    threads_block_count = Column(Integer, default=0)   # 連續被限制次數 → 冷卻加倍
+    ig_blocked_until = Column(DateTime, nullable=True)
+    ig_block_reason = Column(String(255), default="")
+    ig_block_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow,
+                        onupdate=datetime.datetime.utcnow)
+
+
+class UserConsent(Base):
+    """同意紀錄（風險告知書／服務條款）。
+
+    契約效力靠的是「這個人、在這個時間、對這個版本、主動按下同意」——
+    所以版本與時間一定要留；文件改版時 legal.CONSENT_VERSION 跟著改，
+    舊紀錄自然對不上，系統就會再問一次。歷史紀錄只增不刪。
+    """
+    __tablename__ = "user_consents"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    doc_version = Column(String(32), nullable=False, index=True)
+    # 同意人自行輸入的姓名／公司：打字比勾選更接近簽名，舉證力較強
+    signer_name = Column(String(255), default="")
+    agreed_at = Column(DateTime, default=datetime.datetime.utcnow)
+    # 同意當下的軟體版本，便於還原當時看到的畫面
+    app_version = Column(String(32), default="")
+
+
+class ThreadsLead(Base):
+    """Threads 潛在客戶（SPEC-P29）：探索找到的帳號，追蹤前先進這張表。
+
+    探索與追蹤刻意分開——客戶要先看得到名單才決定追誰，而不是系統看了就追。
+    username 唯一：同一個人被不同關鍵字撈到只留一筆，我們要的是「人」。
+    """
+    __tablename__ = "threads_leads"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(255), unique=True, nullable=False, index=True)
+    post_url = Column(String(500), default="")
+    snippet = Column(String(500), default="")
+    posted_at = Column(String(64), default="")     # 平台給什麼就存什麼，不強解析
+    keyword = Column(String(100), default="")      # 是哪個關鍵字撈到的
+    # new＝待追蹤／followed＝已追蹤／skipped＝試過但沒成功／excluded＝客戶排除
+    status = Column(String(20), default="new", index=True)
+    followed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class ThreadsLeadConfig(Base):
+    """潛在客戶追蹤的設定（單例）。預設關閉——這是風險較高的動作類型，
+    必須由客戶主動打開，不能安裝完就自己開始追蹤別人。"""
+    __tablename__ = "threads_lead_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    enabled = Column(Boolean, default=False)
+    keywords = Column(String(500), default="自售,換屋,售屋,想賣房")
+    region = Column(String(50), default="")
+    daily_limit = Column(Integer, default=5)       # 預設保守；硬上限 20，見 run_threads_follow
+    window_start = Column(String(5), default="10:00")
+    window_end = Column(String(5), default="21:00")
+    last_run_date = Column(String(10), default="")  # YYYY-MM-DD，一天只跑一次
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow,
+                        onupdate=datetime.datetime.utcnow)
+
+
+class FriendConfig(Base):
+    """自動加好友設定（SPEC-P31），每平台一列：fb（送好友邀請）/ ig（追蹤）。
+    Threads 沿用 P29 的 threads_lead_config，不在這張表。
+
+    預設關（老闆定案 2026-09-02）：加好友是會被對方看到、會被平台算帳的動作，
+    跟只看不動的養號不同，必須由客戶自己打開。"""
+    __tablename__ = "friend_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    platform = Column(String(10), default="fb", index=True)
+    enabled = Column(Boolean, default=False)
+    daily_max = Column(Integer, default=2)                 # 預設保守；硬上限見 friend_runner.HARD_CAP
+    sources = Column(String(200), default="own_posts,pymk")  # 逗號分隔，順序＝優先序
+    hashtags = Column(String(300), default="台中買房,台中租屋")  # IG 用
+    like_probability = Column(Integer, default=20)         # 百分比；FB 20 / IG 30
+    window_start = Column(String(5), default="10:00")
+    window_end = Column(String(5), default="21:00")
+    last_run_date = Column(String(10), default="")         # YYYY-MM-DD，一天只跑一輪
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow,
+                        onupdate=datetime.datetime.utcnow)
+
+
+class FriendAction(Base):
+    """加好友／追蹤過誰（SPEC-P31）。(platform, target_key) 唯一——同一個人永遠只邀一次。"""
+    __tablename__ = "friend_actions"
+    __table_args__ = (UniqueConstraint("platform", "target_key", name="uq_friend_target"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    platform = Column(String(10), nullable=False, index=True)
+    target_key = Column(String(200), nullable=False)
+    target_name = Column(String(200), default="")
+    target_url = Column(String(500), default="")
+    source = Column(String(30), default="")                # own_posts / pymk / hashtags / search
+    action = Column(String(10), default="request")         # request（FB）/ follow（IG/Threads）
+    liked = Column(Boolean, default=False)
+    status = Column(String(12), default="sent")            # sent / existing / pending / failed
+    run_log_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+
+class CleanupConfig(Base):
+    """自動刪文——備份模式（SPEC-P32），每平台一列。
+
+    跟「發文後 N 天自動刪除」不同：那套靠我們自己的發文紀錄找貼文，紀錄不見就管不到。
+    這套不看紀錄，直接掃平台上「超過 N 天的自己貼文」，當第二道保險。"""
+    __tablename__ = "cleanup_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    platform = Column(String(10), default="fb", index=True)
+    enabled = Column(Boolean, default=True)          # 預設開（老闆 2026-09-02）
+    older_than_days = Column(Integer, default=30)    # 最少 7，見 cleanup_runner
+    max_per_run = Column(Integer, default=20)
+    window_start = Column(String(5), default="02:00")
+    window_end = Column(String(5), default="06:00")  # 夜深人靜再刪，不跟發文搶瀏覽器
+    last_run_date = Column(String(10), default="")
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow,
+                        onupdate=datetime.datetime.utcnow)
+
+
+class GroupJoinConfig(Base):
+    """FB 自動加入社團（SPEC-P32）。單例（單帳號產品）。
+
+    預設關：加入社團是 FB 對帳號最敏感的行為之一，額度比加好友還保守。"""
+    __tablename__ = "group_join_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    enabled = Column(Boolean, default=False)
+    keywords = Column(String(300), default="")       # 最多 3 個，逗號分隔
+    daily_max = Column(Integer, default=1)           # 預設保守；硬上限 3
+    weekly_max = Column(Integer, default=10)
+    window_start = Column(String(5), default="10:00")
+    window_end = Column(String(5), default="21:00")
+    last_run_date = Column(String(10), default="")
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow,
+                        onupdate=datetime.datetime.utcnow)
+
+
+class GroupJoinCandidate(Base):
+    """待加入社團候選名單（SPEC-P32）。依成員數由大到小排，人數多的優先加。"""
+    __tablename__ = "group_join_candidates"
+    __table_args__ = (UniqueConstraint("group_url", name="uq_group_join_url"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    group_url = Column(String(500), nullable=False)
+    name = Column(String(300), default="")
+    members = Column(Integer, default=0)
+    privacy = Column(String(10), default="")         # 公開 / 私密
+    source = Column(String(20), default="keyword")   # keyword / list
+    keyword = Column(String(100), default="")
+    # new/joined/requested/question/existing/failed/excluded
+    status = Column(String(12), default="new", index=True)
+    note = Column(String(300), default="")
+    joined_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+
+class SourceStore(Base):
+    """同店家物件清單的快取（老闆定調 2026-09-02：清單要常態可勾選，
+    只有使用者按「更新」才去打樂屋，且 3 天內最多 2 次，別造成別人伺服器負擔）。
+
+    一列＝一個店鋪頁。items 是整份清單（含標題/地址/價格/格局/坪數），
+    refresh_log 記每次真的去打過樂屋的時間，額度用它算。
+    """
+    __tablename__ = "source_stores"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    store_url = Column(String(500), unique=True, nullable=False, index=True)
+    store_name = Column(String(300), default="")
+    seed_url = Column(String(1000), default="")       # 使用者當初貼的那個物件網址
+    items = Column(JSON, default=list)
+    truncated = Column(Boolean, default=False)
+    fetched_at = Column(DateTime, nullable=True)
+    refresh_log = Column(JSON, default=list)          # ISO 時間字串清單，只留最近幾筆
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+def _ensure_columns():
+    """SQLite 無 migration 工具：對既有表補上新增欄位（欄位已存在則略過）。冪等。"""
+    from sqlalchemy import text
+    # (table, column, DDL 型別與預設)
+    additions = [
+        ("post_tasks", "group_cursor", "INTEGER DEFAULT 0"),
+        # P32 自動加入社團：剛加入的社團 10 天內不發文
+        ("groups", "joined_at", "DATETIME"),
+        ("run_logs", "summary", "TEXT DEFAULT ''"),
+        ("legal_info", "agent_cert_no", "TEXT DEFAULT ''"),
+        ("legal_info", "store_name", "TEXT DEFAULT ''"),
+        ("legal_info", "is_franchise", "BOOLEAN DEFAULT 0"),
+        ("nurture_config", "platform", "VARCHAR(10) DEFAULT 'fb'"),
+        # P27 多平台發送
+        ("marketplace_schedules", "extra_platforms", "JSON DEFAULT '[]'"),
+        ("gp_schedules", "extra_platforms", "JSON DEFAULT '[]'"),
+        # 順發平台各自的每日上限（老闆 2026-09-08）
+        ("marketplace_schedules", "extra_daily_cap", "JSON DEFAULT '{}'"),
+        ("gp_schedules", "extra_daily_cap", "JSON DEFAULT '{}'"),
+        ("marketplace_schedules", "bundle_id", "TEXT DEFAULT ''"),
+        ("gp_schedules", "bundle_id", "TEXT DEFAULT ''"),
+        ("marketplace_schedules", "extra_delete_days", "JSON DEFAULT '{}'"),
+        ("gp_schedules", "extra_delete_days", "JSON DEFAULT '{}'"),
+        ("post_history", "origin", "TEXT DEFAULT ''"),
+        ("threads_accounts", "ig_username", "TEXT DEFAULT ''"),
+        ("threads_accounts", "ig_status", "TEXT DEFAULT ''"),
+        ("threads_accounts", "ig_last_ok_at", "DATETIME"),
+        ("threads_accounts", "threads_blocked_until", "DATETIME"),
+        ("threads_accounts", "threads_block_reason", "TEXT DEFAULT ''"),
+        ("threads_accounts", "threads_block_count", "INTEGER DEFAULT 0"),
+        ("threads_accounts", "ig_blocked_until", "DATETIME"),
+        ("threads_accounts", "ig_block_reason", "TEXT DEFAULT ''"),
+        ("threads_accounts", "ig_block_count", "INTEGER DEFAULT 0"),
+        ("post_history", "deleted", "BOOLEAN DEFAULT 0"),
+        ("legal_info", "footer_text", "TEXT DEFAULT ''"),
+        ("properties", "base_content", "TEXT DEFAULT ''"),
+        ("properties", "condition", "VARCHAR(20) DEFAULT 'new'"),
+        ("properties", "city", "VARCHAR(20) DEFAULT ''"),
+        ("marketplace_schedules", "daily_count_min", "INTEGER DEFAULT 0"),
+        ("marketplace_schedules", "daily_count_max", "INTEGER DEFAULT 0"),
+        ("marketplace_schedules", "auto_delete_days", "INTEGER DEFAULT 7"),
+        ("properties", "success_count", "INTEGER DEFAULT 0"),
+        ("properties", "review_count", "INTEGER DEFAULT 0"),
+        ("properties", "reject_count", "INTEGER DEFAULT 0"),
+        ("properties", "consecutive_review", "INTEGER DEFAULT 0"),
+        ("properties", "health_status", "VARCHAR(10) DEFAULT 'ok'"),
+        ("properties", "last_status", "VARCHAR(20) DEFAULT ''"),
+        ("properties", "last_status_at", "DATETIME"),
+        ("gp_schedules", "groups_per_run", "INTEGER DEFAULT 0"),
+        ("accounts", "fb_bound_at", "DATETIME"),
+        ("accounts", "grace_override", "BOOLEAN DEFAULT 0"),
+        ("system_state", "nurture_grace_days", "INTEGER DEFAULT 7"),
+        ("properties", "source_url", "VARCHAR(1000) DEFAULT ''"),
+        ("gp_listings", "source_url", "VARCHAR(1000) DEFAULT ''"),
+        ("properties", "enabled", "BOOLEAN DEFAULT 1"),
+        ("gp_listings", "enabled", "BOOLEAN DEFAULT 1"),
+        # 合併 gp_listings 用（2026-09-06）。gp_listings 本身不刪，留著回退。
+        ("properties", "sleep_min_sec", "INTEGER DEFAULT 60"),
+        ("properties", "sleep_max_sec", "INTEGER DEFAULT 180"),
+        ("properties", "channels", "TEXT DEFAULT \'[\"mp\"]\'"),
+        ("properties", "deal_type", "TEXT DEFAULT 'sale'"),
+        ("properties", "gp_legacy_id", "INTEGER DEFAULT 0"),
+        # 社團發文自己的名單與健康度（設計檢查 2026-09-06）
+        ("properties", "gp_target_groups", "TEXT DEFAULT '[]'"),
+        ("properties", "gp_health_status", "VARCHAR(10) DEFAULT 'ok'"),
+        ("properties", "gp_consecutive_review", "INTEGER DEFAULT 0"),
+        ("properties", "gp_success_count", "INTEGER DEFAULT 0"),
+        ("properties", "gp_review_count", "INTEGER DEFAULT 0"),
+        ("properties", "gp_reject_count", "INTEGER DEFAULT 0"),
+        ("properties", "gp_last_status", "VARCHAR(20) DEFAULT ''"),
+        ("properties", "gp_last_status_at", "DATETIME"),
+        # 社團自動分類（2026-09-07）
+        ("groups", "tags", "TEXT DEFAULT '[]'"),
+        ("groups", "region", "VARCHAR(10) DEFAULT ''"),
+    ]
+    with sync_engine.begin() as conn:
+        for table, column, ddl in additions:
+            cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+            if column not in cols:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+
+
+def _copy_gp_state(g, target) -> None:
+    """把 gp_listings 那一筆的名單與健康度搬進 Property 的 gp_* 欄位。"""
+    target.gp_target_groups = list(g.target_groups or [])
+    target.gp_health_status = g.health_status or "ok"
+    target.gp_consecutive_review = g.consecutive_review or 0
+    target.gp_success_count = g.success_count or 0
+    target.gp_review_count = g.review_count or 0
+    target.gp_reject_count = g.reject_count or 0
+    target.gp_last_status = g.last_status or ""
+    target.gp_last_status_at = g.last_status_at
+
+
+def merge_gp_listings_into_properties() -> dict:
+    """把 gp_listings 併進 properties（老闆 2026-09-06「直接改到好」）。
+
+    冪等：靠 properties.gp_legacy_id 記住哪一筆已經搬過，重跑不會重複建。
+    **gp_listings 一列都不刪**——出事時它就是回退的依據。
+
+    配對規則跟畫面那一版一致：有來源網址就比網址（最可靠），
+    沒有就比「同帳號＋同名稱」。配到就把 gp 併進那間房的 channels，
+    配不到就新建一筆 channels=["gp"] 的 Property。
+
+    最後把 gp_schedules.listing_ids 從舊的 gp_listings.id 換成新的
+    properties.id——漏掉這步，客戶的社團發文排程會全部指到不存在的物件。
+    """
+    moved = linked = created = sched = 0
+    with SyncSession() as session:
+        listings = session.execute(select(GpListing)).scalars().all()
+        if not listings:
+            return {"moved": 0, "linked": 0, "created": 0, "schedules": 0}
+
+        props = session.execute(select(Property)).scalars().all()
+        done = {p.gp_legacy_id for p in props if p.gp_legacy_id}
+        id_map: dict[int, int] = {p.gp_legacy_id: p.id for p in props if p.gp_legacy_id}
+
+        def _key(x):
+            return (x.source_url or "").strip() or (x.name or "").strip()
+
+        by_url = {(p.source_url or "").strip(): p for p in props if (p.source_url or "").strip()}
+        by_name = {(p.account_id, (p.name or "").strip()): p for p in props}
+
+        by_legacy = {p.gp_legacy_id: p for p in props if p.gp_legacy_id}
+        for g in listings:
+            if g.id in done:                      # 這筆已經搬過
+                # gp_* 欄位是後來才加的（設計檢查 2026-09-06）：先前搬過的那幾筆
+                # 這些欄位還是空白，從還留著的 gp_listings 補一次。只在「全是預設值」
+                # 時補——社團發文一旦真的跑過，計數就不是 0，不能被舊資料蓋回去。
+                t = by_legacy.get(g.id)
+                if t is not None and not (t.gp_target_groups or []) and (t.gp_health_status or "ok") == "ok" \
+                        and not (t.gp_success_count or t.gp_review_count or t.gp_reject_count) \
+                        and not (t.gp_last_status or ""):
+                    _copy_gp_state(g, t)
+                continue
+            key = _key(g)
+            target = by_url.get(key) if (g.source_url or "").strip() else \
+                by_name.get((g.account_id, key))
+            if target is not None:
+                chans = list(target.channels or ["mp"])
+                if "gp" not in chans:
+                    chans.append("gp")
+                target.channels = chans
+                target.sleep_min_sec = g.sleep_min_sec or target.sleep_min_sec
+                target.sleep_max_sec = g.sleep_max_sec or target.sleep_max_sec
+                _copy_gp_state(g, target)          # 社團那份進 gp_*，MP 的一個都不碰
+                target.gp_legacy_id = g.id
+                id_map[g.id] = target.id
+                linked += 1
+            else:
+                row = Property(
+                    account_id=g.account_id, name=g.name, base_content=g.base_content,
+                    titles=list(g.titles or []), bodies=list(g.bodies or []),
+                    image_pool=list(g.image_pool or []),
+                    cover_ids=list(g.image_pool or [])[:3],
+                    source_url=g.source_url or "", enabled=bool(g.enabled),
+                    sleep_min_sec=g.sleep_min_sec or 60, sleep_max_sec=g.sleep_max_sec or 180,
+                    channels=["gp"], gp_legacy_id=g.id,
+                )
+                _copy_gp_state(g, row)
+                session.add(row)
+                session.flush()                   # 要拿到 id 給排程對映
+                id_map[g.id] = row.id
+                created += 1
+            moved += 1
+
+        # 舊排程指向的是 gp_listings.id，換成對應的 properties.id
+        for sc in session.execute(select(GpSchedule)).scalars().all():
+            old_ids = list(sc.listing_ids or [])
+            new_ids = [id_map.get(i, i) for i in old_ids]
+            if new_ids != old_ids:
+                sc.listing_ids = new_ids
+                sched += 1
+
+        session.commit()
+    return {"moved": moved, "linked": linked, "created": created, "schedules": sched}
+
+
+def migrate_plaintext_passwords():
+    """把 accounts.password 中無 enc: 前綴的明文就地加密。冪等。"""
+    from .crypto import encrypt_secret, is_encrypted
+    with SyncSession() as session:
+        accounts = session.execute(select(Account)).scalars().all()
+        changed = 0
+        for acc in accounts:
+            if acc.password and not is_encrypted(acc.password):
+                acc.password = encrypt_secret(acc.password)
+                changed += 1
+        if changed:
+            session.commit()
+        return changed
+
+
+def init_db():
+    """初始化資料庫表格"""
+    Base.metadata.create_all(sync_engine)
+    _ensure_columns()
+
+
+async def get_session() -> AsyncSession:
+    async with async_session_factory() as session:
+        yield session
+
+
+# ─── P16 每日預算 / 全域狀態 helper（台北時間） ─────────
+import zoneinfo
+
+try:
+    TAIPEI = zoneinfo.ZoneInfo("Asia/Taipei")
+except zoneinfo.ZoneInfoNotFoundError:
+    # Windows 嵌入式 Python 若缺 tzdata，ZoneInfo 會在 import 時崩 → 後端起不來
+    # → Next.js「failed to proxy http://127.0.0.1:13081/...」。台北無 DST，用固定 +08 退路。
+    TAIPEI = datetime.timezone(datetime.timedelta(hours=8))
+# 基礎每日上限；帳號暖機每週 +5% 放量，封頂 200（見 current_limits_sync）
+BASE_LISTINGS_PER_DAY = 10
+BASE_POSTS_PER_DAY = 50
+RAMP_STEP = 0.05                 # 每升一級 +5%
+RAMP_DAYS_PER_LEVEL = 7          # 每累積 7 個「達標天」升一級
+RAMP_MAX = 200                   # 上限封頂
+# 相容舊 import（現以動態 current_limits_sync 為準）
+MAX_LISTINGS_PER_DAY = BASE_LISTINGS_PER_DAY
+MAX_POSTS_PER_DAY = BASE_POSTS_PER_DAY
+
+
+def today_taipei() -> str:
+    return datetime.datetime.now(TAIPEI).strftime("%Y-%m-%d")
+
+
+def now_taipei() -> datetime.datetime:
+    """現在時間（帶台北時區）。排程比較時間一律用這支，避免 naive/aware 混用。"""
+    return datetime.datetime.now(TAIPEI)
+
+
+def as_taipei(dt: datetime.datetime) -> datetime.datetime:
+    """把 naive datetime 視為台北時間補上時區；已有時區則原樣返回。
+
+    plan_daily_times 產出的是 naive datetime，與 now_taipei() 相比會拋
+    「can't compare offset-naive and offset-aware datetimes」，務必先過這支。
+    """
+    return dt if dt.tzinfo else dt.replace(tzinfo=TAIPEI)
+
+
+def ramp_state_sync() -> dict:
+    """暖機放量：只有「當日發文達到當時上限」的天數才算數，每累積 7 個達標天升一級(+5%)。
+    沒發到上限的日子不計。回傳 {level, listings_max, posts_max, met_days, to_next}。"""
+    with SyncSession() as s:
+        rows = s.execute(select(DailyBudget).order_by(DailyBudget.date.asc())).scalars().all()
+    level = 0
+    met_since = 0           # 本級已累積的達標天
+    total_met = 0
+    for b in rows:
+        pm = min(RAMP_MAX, round(BASE_POSTS_PER_DAY * (1 + RAMP_STEP) ** level))
+        lm = min(RAMP_MAX, round(BASE_LISTINGS_PER_DAY * (1 + RAMP_STEP) ** level))
+        reached = (b.posts_used or 0) >= pm or (b.listings_used or 0) >= lm
+        if reached:
+            met_since += 1
+            total_met += 1
+            if met_since >= RAMP_DAYS_PER_LEVEL:
+                level += 1
+                met_since = 0
+    lm = min(RAMP_MAX, round(BASE_LISTINGS_PER_DAY * (1 + RAMP_STEP) ** level))
+    pm = min(RAMP_MAX, round(BASE_POSTS_PER_DAY * (1 + RAMP_STEP) ** level))
+    return {"level": level, "listings_max": lm, "posts_max": pm,
+            "met_days": total_met, "to_next": max(0, RAMP_DAYS_PER_LEVEL - met_since)}
+
+
+def current_limits_sync() -> tuple[int, int]:
+    """回傳目前動態每日上限 (listings_max, posts_max)。"""
+    st = ramp_state_sync()
+    return st["listings_max"], st["posts_max"]
+
+
+def get_daily_budget_sync() -> tuple[int, int]:
+    """回傳今日 (listings_used, posts_used)。無則建立。"""
+    d = today_taipei()
+    with SyncSession() as s:
+        b = s.execute(select(DailyBudget).where(DailyBudget.date == d)).scalar_one_or_none()
+        if not b:
+            b = DailyBudget(date=d, listings_used=0, posts_used=0)
+            s.add(b)
+            s.commit()
+            s.refresh(b)
+        return b.listings_used, b.posts_used
+
+
+def budget_remaining_sync() -> tuple[int, int]:
+    """回傳今日剩餘 (listings, posts)。上限依暖機週數動態放量。
+    SaaS：若有雲端聚合快照（同 license 跨機器總量），剩餘取本地與雲端的較小值，
+    防一把 key 多台機器各自吃滿本地額度。"""
+    lu, pu = get_daily_budget_sync()
+    lm, pm = current_limits_sync()
+    rem_l, rem_p = max(0, lm - lu), max(0, pm - pu)
+    try:
+        from .cloud_client import cloud_usage_snapshot
+        snap = cloud_usage_snapshot()
+    except Exception:
+        snap = None
+    if snap:
+        caps = snap.get("caps") or {}
+        if caps.get("listings"):
+            rem_l = min(rem_l, max(0, caps["listings"] - (snap.get("listings") or 0)))
+        if caps.get("posts"):
+            rem_p = min(rem_p, max(0, caps["posts"] - (snap.get("posts") or 0)))
+    return rem_l, rem_p
+
+
+def add_daily_usage_sync(listings: int = 0, posts: int = 0):
+    d = today_taipei()
+    with SyncSession() as s:
+        b = s.execute(select(DailyBudget).where(DailyBudget.date == d)).scalar_one_or_none()
+        if not b:
+            b = DailyBudget(date=d, listings_used=0, posts_used=0)
+            s.add(b)
+        b.listings_used += listings
+        b.posts_used += posts
+        s.commit()
+    # SaaS：背景回報雲端聚合（best-effort，不阻塞發文流程、失敗靜默）
+    import threading
+    from .cloud_client import report_usage
+    threading.Thread(target=report_usage, kwargs={"listings": listings, "posts": posts},
+                     daemon=True).start()
+
+
+# ── P18 物件健康度 ────────────────────────────────────
+REVIEW_TO_PROBLEM = 5   # 連續審核中達此次數 → 問題物件（排程跳過）
+REVIEW_TO_WATCH = 3     # 連續審核中達此次數 → 觀察（僅提示）
+
+
+def _classify_post_status(status_text: str, error_text: str = "") -> str:
+    """把發文結果歸類為 success / review / reject / other（技術失敗）。"""
+    st = status_text or ""
+    blob = f"{st} {error_text or ''}".lower()
+    for kw in ("拒絕", "被拒", "違反", "已移除", "rejected", "removed", "policy"):
+        if kw.lower() in blob:
+            return "reject"
+    for kw in ("成功", "已上架", "上架成功", "published", "active", "live"):
+        if kw in st:
+            return "success"
+    for kw in ("審核", "無法確認", "pending", "review"):
+        if kw.lower() in blob:
+            return "review"
+    return "other"
+
+
+def update_property_health_sync(prop_id: int, status_text: str, error_text: str = "") -> str:
+    """依發文結果更新物件健康度。回傳歸類（success/review/reject/other）。
+    problem 一旦標記，只有 reset_property_health_sync 能解除（手動恢復）。"""
+    cls = _classify_post_status(status_text, error_text)
+    with SyncSession() as s:
+        p = s.get(Property, prop_id)
+        if not p:
+            return cls
+        p.last_status = (status_text or "")[:20]
+        p.last_status_at = datetime.datetime.utcnow()
+        if cls == "success":
+            p.success_count = (p.success_count or 0) + 1
+            p.consecutive_review = 0
+            if p.health_status != "problem":
+                p.health_status = "ok"
+        elif cls == "review":
+            p.review_count = (p.review_count or 0) + 1
+            p.consecutive_review = (p.consecutive_review or 0) + 1
+            if p.health_status != "problem":
+                if p.consecutive_review >= REVIEW_TO_PROBLEM:
+                    p.health_status = "problem"
+                elif p.consecutive_review >= REVIEW_TO_WATCH:
+                    p.health_status = "watch"
+        elif cls == "reject":
+            p.reject_count = (p.reject_count or 0) + 1
+            p.consecutive_review = 0
+            p.health_status = "problem"
+        # other（技術失敗/timeout）：只記 last_status，不動計數與健康度
+        s.commit()
+    return cls
+
+
+def week_post_counts_sync(task_type: str) -> tuple[int, int]:
+    """(近 7 天成功發文數, 再往前 7 天的數)。給頂部狀態列的「本週已發 vs 上週」。
+
+    needs_manual 也算發出去了——貼文本身成功，只是收尾要人工。
+    """
+    now = datetime.datetime.utcnow()
+    week_ago = now - datetime.timedelta(days=7)
+    two_weeks_ago = now - datetime.timedelta(days=14)
+    ok = ("success", "needs_manual")
+    with SyncSession() as s:
+        week = s.execute(
+            select(func.count(RunLog.id)).where(
+                RunLog.task_type == task_type, RunLog.status.in_(ok),
+                RunLog.created_at >= week_ago)
+        ).scalar() or 0
+        prev = s.execute(
+            select(func.count(RunLog.id)).where(
+                RunLog.task_type == task_type, RunLog.status.in_(ok),
+                RunLog.created_at >= two_weeks_ago, RunLog.created_at < week_ago)
+        ).scalar() or 0
+    return int(week), int(prev)
+
+
+def is_postable(row) -> bool:
+    """這個物件現在能不能發：使用者沒關掉，而且健康度不是 problem。
+
+    Marketplace 物件與社團發文物件的欄位同名，共用同一個判斷——
+    分成兩份寫，遲早只會改到其中一邊。
+
+    enabled 是 None 時當成「可以發」：加欄位之前就存在的列可能沒有值，
+    把 None 當成關閉會讓客戶的排程無聲停擺。
+    """
+    enabled = getattr(row, "enabled", None)
+    if enabled is not None and not enabled:
+        return False
+    return (getattr(row, "health_status", "ok") or "ok") != "problem"
+
+
+def eligible_property_ids_sync(ids: list[int]) -> list[int]:
+    """從給定物件池濾掉「被關掉的」與 health_status='problem' 的，回傳可發送的 id。"""
+    if not ids:
+        return []
+    with SyncSession() as s:
+        rows = s.execute(select(Property).where(Property.id.in_(ids))).scalars().all()
+        return [p.id for p in rows if is_postable(p)]
+
+
+def reset_property_health_sync(prop_id: int) -> bool:
+    """手動重新啟用問題物件：清計數、健康度回 ok。"""
+    with SyncSession() as s:
+        p = s.get(Property, prop_id)
+        if not p:
+            return False
+        p.success_count = p.review_count = p.reject_count = p.consecutive_review = 0
+        p.health_status = "ok"
+        p.last_status = ""
+        s.commit()
+        return True
+
+
+def problem_property_count_sync() -> int:
+    with SyncSession() as s:
+        return len(s.execute(select(Property.id).where(Property.health_status == "problem")).scalars().all())
+
+
+def get_system_state_sync() -> SystemState:
+    with SyncSession() as s:
+        st = s.execute(select(SystemState)).scalars().first()
+        if not st:
+            st = SystemState(paused=False)
+            s.add(st)
+            s.commit()
+            s.refresh(st)
+        # 攤平成純資料，避免 detached
+        return {"paused": st.paused, "pause_reason": st.pause_reason,
+                "pause_detail": st.pause_detail,
+                "paused_at": st.paused_at.isoformat() if st.paused_at else None,
+                "nurture_grace_days": st.nurture_grace_days if st.nurture_grace_days is not None else 7}
+
+
+def nurture_grace_days_sync() -> int:
+    """目前設定的新帳號養號期天數（0=關閉）。"""
+    with SyncSession() as s:
+        st = s.execute(select(SystemState)).scalars().first()
+        return (st.nurture_grace_days if st and st.nurture_grace_days is not None else 7)
+
+
+def posting_grace_remaining_sync(fb_bound_at) -> int:
+    """這個帳號的養號期還剩幾天不能發文；0 = 已可發文。
+
+    fb_bound_at 為 None（舊帳號、綁定時間不明）→ 視為已過養號期，回 0，
+    不影響既有客戶。
+    """
+    if fb_bound_at is None:
+        return 0
+    grace = nurture_grace_days_sync()
+    if grace <= 0:
+        return 0
+    elapsed = (datetime.datetime.utcnow() - fb_bound_at).total_seconds() / 86400
+    remaining = grace - elapsed
+    return int(remaining) + (1 if remaining > int(remaining) else 0) if remaining > 0 else 0
+
+
+def set_system_pause_sync(paused: bool, reason: str = "", detail: str = ""):
+    with SyncSession() as s:
+        st = s.execute(select(SystemState)).scalars().first()
+        if not st:
+            st = SystemState()
+            s.add(st)
+        st.paused = paused
+        st.pause_reason = reason if paused else ""
+        st.pause_detail = detail if paused else ""
+        st.paused_at = datetime.datetime.utcnow() if paused else None
+        s.commit()
