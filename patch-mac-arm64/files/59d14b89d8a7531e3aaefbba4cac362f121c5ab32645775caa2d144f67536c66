@@ -1,0 +1,219 @@
+"""曝光量：每天每平台「發了幾篇、轉了幾個社團」的累計表，供首頁看今天／本月／累積。
+
+老闆 2026-09-08：「曝光數量應該都是以月紀錄、以及累積曝光數量」。
+只從 RunLog 現算有兩個問題：舊紀錄會被清、每次首頁都要把所有紀錄的 result_json 拆開算。
+所以另開一張小表 exposure_daily（日期×平台），發文紀錄一收尾就加一筆；舊資料開機時回填一次。
+"""
+from __future__ import annotations
+
+import datetime
+
+try:
+    from zoneinfo import ZoneInfo
+    TAIPEI = ZoneInfo("Asia/Taipei")
+except Exception:                                    # pragma: no cover
+    TAIPEI = datetime.timezone(datetime.timedelta(hours=8))
+
+PLATFORMS = ("fb", "threads", "ig")
+
+# RunLog.task_type → 平台。沒列到的（import_url、sync_groups…）不算任何平台。
+PLATFORM_OF = {
+    "marketplace": "fb", "group_post": "fb", "post": "fb", "mp_cleanup": "fb", "cleanup_fb": "fb",
+    "friend_fb": "fb", "gjoin_search": "fb", "gjoin_join": "fb", "nurture": "fb",
+    # delete＝run_delete_posts（卡片上的「刪文」）、comment＝熱門貼文留言，兩個都是 FB 動作，
+    # 之前漏了，FB 卡的「最近一次」會跳過它們去顯示更舊的紀錄。
+    "delete": "fb", "comment": "fb", "delete_mp": "fb", "delete_marketplace": "fb",
+    "threads_post": "threads", "leads_search": "threads", "leads_follow": "threads",
+    "cleanup_threads": "threads", "nurture_threads": "threads", "threads_check": "threads",
+    "threads_login": "threads", "threads_open": "threads",
+    "ig_post": "ig", "friend_ig": "ig", "cleanup_ig": "ig", "nurture_ig": "ig", "ig_check": "ig",
+    "ig_open": "ig",
+}
+# 「發文」只算真的把東西發出去的那幾種
+POST_TYPES = {"marketplace", "group_post", "post", "threads_post", "ig_post"}
+
+
+def platform_of(task_type: str) -> str:
+    return PLATFORM_OF.get(task_type or "", "")
+
+
+def shares_in_log(result_json) -> int:
+    """一筆 Marketplace 紀錄轉發了幾個社團：對象頁勾的＋「在更多地方上架」補刊的。
+    老闆 2026-09-08：曝光量要含轉發，不然一篇商品轉 20 個社團只算 1 看起來很虛。"""
+    d = result_json if isinstance(result_json, dict) else {}
+    if not d:
+        return 0
+    data = d.get("data") if isinstance(d.get("data"), dict) else {}
+    src = data if data else d
+    n = src.get("audience_selected")
+    if n is None:
+        n = src.get("groups_submitted")
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        n = 0
+    for b in src.get("extra_listed") or []:
+        try:
+            n += int((b or {}).get("selected") or 0)
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return max(0, n)
+
+
+def taipei_date(created_at_utc: datetime.datetime | None) -> str:
+    """RunLog.created_at 是 naive UTC → 台北日期字串。"""
+    dt = created_at_utc or datetime.datetime.utcnow()
+    return dt.replace(tzinfo=datetime.timezone.utc).astimezone(TAIPEI).strftime("%Y-%m-%d")
+
+
+def log_contribution(task_type: str, status: str, result_json) -> tuple[str, str, int, int] | None:
+    """一筆紀錄對曝光表的貢獻：(platform, kind, posts, shares)；不是成功的發文回 None。"""
+    if status != "success" or task_type not in POST_TYPES:
+        return None
+    plat = platform_of(task_type)
+    if not plat:
+        return None
+    shares = shares_in_log(result_json) if task_type == "marketplace" else 0
+    return plat, task_type, 1, shares
+
+
+def bump_exposure(session, log) -> None:
+    """發文紀錄收尾成 success 時呼叫（同一個 session，不 commit）。"""
+    c = log_contribution(log.task_type, log.status, log.result_json)
+    if not c:
+        return
+    plat, _kind, posts, shares = c
+    from sqlalchemy import select
+    from .database import ExposureDaily
+    date = taipei_date(log.created_at)
+    row = session.execute(select(ExposureDaily).where(
+        ExposureDaily.date == date, ExposureDaily.platform == plat)).scalar_one_or_none()
+    if row is None:
+        row = ExposureDaily(date=date, platform=plat, posts=0, shares=0)
+        session.add(row)
+    row.posts = (row.posts or 0) + posts
+    row.shares = (row.shares or 0) + shares
+    if _kind == "marketplace":
+        row.mp_posts = (row.mp_posts or 0) + posts
+    elif _kind in ("group_post", "post"):
+        row.gp_posts = (row.gp_posts or 0) + posts
+
+
+def _needs_rebuild(s) -> bool:
+    """表是空的，或 FB 列還沒拆 Marketplace／社團（升級前寫的）→ 從 RunLog 重算。"""
+    from sqlalchemy import select, func
+    from .database import ExposureDaily
+    total = s.execute(select(func.count(ExposureDaily.id))).scalar() or 0
+    if not total:
+        return True
+    unsplit = s.execute(select(func.count(ExposureDaily.id)).where(
+        ExposureDaily.platform == "fb", ExposureDaily.posts > 0,
+        (func.coalesce(ExposureDaily.mp_posts, 0) + func.coalesce(ExposureDaily.gp_posts, 0)) == 0)).scalar() or 0
+    return unsplit > 0
+
+
+def backfill_sync() -> int:
+    """開機時：表是空的、或還沒拆 MP／社團，就從既有 RunLog 重算一次。回傳寫了幾列。"""
+    from sqlalchemy import select, delete
+    from .database import SyncSession, RunLog, ExposureDaily
+    with SyncSession() as s:
+        if not _needs_rebuild(s):
+            return 0
+        s.execute(delete(ExposureDaily))
+        agg: dict[tuple[str, str], list[int]] = {}
+        for log in s.execute(select(RunLog).where(RunLog.status == "success",
+                                                  RunLog.task_type.in_(POST_TYPES))).scalars():
+            c = log_contribution(log.task_type, log.status, log.result_json)
+            if not c:
+                continue
+            key = (taipei_date(log.created_at), c[0])
+            cur = agg.setdefault(key, [0, 0, 0, 0])
+            cur[0] += c[2]
+            cur[1] += c[3]
+            if c[1] == "marketplace":
+                cur[2] += c[2]
+            elif c[1] in ("group_post", "post"):
+                cur[3] += c[2]
+        for (date, plat), (posts, shares, mp, gp) in agg.items():
+            s.add(ExposureDaily(date=date, platform=plat, posts=posts, shares=shares, mp_posts=mp, gp_posts=gp))
+        s.commit()
+        return len(agg)
+
+
+def aggregate(rows, today: str) -> dict:
+    """純函式：exposure_daily 列 → {"today","month","total"} 各含 posts/shares/exposure，且每平台一份。
+
+    rows：可迭代的 (date, platform, posts, shares)。today：台北 YYYY-MM-DD。"""
+    month = today[:7]
+
+    def _blank():
+        return {"posts": 0, "shares": 0, "exposure": 0}
+    out = {"today": _blank(), "month": _blank(), "total": _blank(),
+           "platforms": {p: {"today": _blank(), "month": _blank(), "total": _blank()} for p in PLATFORMS},
+           # 四個通道各自的發文篇數（老闆 2026-09-10：MP、社團、IG、Threads 的累積與本月）
+           "channels": {c: {"today": 0, "month": 0, "total": 0} for c in ("mp", "gp", "ig", "threads")}}
+    for r in rows:
+        date, plat, posts, shares = r[0], r[1], int(r[2] or 0), int(r[3] or 0)
+        mp = int(r[4] or 0) if len(r) > 4 else 0
+        gp = int(r[5] or 0) if len(r) > 5 else 0
+        buckets = ["total"]
+        if date[:7] == month:
+            buckets.append("month")
+        if date == today:
+            buckets.append("today")
+        for b in buckets:
+            for target in (out[b], out["platforms"].get(plat, {}).get(b)):
+                if target is None:
+                    continue
+                target["posts"] += posts
+                target["shares"] += shares
+                target["exposure"] += posts + shares
+            if plat == "fb":
+                out["channels"]["mp"][b] += mp
+                out["channels"]["gp"][b] += gp
+            elif plat in ("ig", "threads"):
+                out["channels"][plat][b] += posts
+    return out
+
+
+# ── 每週上限（老闆 2026-09-10：安全等級也要限制每週發文、轉發社團數量）──
+
+def week_range(today: str) -> tuple[str, str]:
+    """台北的這一週：週一到週日（含），回 (起, 迄) 日期字串。"""
+    d = datetime.date.fromisoformat(today)
+    start = d - datetime.timedelta(days=d.weekday())
+    return start.isoformat(), (start + datetime.timedelta(days=6)).isoformat()
+
+
+def weekly_remaining(caps: tuple[int, int], used: tuple[int, int]) -> dict:
+    """純函式：caps=(發文上限, 轉發上限)，0＝不限；used=(本週已發, 本週已轉)。
+    回 {"posts_left": int|None, "shares_left": int|None}，None＝不限。"""
+    pc, sc = int(caps[0] or 0), int(caps[1] or 0)
+    pu, su = int(used[0] or 0), int(used[1] or 0)
+    return {"posts_left": (max(0, pc - pu) if pc else None),
+            "shares_left": (max(0, sc - su) if sc else None),
+            "caps": {"posts": pc, "shares": sc}, "used": {"posts": pu, "shares": su}}
+
+
+def weekly_used_sync(today: str | None = None) -> tuple[int, int]:
+    """本週 FB 已發幾篇（MP＋社團）、已轉發幾個社團（exposure_daily 加總）。"""
+    from sqlalchemy import select, func
+    from .database import SyncSession, ExposureDaily
+    today = today or datetime.datetime.now(TAIPEI).strftime("%Y-%m-%d")
+    a, b = week_range(today)
+    with SyncSession() as s:
+        row = s.execute(select(func.coalesce(func.sum(ExposureDaily.posts), 0),
+                               func.coalesce(func.sum(ExposureDaily.shares), 0))
+                        .where(ExposureDaily.platform == "fb", ExposureDaily.date >= a, ExposureDaily.date <= b)).one()
+        return int(row[0] or 0), int(row[1] or 0)
+
+
+def weekly_gate_sync() -> dict:
+    """發文前問一句：這週還能發幾篇、還能轉幾個社團（None＝不限）。"""
+    from .database import weekly_caps_sync
+    return weekly_remaining(weekly_caps_sync(), weekly_used_sync())
+
+
+def weekly_cap_msg(gate: dict, what: str = "發文") -> str:
+    return (f"本週{what}已達安全等級的每週上限（{gate['caps']['posts']} 篇，已發 {gate['used']['posts']}），"
+            "下週一自動恢復；想放寬到帳號設定調安全等級")

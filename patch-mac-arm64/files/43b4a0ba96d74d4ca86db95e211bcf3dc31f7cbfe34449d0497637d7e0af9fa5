@@ -1,0 +1,308 @@
+"""從一個物件網址找出「同一經紀人／店家」的全部出售物件清單。
+
+用途：房仲手上常是同一家店在樂屋網的二三十筆物件。貼一個物件頁進來，
+這支去找到店家頁、把清單抓回來，讓使用者在前端勾選要匯入哪幾筆。
+
+跟 run_import_url 的分工：這支**只抓清單、不下載任何圖片**（所以只要十幾秒）；
+真正的文案與圖片擷取仍然由 run_import_url 一次一筆處理。
+
+刻意用獨立的瀏覽器 profile（不吃 FB cookie）：這是去別人的網站抓公開頁面。
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import re
+import sys
+import time
+
+from playwright.sync_api import sync_playwright
+
+from src.import_parse import (
+    LINKS_JS, LIST_EXTRACT_JS, LIST_PROGRESS_JS,
+    http_error_message, next_page_url, parse_cards, pick_list_page, store_sections, store_url_from_html,
+    city_hint_from_title, agent_hints_from_page, keyword_search_urls, normalize_item_url, lister_identity,
+)
+from src.utils import launch_scrape_browser
+
+_JSON_PATH = None
+_RESULT = None
+
+_ERR_NO_STORE = ("這個刊登者在樂屋沒有店鋪頁，從物件頁找不到整批清單。"
+                 "請改貼樂屋的「搜尋結果」網址：在樂屋用關鍵字搜你的團隊名（例如「方舟團隊」）、選好縣市，"
+                 "把那一頁的網址貼進來，買賣和租屋各一頁。有店鋪頁的人貼 https://vip.rakuya.com.tw/手機號碼 也可以。")
+_ERR_EMPTY = "在這個店家頁面沒抓到任何出售物件（可能全部是出租，或版面與預期不同）。"
+
+
+_TITLE_JUNK = re.compile(r"^(請稍候|載入中|loading)", re.I)
+
+
+def _store_name(page) -> str:
+    """店家名稱：頁面還在載入時 title 常是「請稍候...」，那個抓了等於沒抓。"""
+    with contextlib.suppress(Exception):
+        t = (page.title() or "").split(" - ")[0].strip()[:60]
+        if t and not _TITLE_JUNK.match(t):
+            return t
+    return ""
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+    # 失敗原因也印出來：只寫進用完就刪的結果 JSON，客戶回報問題時無從查起
+    if _RESULT is not None and not _RESULT.get("success"):
+        print("[list] 失敗：" + str(_RESULT.get("error") or "未知原因"), flush=True)
+
+
+def _settle(page, deadline_sec=25):
+    """捲到「物件連結數不再增加」為止，回傳最後的連結數。
+
+    不寫死秒數：同一台機器快慢可差十倍，固定等幾秒必然抓不到。
+
+    **0 筆不算穩定**：頁面是 JS 渲染的，剛 goto 完連續好幾輪都是 0 很正常。
+    把它當成「已經穩定」就會在頁面還沒渲染時直接收工——實測就是這樣抓到 0 筆。
+    一筆都沒有時只能等到 deadline 為止。
+    """
+    t0 = time.time()
+    last, stable, rounds = -1, 0, 0
+    while time.time() - t0 < deadline_sec:
+        try:
+            n = page.evaluate(LIST_PROGRESS_JS)
+        except Exception:
+            page.wait_for_timeout(500)
+            continue                       # 導覽中 evaluate 會短暫失敗，下一輪再問
+        stable = stable + 1 if n == last else 0
+        last = n
+        rounds += 1
+        if rounds >= 3 and stable >= 3 and last > 0:
+            break
+        page.mouse.wheel(0, 1400)
+        page.wait_for_timeout(600)
+    return last
+
+
+def _collect_page(page, url: str, already_open: bool = False) -> tuple[int | None, list[dict]]:
+    """開一頁清單頁，捲完把卡片撈回來。回 (HTTP 狀態碼, 卡片)。
+
+    already_open：使用者貼的就是清單頁時，第一頁已經開好也捲過了，
+    再 goto 一次等於整頁重載重捲，白等十幾秒。
+
+    狀態碼一定要帶回去：被擋（403）時頁面是空的，吞掉狀態碼就會顯示成
+    「這家店沒有出售物件」——把人引去查完全錯誤的方向。
+    """
+    status = None
+    if not already_open:
+        resp = page.goto(url, wait_until="commit", timeout=45000)
+        status = resp.status if resp is not None else None
+    if status and status >= 400:
+        print(f"[list] {url} → HTTP {status}", flush=True)
+        return status, []
+    n = _settle(page)
+    raw = page.evaluate(LIST_EXTRACT_JS)
+    print(f"[list] {url} → 連結 {n} 個、卡片 {len(raw)} 張", flush=True)
+    return status, raw
+
+
+def _verify_lister(page, items: list[dict], nick: str, tag: str) -> list[dict]:
+    """關鍵字搜尋會混到別人的案子（2026-09-10：搜「琣琣」抓到飛雁團隊的）。每一筆開物件頁對刊登者：
+    刊登者名字一樣、或標題帶同一個團隊標記才留。頁面資料是內嵌的，commit 後就讀得到，一筆約 1～2 秒。"""
+    kept, dropped = [], 0
+    for idx, it in enumerate(items, 1):
+        title = it.get("title") or ""
+        if tag and tag in title:
+            kept.append(it)
+            continue
+        ok = False
+        try:
+            page.goto(it["url"], wait_until="commit", timeout=30000)
+            html = ""
+            for _ in range(10):                       # 內嵌 JSON 通常一秒內就有
+                page.wait_for_timeout(300)
+                html = page.content()
+                if "sellerInfo" in html:
+                    break
+            who = lister_identity(html)
+            ok = bool(nick) and who["nick"] == nick
+            if not ok and who["nick"]:
+                print(f"[list] 略過別人的案子（刊登者 {who['nick']}）：{title[:24]}", flush=True)
+        except Exception as e:                        # noqa: BLE001  開不了就保留，寧可多不要漏
+            print(f"[list] 驗證刊登者失敗（{e}），先保留：{title[:24]}", flush=True)
+            ok = True
+        if ok:
+            kept.append(it)
+        else:
+            dropped += 1
+        if idx % 10 == 0:
+            print(f"[list] 刊登者驗證 {idx}/{len(items)}", flush=True)
+    if dropped:
+        print(f"[list] 關鍵字搜到 {len(items)} 筆，扣掉別人的 {dropped} 筆，留 {len(kept)} 筆", flush=True)
+    return kept
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    parser = argparse.ArgumentParser(description="抓同一店家的出售物件清單")
+    parser.add_argument("--url", required=True)
+    parser.add_argument("--max-pages", type=int, default=5)
+    parser.add_argument("--max-items", type=int, default=100)
+    parser.add_argument("--result-json")
+    parser.add_argument("--deal", default="", choices=["", "sale", "rent"],
+                        help="只要買賣或只要租件（老闆 2026-09-10：買賣頁只抓買賣、租件頁只抓租）")
+    args = parser.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {
+        "schema": 1, "success": False, "error": "未完成",
+        "data": {"store_url": "", "store_name": "", "truncated": False, "items": []},
+    }
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    if not args.url.lower().startswith(("http://", "https://")):
+        _RESULT["error"] = "網址必須以 http:// 或 https:// 開頭"
+        sys.exit(1)
+
+    pw = sync_playwright().start()
+    try:
+        browser, context, page = launch_scrape_browser(pw)
+    except Exception as e:
+        _RESULT["error"] = f"開不了瀏覽器（{e}）"
+        with contextlib.suppress(Exception):
+            pw.stop()
+        sys.exit(1)
+
+    try:
+        # 1) 先開使用者貼的那一頁
+        try:
+            resp = page.goto(args.url, wait_until="commit", timeout=45000)
+        except Exception as e:
+            _RESULT["error"] = f"打不開這個網址（{e}）"
+            sys.exit(1)
+        if resp is not None and resp.status >= 400:
+            _RESULT["error"] = f"網頁回應 HTTP {resp.status}，可能需要登入或該站擋自動擷取"
+            sys.exit(1)
+        _settle(page, deadline_sec=12)
+
+        # 2) 決定去哪一頁抓清單（優先跟店家連結，其次才是「這頁本身就是清單頁」）
+        links = page.evaluate(LINKS_JS)
+        html = ""
+        with contextlib.suppress(Exception):
+            html = page.content()
+        # 物件頁的店鋪不一定在連結裡（按鈕晚渲染），HTML 的 agentUrl 一定有 → 當成第一個候選
+        hu = store_url_from_html(html)
+        if hu:
+            links = [{"href": hu, "text": "店鋪"}] + links
+        print(f"[list] 貼進來的網址：{args.url}（連結 {len(links)} 個）", flush=True)
+        store_url = pick_list_page(args.url, links)
+        keyword_sections, keyword_name, source_nick, source_tag = [], "", "", ""
+        if not store_url and normalize_item_url(args.url):
+            # 刊登者沒有店鋪頁（公司帳號常見）→ 用標題上的團隊標記或刊登者名字去樂屋關鍵字搜尋，買賣＋租屋各一頁
+            hints = agent_hints_from_page(html, page.title() if hasattr(page, "title") else "")
+            # 樂屋的搜尋會比對「刊登者名字」欄位（2026-09-10 實測搜「琣琣」找得到她的整批），所以經紀人本人一定搜；
+            # 標題有團隊標記（☆方舟團隊☆）再多搜一次，把同團隊其他人的案子也帶進來。沒有團隊名稱的公司也照樣能用。
+            source_nick, source_tag = hints["agent"], hints["tag"]
+            keywords = [k for k in (hints["agent"], hints["tag"]) if k]
+            keywords = list(dict.fromkeys(keywords))
+            keyword_name = "／".join(keywords)
+            for k in keywords:
+                keyword_sections += keyword_search_urls(k, hints["city"])
+            if keyword_sections:
+                store_url = keyword_sections[0][0]
+                print(f"[list] 這個刊登者沒有店鋪頁，改用關鍵字 {keyword_name} 搜尋（縣市代碼 {hints['city'] or '全部'}）", flush=True)
+        if not store_url:
+            _RESULT["error"] = _ERR_NO_STORE
+            sys.exit(1)
+        print(f"[list] 清單頁：{store_url}"
+              f"{'（就是貼進來的這頁）' if store_url == args.url else ''}", flush=True)
+
+        # 3) 逐段（出售／出租）逐頁收卡片——vip 店鋪首頁只有出售，出租在 /rent（老闆 2026-09-10：要分開）
+        raw_all, seen_href = [], set()
+        truncated = False
+        store_name = ""
+        sections = keyword_sections or store_sections(store_url)
+        if args.deal:
+            picked = [x for x in sections if x[1] in ("", args.deal)]
+            sections = picked or sections
+        if len(sections) > 1:
+            print(f"[list] 分兩段抓：{'、'.join(u for u, _ in sections)}", flush=True)
+        for sec_idx, (sec_url, sec_deal) in enumerate(sections):
+            for n in range(1, max(1, args.max_pages) + 1):
+                url = sec_url if n == 1 else next_page_url(sec_url, n)
+                try:
+                    # 「已經開著」只對整個流程的第一頁成立；第二段（/rent）就算網址等於貼進來的也要重新 goto，
+                    # 不然瀏覽器還停在出售頁最後一頁，把同一批卡片再撈一次（2026-09-10 實測租件全空）
+                    status, raw = _collect_page(
+                        page, url, already_open=(sec_idx == 0 and n == 1 and sec_url == args.url))
+                except Exception as e:
+                    print(f"[list] 第 {n} 頁讀取失敗（{e}），停在這裡", flush=True)
+                    break
+                http_err = http_error_message(status)
+                if http_err:
+                    if n == 1 and not raw_all:
+                        _RESULT["error"] = http_err     # 第一頁就被擋＝這次什麼都沒有
+                        sys.exit(1)
+                    break                                # 後面的頁被擋：前面抓到的仍然有用
+                fresh = [c for c in raw if c.get("url") not in seen_href]
+                city_hint = ""
+                with contextlib.suppress(Exception):
+                    city_hint = city_hint_from_title(page.title())
+                for c in fresh:
+                    seen_href.add(c.get("url"))
+                    if sec_deal:
+                        c["deal_hint"] = sec_deal
+                    if city_hint:
+                        c["city_hint"] = city_hint
+                if not fresh:
+                    break                      # 這一頁沒有新東西＝已經到底
+                raw_all += fresh
+                if not store_name:
+                    store_name = _store_name(page)
+                if len(parse_cards(raw_all)) >= args.max_items:
+                    truncated = True
+                    break
+            if truncated:
+                break
+
+        items = parse_cards(raw_all)
+        if keyword_sections and (source_nick or source_tag):
+            items = _verify_lister(page, items, source_nick, source_tag)
+        if args.deal:
+            other = [i for i in items if (i.get("deal_type") or "sale") != args.deal]
+            items = [i for i in items if (i.get("deal_type") or "sale") == args.deal]
+            if other:
+                print(f"[list] 略過 {len(other)} 筆{'租件' if args.deal == 'sale' else '買賣'}（這一頁只收{'買賣' if args.deal == 'sale' else '租件'}）", flush=True)
+            if not items:
+                _RESULT["error"] = ("這家店沒有" + ("買賣" if args.deal == "sale" else "出租") + "物件"
+                                    + (f"（有 {len(other)} 筆{'租件' if args.deal == 'sale' else '買賣'}，到另一個頁籤匯入）" if other else ""))
+                sys.exit(1)
+        if len(items) > args.max_items:
+            items = items[:args.max_items]
+            truncated = True
+        if not items:
+            _RESULT["error"] = _ERR_EMPTY
+            sys.exit(1)
+
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        if keyword_name:
+            store_name = f"{keyword_name}（樂屋關鍵字搜尋）"
+        _RESULT["data"].update({
+            "store_url": store_url, "store_name": store_name,
+            "truncated": truncated, "items": items,
+        })
+        print(f"清單擷取完成：{len(items)} 筆"
+              f"{'（已達上限，未列完）' if truncated else ''}", flush=True)
+    except SystemExit:
+        raise
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    finally:
+        for close in (context.close, browser.close, pw.stop):
+            with contextlib.suppress(Exception):
+                close()
+
+
+if __name__ == "__main__":
+    main()

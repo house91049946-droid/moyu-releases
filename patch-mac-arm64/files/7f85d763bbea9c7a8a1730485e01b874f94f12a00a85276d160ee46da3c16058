@@ -1,0 +1,243 @@
+"""把已下載好的補丁「現在就套用」——按鈕與每晚自動套用共用（老闆 2026-09-10）。
+
+以前：背景把補丁下載到 staging，要等客戶關掉軟體再點圖示，啟動器才套用；常駐機（LaunchAgent）永遠不會套。
+按鈕又是連到「下載整包」——客戶會以為要重裝。現在：
+
+  1. 寫一個「請套用」記號檔（DATA/.update_apply_request）。
+  2. 誰來重啟？
+     - 啟動器模式（客戶一般用法）：啟動器每 5 秒看一次記號檔，看到就停服務 → 套用 → 重開，全自動。
+     - 常駐模式（MOYU_MANAGED=1，mini 的 LaunchAgent）：後端自己退出，launchd 把它拉起來；
+       後端開機第一件事看到記號檔就跑 _apply_update.py，套完再把前端 node 砍掉讓 launchd 重開。
+  3. 每天 03:30 若有已下載好的新版、而且沒有瀏覽器任務在跑，就自動走同一條路。
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from .config import DATA_DIR
+
+MARKER = DATA_DIR / ".update_apply_request"
+AUTO_APPLY_AT = (3, 30)          # 台北時間；02:00～06:00 是備份刪文時段，跟它共用瀏覽器互斥
+FRONT_PORT = os.environ.get("MOYU_FRONT_PORT", "13000")
+
+
+def is_managed() -> bool:
+    """服務由 launchd／系統管理（會自動重生）→ 後端可以自己退出去套用。"""
+    return os.environ.get("MOYU_MANAGED", "") == "1"
+
+
+def _vtuple(v: str) -> tuple:
+    try:
+        return tuple(int(x) for x in (v or "").strip().split("."))
+    except ValueError:
+        return ()
+
+
+def write_marker(version: str, reason: str) -> dict:
+    d = {"version": version, "reason": reason, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    MARKER.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    return d
+
+
+def read_marker() -> dict | None:
+    try:
+        d = json.loads(MARKER.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else None
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def clear_marker() -> None:
+    try:
+        MARKER.unlink()
+    except OSError:
+        pass
+
+
+def staged_newer_than(current: str) -> str:
+    """staging 裡排好隊的版本若比目前新就回它，否則回空字串。"""
+    from .update_downloader import _staged_version
+    v = _staged_version()
+    return v if v and _vtuple(v) > _vtuple(current) else ""
+
+
+def request_apply(reason: str = "manual", stage_timeout: float = 60.0) -> dict:
+    """按鈕／每晚自動：確定有新版排好隊 → 寫記號 → 依模式重啟。
+
+    回 {"status": "none"|"requested"|"restarting"|"error", ...}。"""
+    from .config import settings
+    from .update_downloader import check_and_stage, package_root
+    if not package_root():
+        return {"status": "error", "reason": "開發環境沒有補丁機制"}
+    current = settings.app_version
+    version = staged_newer_than(current)
+    if not version:
+        try:
+            s = check_and_stage(stage_timeout)          # 還沒下載就現在下載（最多等 60 秒）
+        except Exception as e:                           # noqa: BLE001
+            return {"status": "error", "reason": f"下載補丁失敗：{e}"}
+        version = staged_newer_than(current)
+        if not version:
+            return {"status": "none", "reason": s.get("reason") or "已是最新版本", "current": current}
+    write_marker(version, reason)
+    if is_managed():
+        _exit_soon()
+        return {"status": "restarting", "mode": "managed", "version": version}
+    # 啟動器模式：啟動器多半已經退出（客戶按「進入儀表板」就 os._exit 了），沒人在看記號——把它叫起來
+    woke = wake_launcher(package_root())
+    print(f"[update] 已寫下更新要求（{version}），啟動器：{woke}", flush=True)
+    return {"status": "requested", "mode": "launcher", "version": version, "launcher": woke}
+
+
+def _launcher_running() -> bool:
+    """有沒有啟動器（_launcher_gui.py）還開著——有就讓它自己每 5 秒看記號。"""
+    try:
+        import psutil
+    except ImportError:
+        return False
+    me = os.getpid()
+    for p in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if p.info["pid"] == me:
+                continue
+            if "_launcher_gui.py" in " ".join(p.info.get("cmdline") or []):
+                return True
+        except (psutil.Error, OSError):
+            continue
+    return False
+
+
+def wake_launcher(base) -> str:
+    """啟動器不在就啟動它：它開機第一件事看到記號會停服務、套用、重開。回傳做了什麼（給日誌／測試）。"""
+    if base is None:
+        return "no-package"
+    if _launcher_running():
+        return "running"
+    try:
+        if sys.platform == "darwin":
+            app = base / "摸魚.app"
+            if not app.is_dir():
+                return "no-app"
+            subprocess.Popen(["open", str(app)], close_fds=True)
+            return "opened"
+        if os.name == "nt":
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            exe, vbs = base / "摸魚.exe", base / "摸魚.vbs"
+            if exe.is_file():
+                subprocess.Popen([str(exe)], cwd=str(base), close_fds=True, creationflags=flags)
+            elif vbs.is_file():
+                subprocess.Popen(["wscript", str(vbs)], cwd=str(base), close_fds=True, creationflags=flags)
+            else:
+                return "no-app"
+            return "opened"
+    except OSError as e:
+        return f"error:{e}"
+    return "unsupported"
+
+
+def _exit_soon(delay: float = 1.0) -> None:
+    """常駐模式：把瀏覽器任務收乾淨後自己退出，launchd 會把後端拉起來。"""
+    import threading
+
+    def _go():
+        time.sleep(delay)
+        try:
+            from .fbauto_bridge import shutdown_children
+            shutdown_children("系統更新中重新啟動，這筆任務中途停止，下一場照常")
+        except Exception:
+            pass
+        os._exit(0)
+    threading.Thread(target=_go, daemon=True).start()
+
+
+def apply_pending_if_requested() -> str:
+    """後端開機最前面呼叫（常駐模式）：有記號＋有排好隊的補丁 → 跑 _apply_update.py，再讓前端重開。
+    回傳做了什麼（給日誌）。啟動器模式不做——啟動器自己會在服務停掉時套用。"""
+    if not is_managed():
+        return "skip:not-managed"
+    m = read_marker()
+    if not m:
+        return "skip:no-marker"
+    from .update_downloader import package_root
+    base = package_root()
+    if base is None or not (base / "_apply_update.py").is_file():
+        clear_marker()
+        return "skip:no-package"
+    clear_marker()
+    try:
+        r = subprocess.run([sys.executable, str(base / "_apply_update.py"), "apply"],
+                           cwd=str(base), capture_output=True, text=True, timeout=600)
+        out = (r.stdout or "").strip().splitlines()
+        print(f"[update] 套用補丁 rc={r.returncode}：{out[-1] if out else ''}", flush=True)
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"[update] 套用補丁失敗：{e}", flush=True)
+        return "apply-failed"
+    if r.returncode == 10:
+        # 真的換了檔案：這個程序已經載入一半舊模組，不能繼續用——讓前端重開、自己也退出，
+        # launchd 會用新檔把後端拉起來（記號已清，不會無限循環）
+        _restart_frontend()
+        print("[update] 補丁已套用，重新啟動後端載入新版", flush=True)
+        sys.stdout.flush()
+        os._exit(0)
+    return f"applied:{r.returncode}"
+
+
+def _restart_frontend() -> None:
+    """常駐模式：砍掉佔著前端埠的 node，launchd 會用新檔重開它。"""
+    if os.name == "nt":
+        return
+    try:
+        pids = subprocess.run(["lsof", "-ti", f":{FRONT_PORT}"], capture_output=True, text=True, timeout=10).stdout.split()
+        for pid in pids:
+            subprocess.run(["kill", pid], timeout=5)
+        if pids:
+            print(f"[update] 已請前端重開（pid {', '.join(pids)}）", flush=True)
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+
+def in_auto_window(now: datetime.datetime | None = None) -> bool:
+    """每晚自動套用的時段：03:30 起到 06:00 前（跟備份刪文同一段清晨）。"""
+    from .database import TAIPEI
+    now = now or datetime.datetime.now(TAIPEI)
+    h, m = AUTO_APPLY_AT
+    start = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    end = now.replace(hour=6, minute=0, second=0, microsecond=0)
+    return start <= now < end
+
+
+async def maybe_auto_apply() -> dict:
+    """每晚 03:30 的排程：有新版下載好、沒有瀏覽器任務在跑 → 自動套用。"""
+    import asyncio
+    from .config import settings
+    from .fbauto_bridge import browser_busy_reason
+    from .update_downloader import package_root
+    if not package_root():
+        return {"skipped": "開發環境"}
+    busy = browser_busy_reason()
+    if busy:
+        return {"skipped": f"「{busy}」正在跑，明天再說"}
+    r = await asyncio.to_thread(request_apply, "nightly", 120.0)
+    if r.get("status") in ("requested", "restarting"):
+        print(f"[update] 每晚自動更新：{settings.app_version} → {r.get('version')}（{r.get('mode')}）", flush=True)
+    return r
+
+
+async def restore_auto_apply_schedule():
+    from apscheduler.triggers.cron import CronTrigger
+    from .database import TAIPEI
+    from .scheduler.task_runner import scheduler
+
+    async def _job():
+        r = await maybe_auto_apply()
+        if r.get("skipped") or r.get("status") in ("none", "error"):
+            print(f"[update] 每晚檢查：{r}", flush=True)
+    scheduler.add_job(func=_job, trigger=CronTrigger(hour=AUTO_APPLY_AT[0], minute=AUTO_APPLY_AT[1], timezone=TAIPEI),
+                      id="update_auto_apply", replace_existing=True)

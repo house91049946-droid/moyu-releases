@@ -1,0 +1,101 @@
+"""成效回收（老闆 2026-09-10）：FB 刊登的實際點擊數 → 物件卡「N 次點擊」、儀表板 Marketplace 卡「實際點擊」。
+
+資料來源是 FB「你的商品」頁（FB_Auto/src/run_metrics.py），每天 05:10 讀一次（metrics_runner）。
+那一頁的標題是 FB 顯示的字，跟我們的標題只差全形／半形逗號，比對前先正規化。
+"""
+from __future__ import annotations
+
+import datetime
+import re
+
+from .exposure import TAIPEI
+
+_PUNCT = str.maketrans({"，": ",", "、": "、", "：": ":", "！": "!", "（": "(", "）": ")", " ": ""})
+
+
+def norm_title(t: str) -> str:
+    return re.sub(r"\s+", "", (t or "")).translate(_PUNCT).strip()
+
+
+def today_taipei() -> str:
+    return datetime.datetime.now(TAIPEI).strftime("%Y-%m-%d")
+
+
+def apply_results_sync(results: list[dict], date: str | None = None) -> int:
+    """把 CLI 讀回來的刊登清單存成今天的快照（同一天同一筆覆蓋）。回寫了幾筆。"""
+    from sqlalchemy import select
+    from .database import SyncSession, ListingMetric
+    date = date or today_taipei()
+    n = 0
+    with SyncSession() as s:
+        for it in results or []:
+            title = (it.get("title") or "")[:300]
+            if not title:
+                continue
+            price = int(it.get("price") or 0)
+            posted = (it.get("posted") or "")[:10]
+            row = s.execute(select(ListingMetric).where(
+                ListingMetric.date == date, ListingMetric.title == title,
+                ListingMetric.price == price, ListingMetric.posted == posted)).scalar_one_or_none()
+            if row is None:
+                row = ListingMetric(date=date, title=title, price=price, posted=posted)
+                s.add(row)
+            row.clicks = int(it.get("clicks") or 0)
+            row.views = int(it.get("views") or 0)
+            row.status = (it.get("status") or "")[:20]
+            row.collected_at = datetime.datetime.utcnow()
+            n += 1
+        s.commit()
+    return n
+
+
+def latest_rows_sync() -> tuple[str, list]:
+    """最近一次快照（最新日期）的所有列。"""
+    from sqlalchemy import select, func
+    from .database import SyncSession, ListingMetric
+    with SyncSession() as s:
+        d = s.execute(select(func.max(ListingMetric.date))).scalar()
+        if not d:
+            return "", []
+        rows = s.execute(select(ListingMetric).where(ListingMetric.date == d)).scalars().all()
+        return d, [{"title": r.title, "price": r.price, "posted": r.posted, "clicks": r.clicks or 0,
+                    "views": r.views or 0, "status": r.status or ""} for r in rows]
+
+
+def clicks_by_property(rows: list[dict], props: list[tuple[int, list, int]]) -> dict[int, int]:
+    """純函式：快照列對回物件（標題在它的 titles 裡，且價格一樣或物件沒填價格），每個物件的點擊合計。
+    props：(id, titles, price)。同一標題出現在多個物件就不算（不猜）。"""
+    owner: dict[str, tuple[int, int] | None] = {}
+    for pid, titles, price in props:
+        for t in titles or []:
+            k = norm_title(t)
+            if not k:
+                continue
+            owner[k] = None if (k in owner and owner[k] and owner[k][0] != pid) else (pid, int(price or 0))
+    out: dict[int, int] = {}
+    for r in rows:
+        o = owner.get(norm_title(r.get("title", "")))
+        if not o:
+            continue
+        pid, price = o
+        if price and int(r.get("price") or 0) and price != int(r.get("price") or 0):
+            continue
+        out[pid] = out.get(pid, 0) + int(r.get("clicks") or 0)
+    return out
+
+
+def property_clicks_sync() -> dict[int, int]:
+    from sqlalchemy import select
+    from .database import SyncSession, Property
+    d, rows = latest_rows_sync()
+    if not rows:
+        return {}
+    with SyncSession() as s:
+        props = [(p.id, list(p.titles or []), int(p.price or 0)) for p in s.execute(select(Property)).scalars().all()]
+    return clicks_by_property(rows, props)
+
+
+def summary_sync() -> dict:
+    d, rows = latest_rows_sync()
+    return {"date": d or None, "listings": len(rows), "clicks": sum(r["clicks"] for r in rows),
+            "views": sum(r["views"] for r in rows)}

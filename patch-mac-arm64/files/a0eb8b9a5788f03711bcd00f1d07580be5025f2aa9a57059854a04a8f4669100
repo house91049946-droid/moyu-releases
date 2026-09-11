@@ -1,0 +1,25 @@
+"""成效回收：你的商品頁文字 → 點擊數（2026-09-11 實測 mini 的頁面）"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.metrics_parse import parse_selling_lines  # noqa: E402
+
+LINES = ["管理商品", "篩選條件", "你的商品", "需要特別留意", "隱藏", "你似乎建立了重複的商品。",
+         "親家景一方三房雙車,學區、採買都方便", "NT$16,600,000", "有存貨", "· 9/10上架",
+         "已在 Marketplace 和至少 1 個社團上架", "·", "商品獲得0次點擊", "標示為缺貨", "分享",
+         "所有商品", "隱藏",
+         "台中太平兩年內新古屋,三房平車視野戶", "NT$17,770,000", "有存貨", "· 9/9上架",
+         "已在 Marketplace 和至少 1 個社團上架", "·", "商品獲得2次點擊", "標示為缺貨", "立即推廣", "分享"]
+
+
+def test_parse():
+    items = parse_selling_lines(LINES)
+    assert len(items) == 2
+    assert items[0] == {"title": "親家景一方三房雙車,學區、採買都方便", "price": 16600000, "posted": "9/10", "clicks": 0,
+                        "views": 0, "status": "有存貨", "shared": True}
+    assert items[1]["clicks"] == 2 and items[1]["price"] == 17770000 and items[1]["posted"] == "9/9"
+
+
+def test_empty():
+    assert parse_selling_lines(["你的商品", "沒有商品"]) == []
