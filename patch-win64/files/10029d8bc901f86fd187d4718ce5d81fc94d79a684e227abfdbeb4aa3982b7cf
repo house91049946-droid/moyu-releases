@@ -1,0 +1,425 @@
+"""FB Auto Poster - 主應用程式入口
+
+行銷快手復刻版 - Facebook/Instagram 行銷自動化工具
+
+啟動方式:
+    cd backend
+    uvicorn app.main:app --host 127.0.0.1 --port 3081 --reload
+"""
+from contextlib import asynccontextmanager
+import sys
+
+# Windows 主控台預設 cp1252：啟動流程裡任何一行中文 print 都會 UnicodeEncodeError，
+# 而且是在 lifespan 裡炸——整個後端起不來（2026-08-31 CI 冒煙實測）。
+# 便攜包啟動器有設 PYTHONUTF8=1，但後端不該把「能不能啟動」押在啟動器身上：
+# 印不出來的字用 ? 代替就好，永遠不准因為 print 而死。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+from fastapi import Request, HTTPException, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from .config import settings, DATA_DIR
+# 常駐模式（MOYU_MANAGED=1）：有「請套用」記號就在載入其他模組之前先跑補丁（老闆 2026-09-10：更新按下去要啟動更新系統）
+from .update_apply import apply_pending_if_requested as _apply_pending
+_apply_pending_result = _apply_pending()
+from .database import init_db
+from .scheduler.task_runner import task_scheduler
+
+from .api.accounts import router as accounts_router
+from .api.articles import router as articles_router
+from .api.clubs import router as clubs_router
+from .api.comments import router as comments_router
+from .api.logs import router as logs_router
+from .api.marketplace import router as marketplace_router
+from .api.nurture import router as nurture_router
+from .api.friend import router as friend_router
+from .api.automation import router as automation_router
+from .api.dashboard import router as dashboard_router
+from .api.setup import router as setup_router
+from .api.posts import router as posts_router
+
+
+async def _reap_jobs_loop():
+    """每分鐘收尾「已結束但沒人再輪詢」的長時任務。
+
+    RunLog 原本只在前端輪詢時才收尾，前端關掉就永遠停在「執行中」。
+    """
+    import asyncio
+    import contextlib
+    from .fbauto_bridge import reap_finished_jobs
+    while True:
+        await asyncio.sleep(60)
+        with contextlib.suppress(Exception):
+            n = await asyncio.to_thread(reap_finished_jobs)
+            if n:
+                print(f"[reaper] 已收尾 {n} 筆結束但未回收的任務", flush=True)
+
+
+async def _cloud_heartbeat_loop():
+    """SaaS：每 6h 打 heartbeat（續期 token/回報存活）＋ 重抓下發設定。
+    啟動時先跑一次；失敗靜默（離線寬限由 cloud_client 處理）。"""
+    import asyncio
+    import contextlib
+    from .cloud_client import cloud_enabled, heartbeat, fetch_config
+    from .error_report import send_pending
+    tick = 0
+    while True:
+        if tick % 6 == 0:                              # 心跳＋設定：每 6 小時
+            with contextlib.suppress(Exception):
+                if cloud_enabled():
+                    await asyncio.to_thread(heartbeat)
+            # 用量快照也順便刷新（delta 0）：雲端調高上限後，本地快取的舊上限會一直說「額度用完」（2026-09-10 實測 50→150 沒生效）
+            with contextlib.suppress(Exception):
+                if cloud_enabled():
+                    from .cloud_client import report_usage
+                    await asyncio.to_thread(report_usage, 0, 0)
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(fetch_config)
+        # 失敗紀錄去個資後回傳雲端：每小時（老闆 2026-09-10「錯誤訊息自動回收」）
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(send_pending)
+        tick += 1
+        await asyncio.sleep(3600)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 啟動時
+    # 舊便攜包 → 安裝版的一次性資料遷移，必須在 init_db() 之前：
+    # 一旦建了空的 fb_poster.db，就分不出「全新安裝」和「還沒搬過來」了。
+    import traceback
+    # 檔案描述元上限：.app／launchd 給的 256 會被所有 CLI 子進程繼承，Chrome 不夠用
+    # 就會卡在載入網頁（見 proc_utils.raise_fd_limit）。要在 spawn 任何東西之前做。
+    try:
+        from .proc_utils import raise_fd_limit
+        limit = raise_fd_limit()
+        if limit is not None:
+            print(f"[startup] 檔案描述元上限：{limit}", flush=True)
+    except Exception:
+        print("[startup] 調整檔案描述元上限失敗，服務仍繼續啟動：", flush=True)
+        traceback.print_exc()
+    try:
+        from .data_migration import migrate_if_needed
+        r = migrate_if_needed()
+        if r["status"] == "migrated":
+            print(f"[startup] 已從舊版搬入 {r['files']} 個檔案"
+                  f"（{r['bytes'] / 1e6:.1f} MB）：{r['source']}", flush=True)
+    except Exception:
+        print("[startup] 資料遷移失敗，服務仍繼續啟動：", flush=True)
+        traceback.print_exc()
+    # 備份還原（兩段式第二段）：必須在 init_db() 之前——此刻資料庫還沒被開啟，
+    # Windows 才允許覆蓋 fb_poster.db（匯入當下動手會 WinError 32，2026-08-06 實測）
+    try:
+        from .api.backup import apply_pending_restore
+        r = apply_pending_restore()
+        if r:
+            print(f"[startup] 備份還原完成：{r['restored']} 個檔案"
+                  + (f"，失敗 {len(r['failed'])} 個：{r['failed'][:5]}" if r["failed"] else ""),
+                  flush=True)
+    except Exception:
+        print("[startup] 備份還原失敗，服務仍繼續啟動：", flush=True)
+        traceback.print_exc()
+    init_db()
+    from .database import migrate_plaintext_passwords
+    migrate_plaintext_passwords()
+    # 社團發文物件併進 properties（冪等；gp_listings 不刪，出事可回退）
+    try:
+        from .database import merge_gp_listings_into_properties
+        r = merge_gp_listings_into_properties()
+        if r["moved"]:
+            print(f"[startup] 社團發文物件已併入：搬 {r['moved']} 筆"
+                  f"（合併 {r['linked']}、新建 {r['created']}），"
+                  f"重新對映 {r['schedules']} 個排程", flush=True)
+    except Exception:
+        print("[startup] 合併社團發文物件失敗，服務仍繼續啟動：", flush=True)
+        traceback.print_exc()
+    # 上次沒收尾的 running 任務：子進程不跨重啟，留著會在執行紀錄永遠轉圈
+    try:
+        from .fbauto_bridge import reconcile_orphan_run_logs_sync
+        n = reconcile_orphan_run_logs_sync()
+        if n:
+            print(f"[startup] 已收尾 {n} 筆上次未完成的執行紀錄", flush=True)
+    except Exception:
+        print("[startup] 收尾執行紀錄失敗，服務仍繼續啟動：", flush=True)
+        traceback.print_exc()
+    # 曝光累計表：第一次升到這版時從既有發文紀錄回填（老闆 2026-09-08：本月／累積曝光）
+    try:
+        from .exposure import backfill_sync
+        n = backfill_sync()
+        # 物件「已發 N 次」以前只在抓到商品網址時才加，FB 改版後多半抓不到 → 從成功紀錄補算一次（冪等）
+        try:
+            from .scheduler.marketplace_runner import backfill_post_counts_sync
+            fixed = backfill_post_counts_sync()
+            if fixed:
+                print(f"[boot] 物件發文次數補算：{fixed} 個物件", flush=True)
+        except Exception as e:                       # noqa: BLE001
+            print(f"[boot] 物件發文次數補算失敗：{e}", flush=True)
+        if n:
+            print(f"[startup] 曝光累計表已從舊紀錄回填 {n} 列", flush=True)
+    except Exception:
+        print("[startup] 曝光累計回填失敗，服務仍繼續啟動：", flush=True)
+        traceback.print_exc()
+    # 不讓電腦閒置睡著（老闆 2026-09-10）：Mac caffeinate／Windows SetThreadExecutionState
+    try:
+        from . import keep_awake
+        print(f"[startup] 防睡眠：{keep_awake.start()}", flush=True)
+    except Exception:
+        traceback.print_exc()
+    # macOS：進程內停用 App Nap——整夜閒置時計時器被節流，排程一件都不發
+    # （2026-08 mini 實案）。失敗無妨，下面另有 watchdog 當第二道防線。
+    from .macos_nap import disable_app_nap
+    nap_ok, nap_msg = disable_app_nap()
+    print(f"[startup] App Nap：{nap_msg}", flush=True)
+    task_scheduler.start()
+    from .scheduler.task_runner import start_scheduler_watchdog
+    start_scheduler_watchdog()
+    # 手機開關同步（SPEC-P30 v2）：每 30 秒與雲端信箱對一次。雲端不可用就安靜跳過。
+    try:
+        from apscheduler.triggers.interval import IntervalTrigger as _IT
+        from .scheduler.mobile_sync import sync_once as _mobile_sync
+        task_scheduler._scheduler.add_job(_mobile_sync, trigger=_IT(seconds=30), id="mobile_sync",
+                                          replace_existing=True, max_instances=1, coalesce=True)
+    except Exception as _e:
+        print(f"[startup] 手機同步排程未啟動：{_e}", flush=True)
+    # 排程還原一律不得阻擋後端啟動：任一失敗只記錄，服務仍要起得來
+    from .scheduler.task_runner import restore_jobs
+    from .scheduler.marketplace_runner import restore_marketplace_schedules
+    from .scheduler.group_post_runner import restore_group_post_schedules
+    from .scheduler.nurture_runner import restore_nurture_schedule
+    from .scheduler.friend_runner import restore_friend_schedule
+    from .scheduler.cleanup_runner import restore_cleanup_schedule
+    from .scheduler.group_join_runner import restore_group_join_schedule
+    from .scheduler.post_cleanup_runner import restore_post_cleanup_schedule
+    from .scheduler.meta_login_check import restore_meta_login_check
+    from .update_apply import restore_auto_apply_schedule
+    from .scheduler.metrics_runner import restore_metrics_schedule
+    for name, restore in (
+        ("task_runner", restore_jobs),
+        ("marketplace", restore_marketplace_schedules),
+        ("group_post", restore_group_post_schedules),
+        ("nurture", restore_nurture_schedule),
+        ("friend", restore_friend_schedule),
+        ("cleanup", restore_cleanup_schedule),
+        ("group_join", restore_group_join_schedule),
+        ("post_cleanup", restore_post_cleanup_schedule),
+        ("meta_login_check", restore_meta_login_check),
+        ("update_auto_apply", restore_auto_apply_schedule),
+        ("metrics", restore_metrics_schedule),
+    ):
+        try:
+            await restore()
+        except Exception:
+            print(f"[startup] {name} 排程還原失敗，服務仍繼續啟動：", flush=True)
+            traceback.print_exc()
+    # SaaS：heartbeat + 下發設定背景迴圈（含啟動時先跑一次）
+    import asyncio
+    hb_task = asyncio.create_task(_cloud_heartbeat_loop())
+    reap_task = asyncio.create_task(_reap_jobs_loop())
+    # 補丁更新：背景下載新版檔案到 staging，下次啟動由 _apply_update.py 套用。
+    # 同樣不得阻擋啟動——這裡只起一條 daemon thread，例外全關在裡面。
+    try:
+        from .update_downloader import start_background_checks
+        start_background_checks()
+    except Exception:
+        print("[startup] 更新檢查啟動失敗，服務仍繼續啟動：", flush=True)
+        traceback.print_exc()
+    yield
+    # 關閉：把還在跑的 CLI（含它開的 Chrome）收掉，紀錄寫成人話——不然更新／關機後 Chrome 還在跑，
+    # 下一場發文全都「瀏覽器還開著」，紀錄又被開機收尾標成失敗（老闆 2026-09-08 看到的那筆）
+    try:
+        from .fbauto_bridge import shutdown_children
+        n = shutdown_children()
+        if n:
+            print(f"[shutdown] 已收掉 {n} 個進行中的瀏覽器任務", flush=True)
+    except Exception:
+        traceback.print_exc()
+    try:
+        from . import keep_awake
+        keep_awake.stop()
+    except Exception:
+        pass
+    # 關閉時：停排程器並盡力中止仍在跑的子進程
+    reap_task.cancel()
+    hb_task.cancel()
+    task_scheduler.stop()
+    from .fbauto_bridge import _RUNNING, kill_job
+    for key in list(_RUNNING.keys()):
+        kill_job(key)
+
+
+app = FastAPI(
+    title=settings.app_name,
+    version=settings.app_version,
+    description="Facebook 自動發文、養號、加社團一站式行銷工具",
+    lifespan=lifespan,
+    redirect_slashes=False,
+)
+
+# CORS：白名單來源（wildcard 配 credentials 會被瀏覽器拒，改讀 env 白名單）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# SaaS 授權硬鎖：未啟用授權（或超過離線寬限）→ 除白名單外所有 API 一律 403。
+# 白名單：健康檢查、授權管理（要能輸入金鑰）、版本檢查、疑難排解。
+# 疑難排解放行的理由：授權出問題時（例如已付款但授權沒生效）客戶正需要匯出診斷包
+# 回報，若被 gate 擋住就變成死結。它只讀日誌與環境資訊，不含機密。
+# 備份放行的理由：重灌後本機沒有授權金鑰 → 被 gate 擋住 → 但金鑰正好在備份檔裡，
+# 不放行就永遠匯不進來（死結）。後端只聽 127.0.0.1，操作者就是本機使用者本人。
+# 開發環境由 start_servers 腳本設 MOYU_DEV_MODE=1 放行（客戶包不設）。
+# /api/consent 在白名單：同意是在「申請／啟用」當下勾選的，
+# 那時還沒有授權，不放行就沒辦法在申請頁記錄同意。
+LICENSE_GATE_WHITELIST = ("/api/health", "/api/license", "/api/version",
+                          "/api/troubleshoot", "/api/backup", "/api/consent")
+
+
+def _gate_blocks(path: str) -> bool:
+    return path.startswith("/api") and not any(path.startswith(w) for w in LICENSE_GATE_WHITELIST)
+
+
+@app.middleware("http")
+async def license_gate(request, call_next):
+    import asyncio as _aio
+    from fastapi.responses import JSONResponse
+
+    if _gate_blocks(request.url.path):
+        from .cloud_client import license_gate_ok
+        if not await _aio.to_thread(license_gate_ok):
+            return JSONResponse(status_code=403, content={
+                "detail": "尚未啟用授權或授權已失效，請至「工具箱 → 授權管理」輸入金鑰",
+                "code": "license_required",
+            })
+    return await call_next(request)
+
+# API 路由
+app.include_router(accounts_router)
+app.include_router(articles_router)
+app.include_router(clubs_router)
+app.include_router(comments_router)
+app.include_router(logs_router)
+app.include_router(marketplace_router)
+app.include_router(nurture_router)
+app.include_router(friend_router)
+app.include_router(automation_router)
+app.include_router(dashboard_router)
+app.include_router(setup_router)
+app.include_router(posts_router)
+
+from .api.jobs import router as jobs_router
+app.include_router(jobs_router)
+
+from .api.properties import router as properties_router
+app.include_router(properties_router)
+
+from .api.group_post import router as group_post_router
+app.include_router(group_post_router)
+
+from .api.import_url import router as import_url_router
+app.include_router(import_url_router)
+
+from .api.threads import router as threads_router  # noqa: E402
+app.include_router(threads_router)
+
+from .api.consent import router as consent_router  # noqa: E402
+app.include_router(consent_router)
+
+from .api.leads import router as leads_router  # noqa: E402
+app.include_router(leads_router)
+
+from .api.mobile import router as mobile_router  # noqa: E402
+app.include_router(mobile_router)
+
+from .api.feedback import router as feedback_router
+app.include_router(feedback_router)
+
+from .api.license import router as license_router
+app.include_router(license_router)
+
+from .api.version import router as version_router
+app.include_router(version_router)
+
+from .api.troubleshoot import router as troubleshoot_router
+app.include_router(troubleshoot_router)
+
+from .api.backup import router as backup_router
+app.include_router(backup_router)
+
+# 靜態檔案：上傳圖片
+from .config import DATA_DIR
+uploads_dir = DATA_DIR / "uploads"
+uploads_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(uploads_dir)), name="uploads")
+
+
+@app.get("/api/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "app": settings.app_name,
+        "version": settings.app_version,
+    }
+
+
+@app.post("/api/health/shutdown")
+async def graceful_shutdown(request: Request):
+    """啟動器「停止服務」／重啟前先打這支：把養號／發文的 Chrome 一起收掉、紀錄寫成人話，
+    然後自己退出。Windows 沒有 SIGTERM 這種溫柔關法（taskkill /f 直接砍），只能靠這條路。
+    只收本機（服務本來就只綁 127.0.0.1，這裡再擋一次）。"""
+    host = (request.client.host if request.client else "") or ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(403, "only local")
+    from .fbauto_bridge import shutdown_children
+    import asyncio as _aio
+    n = shutdown_children()
+    loop = _aio.get_running_loop()
+    loop.call_later(0.5, _exit_self)
+    return {"ok": True, "closed": n}
+
+
+def _exit_self():
+    import os as _os, signal as _signal
+    try:
+        _os.kill(_os.getpid(), _signal.SIGTERM)     # mac：uvicorn 會走 lifespan 收尾；Windows：直接結束
+    except Exception:
+        _os._exit(0)
+
+
+@app.get("/api/status")
+async def system_status():
+    """取得系統運行狀態"""
+    from sqlalchemy import select, func
+    from .database import async_session_factory, Account, PostTask, PostHistory, Group
+
+    async with async_session_factory() as session:
+        acc_count = await session.scalar(select(func.count(Account.id)))
+        running_tasks = await session.scalar(
+            select(func.count(PostTask.id)).where(PostTask.status == "running")
+        )
+        today = __import__("datetime").datetime.utcnow().date()
+        today_posts = await session.scalar(
+            select(func.count(PostHistory.id)).where(
+                func.date(PostHistory.post_time) == today
+            )
+        )
+        group_count = await session.scalar(select(func.count(Group.id)))
+
+    return {
+        "accounts": acc_count,
+        "running_tasks": running_tasks,
+        "today_posts": today_posts,
+        "group_count": group_count,
+        "scheduler_running": task_scheduler._scheduler.running if task_scheduler._scheduler else False,
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host=settings.host, port=settings.port, reload=settings.debug)

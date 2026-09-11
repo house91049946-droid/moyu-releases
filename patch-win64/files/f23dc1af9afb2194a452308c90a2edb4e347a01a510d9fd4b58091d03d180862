@@ -1,0 +1,63 @@
+"""成效回收：FB Marketplace「你的商品」頁的文字 → 每個刊登的點擊數（純函式，可測）。
+
+老闆 2026-09-10 說做「成效回收」。2026-09-11 實測 /marketplace/you/selling 每張卡片的文字行長這樣：
+    標題 / NT$16,600,000 / 有存貨 / · 9/10上架 / 已在 Marketplace 和至少 1 個社團上架 / · / 商品獲得0次點擊 / 標示為缺貨 / 分享
+卡片是 div、沒有商品連結，所以只能靠「標題＋價格＋上架日」認同一筆。
+"""
+from __future__ import annotations
+
+import re
+
+_PRICE_RE = re.compile(r"^NT\$\s*([\d,]+)$")
+_POSTED_RE = re.compile(r"^·?\s*(\d{1,2}/\d{1,2})\s*上架$")
+_CLICK_RE = re.compile(r"商品獲得\s*([\d,]+)\s*次點擊")
+_VIEW_RE = re.compile(r"([\d,]+)\s*次(瀏覽|觀看)")
+_SKIP = {"有存貨", "標示為缺貨", "分享", "立即推廣", "·", "隱藏", "你似乎建立了重複的商品。", "所有商品", "需要特別留意"}
+
+
+def parse_selling_lines(lines: list[str]) -> list[dict]:
+    """把整頁文字行切成刊登：看到「NT$ 價格」就把前一行當標題，往後收到「點擊」為止。"""
+    out: list[dict] = []
+    cur: dict | None = None
+    prev = ""
+    for raw in lines:
+        l = (raw or "").strip()
+        if not l:
+            continue
+        m = _PRICE_RE.match(l)
+        if m:
+            if cur is not None:
+                out.append(cur)
+            cur = {"title": prev, "price": int(m.group(1).replace(",", "")), "posted": "", "clicks": 0, "views": 0,
+                   "status": "", "shared": False}
+            prev = l
+            continue
+        if cur is not None:
+            m = _POSTED_RE.match(l)
+            if m:
+                cur["posted"] = m.group(1)
+                prev = l
+                continue
+            m = _CLICK_RE.search(l)
+            if m:
+                cur["clicks"] = int(m.group(1).replace(",", ""))
+                prev = l
+                continue
+            m = _VIEW_RE.search(l)
+            if m:
+                cur["views"] = int(m.group(1).replace(",", ""))
+                prev = l
+                continue
+            if "社團上架" in l:
+                cur["shared"] = True
+                prev = l
+                continue
+            if l in ("有存貨", "已售出", "已下架", "待處理"):
+                cur["status"] = l
+                prev = l
+                continue
+        prev = l
+    if cur is not None:
+        out.append(cur)
+    # 去掉沒有標題的（頁首雜訊）
+    return [c for c in out if c["title"] and c["title"] not in _SKIP]
