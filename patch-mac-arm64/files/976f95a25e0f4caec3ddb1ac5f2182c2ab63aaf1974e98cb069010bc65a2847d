@@ -1,0 +1,25 @@
+"""FB 通知頁的文字 → 社團審核結果（老闆 2026-09-14：管理員拒絕發布的社團，下次不要再發）。
+
+2026-09-14 實測通知原文：
+  「管理員拒絕了你在<社團名>發佈的貼文。查看意見回饋。」   連結 /groups/<id>/my_declined_content/
+  「一位管理員批准了你在<社團名>發佈的貼文。」            連結 /groups/<id>/posts/<post id>
+"""
+from __future__ import annotations
+
+import re
+
+_DECLINED_RE = re.compile(r"管理員拒絕了你在(.+?)發佈的貼文")
+_APPROVED_RE = re.compile(r"管理員批准了你在(.+?)發佈的貼文")
+_REMOVED_RE = re.compile(r"管理員(?:移除|刪除)了你在(.+?)(?:發佈|的)的?貼文")
+_GROUP_ID_RE = re.compile(r"/groups/(\d+)")
+
+
+def parse_notice(text: str, href: str = "") -> dict | None:
+    """回 {"kind": declined|approved|removed, "group_name", "group_id"}；不是社團審核通知回 None。"""
+    t = " ".join((text or "").split()).replace("未讀 ", "", 1)
+    for kind, rx in (("declined", _DECLINED_RE), ("removed", _REMOVED_RE), ("approved", _APPROVED_RE)):
+        m = rx.search(t)
+        if m:
+            gm = _GROUP_ID_RE.search(href or "")
+            return {"kind": kind, "group_name": m.group(1).strip(), "group_id": gm.group(1) if gm else ""}
+    return None
