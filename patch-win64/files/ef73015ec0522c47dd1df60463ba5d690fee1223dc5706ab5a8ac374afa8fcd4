@@ -1,0 +1,26 @@
+"""互助圈純邏輯（老闆 2026-09-14）"""
+import random
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.circle_parse import parse_members, pick_actions  # noqa: E402
+
+
+def test_parse_members():
+    assert parse_members("台中不動產 · 2.8 萬位成員 · 公開") == 28000
+    assert parse_members("3,619 位成員") == 3619
+    assert parse_members("沒有成員字樣") == 0
+
+
+def test_pick_ratio_caps_and_done():
+    cands = [{"key": f"k{i}"} for i in range(200)]
+    picks = pick_actions(cands, 0.2, 3, 1, {"k0"}, random.Random(7))
+    assert 1 <= len(picks) <= 4
+    assert sum(p["action"] == "like" for p in picks) <= 3 and sum(p["action"] == "comment" for p in picks) <= 1
+    assert all(p["key"] != "k0" for p in picks)
+    # 機率 0 → 完全不出手
+    assert pick_actions(cands, 0.0, 3, 1, set(), random.Random(1)) == []
+    # 統計上出手比例不超過 ratio 太多（上限之前）
+    n = sum(len(pick_actions([{"key": f"x{i}"} for i in range(5)], 0.2, 9, 9, set(), random.Random(s))) for s in range(300))
+    assert n / 1500 < 0.3

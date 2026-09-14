@@ -1,0 +1,41 @@
+"""互助圈（介紹人互相按讚／留言）的純邏輯：成員數解析、要不要出手（老闆 2026-09-14：機率 ≤20%、社團 ≥5000 人）。"""
+from __future__ import annotations
+
+import random
+import re
+
+_MEMBERS_RE = re.compile(r"([\d.,]+)\s*(萬)?\s*位成員")
+
+
+def parse_members(text: str) -> int:
+    """「2.8 萬位成員」→ 28000；「3,619 位成員」→ 3619；抓不到回 0。"""
+    m = _MEMBERS_RE.search(text or "")
+    if not m:
+        return 0
+    try:
+        n = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return 0
+    if m.group(2):
+        n *= 10000
+    return int(n)
+
+
+def pick_actions(candidates: list[dict], ratio: float, max_likes: int, max_comments: int,
+                 done: set[str], rng: random.Random | None = None) -> list[dict]:
+    """candidates：[{key, ...}]（已依新到舊排）。每篇只有 ratio 的機率出手；先讚後留言，各有上限；做過的不重做。
+    回 [{**cand, "action": "like"|"comment"}]。"""
+    rng = rng or random.Random()
+    likes, comments, out = 0, 0, []
+    for c in candidates:
+        if c.get("key") in done:
+            continue
+        if likes >= max_likes and comments >= max_comments:
+            break
+        if rng.random() >= ratio:
+            continue
+        if likes < max_likes and (comments >= max_comments or rng.random() < 0.65):
+            out.append({**c, "action": "like"}); likes += 1
+        elif comments < max_comments:
+            out.append({**c, "action": "comment"}); comments += 1
+    return out
