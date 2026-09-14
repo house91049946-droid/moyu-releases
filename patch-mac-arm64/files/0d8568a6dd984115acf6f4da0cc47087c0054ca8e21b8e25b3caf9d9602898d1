@@ -1,0 +1,138 @@
+"""互助圈（加購）：介紹人之間互相按讚／留一句像買方的話（老闆 2026-09-14）。
+
+規則寫死在這裡，客戶只能開關：
+  - 只在雙方共同、成員 ≥ 5000 的社團；只對介紹關係的夥伴
+  - 每篇貼文只有 20% 機率出手；每帳號每天最多 3 讚 1 留言
+  - 每天兩場，時間在 10:00～21:00 隨機；跟其他瀏覽器任務排隊
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import random
+import tempfile
+
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+from sqlalchemy import select
+
+from ..database import (SyncSession, Account, Group, TAIPEI, circle_enabled_sync, circle_done_keys_sync,
+                        circle_today_sync, circle_record_sync)
+from .task_runner import scheduler
+
+RATIO = 0.2
+MAX_LIKES = 3
+MAX_COMMENTS = 1
+MIN_MEMBERS = 5000
+RUNS_PER_DAY = 2
+WINDOW = (10, 21)
+PLAN_AT = (9, 30)
+
+
+def plan_times(n: int, window: tuple[int, int], now: datetime.datetime, rng: random.Random | None = None) -> list[datetime.datetime]:
+    """純函式：今天 window 內挑 n 個至少間隔 90 分鐘、且在 now 之後的時間。"""
+    rng = rng or random.Random()
+    start = now.replace(hour=window[0], minute=0, second=0, microsecond=0)
+    end = now.replace(hour=window[1], minute=0, second=0, microsecond=0)
+    if end <= start:
+        return []
+    out: list[datetime.datetime] = []
+    for _ in range(50):
+        if len(out) >= n:
+            break
+        t = start + datetime.timedelta(minutes=rng.randint(0, int((end - start).total_seconds() // 60)))
+        if t <= now or any(abs((t - o).total_seconds()) < 5400 for o in out):
+            continue
+        out.append(t)
+    return sorted(out)
+
+
+def available() -> bool:
+    from ..cloud_client import license_addons
+    return "circle" in license_addons()
+
+
+def _accounts() -> list[tuple[int, str, str]]:
+    with SyncSession() as s:
+        return [(a.id, a.fb_user_id, a.name or a.email or "") for a in s.execute(select(Account)).scalars().all() if a.fb_user_id]
+
+
+def _groups_of(account_id: int) -> list[dict]:
+    with SyncSession() as s:
+        rows = s.execute(select(Group).where(Group.account_id == account_id)).scalars().all()
+    out = []
+    for g in rows:
+        gid = g.group_id or next((p for p in (g.group_url or "").rstrip("/").split("/")[-2:] if p.isdigit()), "")
+        if gid and not getattr(g, "post_blocked", False):
+            out.append({"id": str(gid), "name": g.group_name or "", "members": int(g.member_count or 0)})
+    return out
+
+
+async def run_once(dry_run: bool = False) -> dict:
+    import asyncio
+    from ..cloud_client import circle_sync, circle_partners, CloudError
+    from ..fbauto_bridge import start_long_op, wait_fbid_free, cookie_exists
+    if not available():
+        return {"skipped": "未加購互助圈"}
+    if not circle_enabled_sync():
+        return {"skipped": "互助圈沒有開"}
+    jobs, notes = [], []
+    for account_id, fbid, name in await asyncio.to_thread(_accounts):
+        if not cookie_exists(fbid):
+            continue
+        today = await asyncio.to_thread(circle_today_sync, account_id)
+        if today["likes"] >= MAX_LIKES and today["comments"] >= MAX_COMMENTS:
+            notes.append(f"{fbid} 今天額度用完"); continue
+        groups = await asyncio.to_thread(_groups_of, account_id)
+        try:
+            await asyncio.to_thread(circle_sync, fbid, name, True, groups)
+            pr = await asyncio.to_thread(circle_partners, fbid)
+        except CloudError as e:
+            notes.append(str(e)); continue
+        partners = pr.get("partners") or []
+        if not partners:
+            notes.append(f"{fbid}：{pr.get('reason') or '沒有夥伴或沒有共同的大社團'}"); continue
+        busy = await wait_fbid_free(fbid, max_wait_sec=900, tag="[circle]")
+        if busy is not None:
+            notes.append(f"{fbid} 瀏覽器被「{busy.op}」占著"); continue
+        tmp = tempfile.mkdtemp(prefix="circle_")
+        p_path, ph_path, d_path = f"{tmp}/partners.json", f"{tmp}/phrases.json", f"{tmp}/done.json"
+        json.dump(partners, open(p_path, "w", encoding="utf-8"), ensure_ascii=False)
+        json.dump(pr.get("phrases") or [], open(ph_path, "w", encoding="utf-8"), ensure_ascii=False)
+        json.dump(await asyncio.to_thread(circle_done_keys_sync, account_id), open(d_path, "w", encoding="utf-8"))
+        args = ["--fbid", fbid, "--partners-json", p_path, "--phrases-json", ph_path, "--done-json", d_path,
+                "--min-members", str(MIN_MEMBERS), "--ratio", str(RATIO),
+                "--max-likes", str(max(0, MAX_LIKES - today["likes"])), "--max-comments", str(max(0, MAX_COMMENTS - today["comments"])),
+                "--headless"] + (["--dry-run"] if dry_run else [])
+
+        def _on_done(result, _aid=account_id):
+            if not result.success:
+                print(f"[circle] 失敗：{result.error}", flush=True); return
+            d = result.data or {}
+            n = circle_record_sync(_aid, d.get("actions") or [])
+            print(f"[circle] 讚 {d.get('likes', 0)}、留言 {d.get('comments', 0)}（記錄 {n} 筆）", flush=True)
+        try:
+            jobs.append(start_long_op("circle", "src.run_circle", args, account_id=account_id, fbid=fbid, on_done=_on_done))
+        except RuntimeError as e:
+            notes.append(str(e))
+    return {"jobs": jobs, "notes": notes}
+
+
+async def plan_and_schedule() -> list[str]:
+    if not (available() and circle_enabled_sync()):
+        return []
+    now = datetime.datetime.now(TAIPEI)
+    ids = []
+    for i, t in enumerate(plan_times(RUNS_PER_DAY, WINDOW, now)):
+        jid = f"circle_run_{t.strftime('%H%M')}"
+        scheduler.add_job(func=run_once, trigger=DateTrigger(run_date=t), id=jid, replace_existing=True)
+        ids.append(jid)
+    if ids:
+        print(f"[circle] 今天排 {len(ids)} 場：{', '.join(ids)}", flush=True)
+    return ids
+
+
+async def restore_circle_schedule():
+    scheduler.add_job(func=plan_and_schedule, trigger=CronTrigger(hour=PLAN_AT[0], minute=PLAN_AT[1], timezone=TAIPEI),
+                      id="circle_plan_daily", replace_existing=True)
+    await plan_and_schedule()      # 開機當天也排

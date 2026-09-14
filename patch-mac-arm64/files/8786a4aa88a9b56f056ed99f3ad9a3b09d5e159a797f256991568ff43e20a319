@@ -1,0 +1,96 @@
+"""互助圈（加購）開關與狀態（老闆 2026-09-14）。"""
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..database import get_session, SystemState, Account, circle_today_sync
+
+router = APIRouter(prefix="/api/circle", tags=["circle"])
+
+
+class CircleIn(BaseModel):
+    enabled: bool
+
+
+@router.get("/status")
+async def status(session: AsyncSession = Depends(get_session)):
+    import asyncio
+    from ..cloud_client import license_addons
+    from ..scheduler.circle_runner import RATIO, MAX_LIKES, MAX_COMMENTS, MIN_MEMBERS
+    st = (await session.execute(select(SystemState))).scalars().first()
+    acc = (await session.execute(select(Account).order_by(Account.id))).scalars().first()
+    today = await asyncio.to_thread(circle_today_sync, acc.id) if acc else {"likes": 0, "comments": 0}
+    return {"addon": "circle" in license_addons(), "enabled": bool(st and st.circle_enabled), "today": today,
+            "rules": {"ratio": RATIO, "max_likes": MAX_LIKES, "max_comments": MAX_COMMENTS, "min_members": MIN_MEMBERS}}
+
+
+@router.put("")
+async def put(data: CircleIn, session: AsyncSession = Depends(get_session)):
+    st = (await session.execute(select(SystemState))).scalars().first()
+    if not st:
+        st = SystemState(); session.add(st)
+    st.circle_enabled = data.enabled
+    await session.commit()
+    if data.enabled:
+        from ..scheduler.circle_runner import plan_and_schedule
+        await plan_and_schedule()
+    return {"enabled": data.enabled}
+
+
+class LinkIn(BaseModel):
+    code: str
+
+
+@router.post("/link")
+async def link(data: LinkIn):
+    """用對方的介紹碼加入互助圈（沒有介紹關係的人後來也能加，老闆 2026-09-14）。"""
+    import asyncio
+    from fastapi import HTTPException
+    from ..cloud_client import circle_link, CloudError
+    try:
+        return await asyncio.to_thread(circle_link, data.code)
+    except CloudError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/family")
+async def family():
+    import asyncio
+    from ..cloud_client import circle_family, CloudError
+    try:
+        return await asyncio.to_thread(circle_family)
+    except CloudError as e:
+        return {"partners": [], "error": str(e)}
+
+
+@router.get("/invites")
+async def invites():
+    import asyncio
+    from ..cloud_client import circle_invites, CloudError, license_addons
+    if "circle" not in license_addons():
+        return {"invites": []}
+    try:
+        return await asyncio.to_thread(circle_invites)
+    except CloudError as e:
+        return {"invites": [], "error": str(e)}
+
+
+@router.post("/invites/{link_id}/{decision}")
+async def decide(link_id: int, decision: str):
+    import asyncio
+    from fastapi import HTTPException
+    from ..cloud_client import circle_decide, CloudError
+    try:
+        return await asyncio.to_thread(circle_decide, link_id, decision)
+    except CloudError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/run-now")
+async def run_now(dry_run: bool = True):
+    """測試用：現在跑一場（預設乾跑，只挑不點）。"""
+    from ..scheduler.circle_runner import run_once
+    return await run_once(dry_run=dry_run)
