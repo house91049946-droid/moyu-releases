@@ -1,0 +1,38 @@
+"""社團關於頁解析（老闆 2026-09-15）"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.group_about_parse import extract_about  # noqa: E402
+
+SAMPLE = """台中不動產(中古新房20年內)專區
+私密社團
+·
+2,041 位成員
+關於這個社團
+提供想買新房子的人一個平台
+1.10年內的房子
+2.歡迎仲介同行加入…… 查看更多
+私密
+只有成員可以查看社團成員名單和他們發佈的貼文。
+開放搜尋
+紀錄
+社團建立於 2018年9月12日
+管理員建立的社團規則
+1
+需20年內屋齡，產品不拘，價格不拘
+需20年內屋齡，產品不拘，但不接受預售屋
+2
+須寫屋齡
+須把屋齡明確標示在貼文或標題中 沒打不會批准
+3
+須在台中市
+需要是台中市的不動產"""
+
+
+def test_extract_about():
+    r = extract_about(SAMPLE)
+    assert r["members"] == 2041 and r["has_rules"]
+    assert "歡迎仲介同行加入" in r["about"] and "不接受預售屋" in r["about"] and "須在台中市" in r["about"]
+    assert "只有成員可以查看" not in r["about"]
+    assert extract_about("隨便一頁")["about"] == ""
