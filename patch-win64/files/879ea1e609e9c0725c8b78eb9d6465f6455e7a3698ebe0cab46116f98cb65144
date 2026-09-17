@@ -1,0 +1,29 @@
+"""社團「關於」頁文字 → 描述＋管理員規則（給 AI 讀，老闆 2026-09-15）。
+
+2026-09-15 實測版面（innerText）：
+  …關於這個社團\n<描述>\n私密|公開\n…\n管理員建立的社團規則\n1\n<規則標題>\n<規則內容>\n2\n…
+"""
+from __future__ import annotations
+
+import re
+
+from src.circle_parse import parse_members
+
+_STOP_DESC = ("私密\n", "公開\n", "開放搜尋", "不公開", "紀錄\n")
+
+
+def extract_about(text: str, limit: int = 1500) -> dict:
+    t = (text or "").replace("\r", "")
+    desc = ""
+    i = t.find("關於這個社團")
+    if i >= 0:
+        seg = t[i + len("關於這個社團"):]
+        cut = min([seg.find(s) for s in _STOP_DESC if seg.find(s) >= 0] or [len(seg)])
+        desc = seg[:cut].replace("查看更多", "").strip()
+    rules = ""
+    j = t.find("管理員建立的社團規則")
+    if j >= 0:
+        rules = t[j + len("管理員建立的社團規則"):].strip()
+        rules = re.sub(r"\n\d{1,2}\n", "\n", "\n" + rules).strip()
+    body = (f"描述：{desc}\n" if desc else "") + (f"規則：{rules}" if rules else "")
+    return {"members": parse_members(t), "about": body[:limit], "has_rules": bool(rules)}

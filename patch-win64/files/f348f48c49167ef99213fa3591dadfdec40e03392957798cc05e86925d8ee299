@@ -1,0 +1,70 @@
+"""讀社團「關於」頁（描述＋管理員規則），交給後端送 AI 判斷會不會被拒（老闆 2026-09-15）。
+
+只讀不發。一次一批（後端傳 --groups-json），每個社團間隔隨機幾秒。
+用法：python -m src.run_group_rules --fbid <id> --groups-json g.json --headless --result-json out.json
+groups-json：[{"id": "241315693117084", "name": "..."}]
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import random
+import sys
+
+from src.group_about_parse import extract_about
+from src.utils import launch_browser
+
+_JSON_PATH = None
+_RESULT = None
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fbid", required=True)
+    ap.add_argument("--groups-json", required=True)
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--result-json")
+    a = ap.parse_args()
+    _JSON_PATH = a.result_json
+    _RESULT = {"schema": 1, "success": False, "error": "未完成", "data": {"items": []}}
+    if _JSON_PATH:
+        atexit.register(_write)
+    groups = json.load(open(a.groups_json, encoding="utf-8"))
+    res = launch_browser(a.fbid, headless=a.headless)
+    ctx = res[0]; page = res[2] if len(res) > 2 else ctx.pages[0]
+    try:
+        for n, g in enumerate(groups, 1):
+            gid = str(g.get("id") or "")
+            if not gid:
+                continue
+            try:
+                page.goto(f"https://www.facebook.com/groups/{gid}/about", wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(random.randint(4500, 7000))
+                text = page.evaluate("() => (document.querySelector('[role=\"main\"]') || document.body).innerText")
+                info = extract_about(text)
+            except Exception as e:                    # noqa: BLE001
+                print(f"[rules] {g.get('name') or gid} 讀不到：{e}", flush=True)
+                continue
+            _RESULT["data"]["items"].append({"id": gid, "name": g.get("name", ""), **info})
+            print(f"[rules] {n}/{len(groups)} {(g.get('name') or gid)[:24]}：{info['members']} 人，"
+                  f"{'有規則' if info['has_rules'] else '沒寫規則'}", flush=True)
+            page.wait_for_timeout(random.randint(2000, 5000))
+        _RESULT["success"] = True; _RESULT["error"] = ""
+        print(f"[rules] 讀完 {len(_RESULT['data']['items'])} 個社團", flush=True)
+    except Exception as e:                            # noqa: BLE001
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    finally:
+        with contextlib.suppress(Exception):
+            ctx.close()
+
+
+if __name__ == "__main__":
+    main()
