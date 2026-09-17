@@ -1,0 +1,83 @@
+"""把「已經在架上」的 Marketplace 刊登，用『在更多地方上架』再轉發到社團（老闆 2026-09-17）。
+
+不重新建立刊登——同一個案子重複上架會被 FB 當洗版，也讓買方看到一堆重複。
+用法：python -m src.run_mp_reshare --fbid <id> --item-title "<selling 頁上的標題>" \
+        --groups A B C --headless --result-json out.json
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import random
+import sys
+import time
+
+from src.login import _try_cookie_login
+from src.marketplacePost import list_in_more_places
+from src.utils import launch_browser
+
+_JSON_PATH = None
+_RESULT = None
+BATCH = 20
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fbid", required=True)
+    ap.add_argument("--item-title", required=True)
+    ap.add_argument("--groups", nargs="+", required=True)
+    ap.add_argument("--min-wait", type=float, default=45)
+    ap.add_argument("--max-wait", type=float, default=120)
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--result-json")
+    a = ap.parse_args()
+    _JSON_PATH = a.result_json
+    _RESULT = {"schema": 1, "success": False, "error": "未完成",
+               "data": {"item_title": a.item_title, "groups_submitted": 0, "selected_groups": [], "batches": [], "available": []}}
+    if _JSON_PATH:
+        atexit.register(_write)
+    groups = list(dict.fromkeys(a.groups))
+    random.shuffle(groups)
+    browser, context, page = launch_browser(fbid=a.fbid, headless=a.headless)
+    try:
+        if not _try_cookie_login(page, context, a.fbid):
+            _RESULT["error"] = "FB 登入失效，請重新一鍵登入"
+            sys.exit(1)
+        total = 0
+        batches = [groups[i:i + BATCH] for i in range(0, len(groups), BATCH)]
+        for bi, batch in enumerate(batches):
+            print(f"[reshare] 第 {bi + 1}/{len(batches)} 批：{len(batch)} 個社團", flush=True)
+            r = list_in_more_places(page, a.fbid, a.item_title, batch, dry_run=a.dry_run)
+            n = int(r.get("selected") or 0)
+            total += n
+            _RESULT["data"]["batches"].append({"batch": bi + 1, "requested": len(batch), "selected": n,
+                                               "errors": r.get("errors", [])})
+            if r.get("available"):
+                _RESULT["data"]["available"] = r["available"]
+            # 勾到的就是這批裡對話框有的那些；沒有逐一回名單時以整批計
+            _RESULT["data"]["selected_groups"] += [g for g in batch if not r.get("available") or g in r["available"]][:n]
+            if bi < len(batches) - 1:
+                time.sleep(random.uniform(a.min_wait, a.max_wait))
+        _RESULT["data"]["groups_submitted"] = total
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        print(f"[reshare] 完成：轉發 {total} 個社團（沿用現有刊登，沒有重新上架）", flush=True)
+    except Exception as e:                       # noqa: BLE001
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    finally:
+        for close in (context.close, browser.close):
+            with contextlib.suppress(Exception):
+                close()
+
+
+if __name__ == "__main__":
+    main()
