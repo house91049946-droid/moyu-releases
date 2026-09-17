@@ -1,0 +1,38 @@
+"""救援腳本：把所有進行中的排程改為已停止，讓後端能重新啟動。
+
+用途：排程資料本身害後端啟動失敗時（例如舊版的排程規劃錯誤），
+執行本檔即可開機。只動 status 欄位，帳號/物件/圖片/法定資訊完全不碰。
+"""
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+# DB 位置必須與 backend/app/config.py 的規則一致（SPEC-P23 §3.2）：
+# 便攜包 → 程式目錄旁的 backend/data；安裝版（有設 MOYU_DATA_ROOT）→ <root>/backend
+_root = os.environ.get("MOYU_DATA_ROOT", "").strip()
+if _root:
+    DB = Path(_root).expanduser() / "backend" / "fb_poster.db"
+else:
+    DB = Path(__file__).resolve().parent / "backend" / "data" / "fb_poster.db"
+
+if not DB.exists():
+    print(f"[錯誤] 找不到資料庫：{DB}")
+    print("       若這是安裝版，請確認 MOYU_DATA_ROOT 有正確設定。")
+    sys.exit(1)
+print(f"資料庫：{DB}")
+
+conn = sqlite3.connect(DB)
+total = 0
+for table in ("gp_schedules", "marketplace_schedules"):
+    try:
+        cur = conn.execute(
+            f"UPDATE {table} SET status='stopped' WHERE status='running'"
+        )
+        print(f"  {table}: 停用 {cur.rowcount} 筆")
+        total += cur.rowcount
+    except sqlite3.OperationalError as e:
+        print(f"  {table}: 略過（{e}）")
+conn.commit()
+conn.close()
+print(f"完成，共停用 {total} 筆排程。請重新啟動，然後回介面按「開始排程」。")

@@ -1,0 +1,88 @@
+"""套用／回滾待處理的更新（SPEC-P23 §5）。由啟動器在起服務前呼叫。
+
+用法：
+    python _apply_update.py apply      # 套用 staging 裡待處理的更新
+    python _apply_update.py rollback   # 從備份還原（健康檢查失敗時）
+
+離開碼（啟動器據此決定後續動作）：
+    0  沒有待套用的更新，或套用完成但沒有實際變更 → 照常啟動
+    10 已套用更新 → 照常啟動，但若健康檢查失敗要記得 rollback
+    1  套用失敗 → 已保持原狀，照常啟動舊版即可
+
+⚠️ 只能在 backend / frontend 都還沒啟動時執行。那時 python.exe / node.exe
+   尚未載入，檔案沒被鎖才能安全覆蓋（Windows 不允許覆蓋執行中的檔案）。
+"""
+import os
+import sys
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent          # 包根（程式所在）
+
+# 資料層位置與 backend/app/config.py 同一份規則（SPEC-P23 §3.2）
+_root = os.environ.get("MOYU_DATA_ROOT", "").strip()
+DATA = (Path(_root).expanduser() / "backend") if _root else (BASE / "backend" / "data")
+STAGING = DATA / ".update_staging"
+BACKUP = DATA / ".update_backup"
+
+sys.path.insert(0, str(BASE / "backend"))
+try:
+    from app.updater import apply_staged, rollback, read_pending
+except Exception as e:                          # noqa: BLE001 - 缺檔/語法錯都不該擋啟動
+    print(f"[update] 無法載入 updater（略過更新）：{e}")
+    sys.exit(0)
+
+STATE_FILE = DATA / ".update_state.json"
+
+
+def write_state(action, version=None, detail=""):
+    """留一筆狀態給儀表板顯示——客戶必須看得到「剛剛更新了什麼」，
+    不然背後換了十幾個檔案他完全不知情（SPEC-P23 §3.5 的延伸）。"""
+    import datetime
+    import json
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps({
+            "action": action,              # applied / rolled_back / failed
+            "version": version,
+            "detail": detail,
+            "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        }, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass                               # 寫不了狀態不該影響更新本身
+
+
+action = sys.argv[1] if len(sys.argv) > 1 else "apply"
+
+if action == "rollback":
+    r = rollback(BASE, BACKUP)
+    print(f"[update] 回滾：還原 {r['restored']} 個檔案"
+          + (f"，錯誤：{r['error']}" if r.get("error") else ""))
+    write_state("rolled_back", detail=f"已還原 {r['restored']} 個檔案")
+    sys.exit(0 if r["ok"] else 1)
+
+pending = read_pending(STAGING)
+if not pending:
+    sys.exit(0)                                 # 沒有待套用的更新，安靜離開
+
+r = apply_staged(BASE, STAGING, BACKUP)
+if not r["ok"]:
+    # 失敗時 apply_staged 保證沒留下混版目錄，所以舊版仍可啟動
+    print(f"[update] 套用失敗，維持原版本：{r['error']}")
+    write_state("failed", pending.get("version"), r["error"] or "")
+    sys.exit(1)
+if r.get("skipped") or (r["applied"] == 0 and r["removed"] == 0):
+    sys.exit(0)
+
+ver = r.get("version") or "新版本"
+print(f"[update] 已更新到 {ver}（{r['applied']} 個檔案更新、{r['removed']} 個移除）")
+write_state("applied", ver, f"{r['applied']} 個檔案更新、{r['removed']} 個移除")
+# 套用成功後清掉 staging，避免下次啟動又套一次。
+# 下載狀態檔也要一起清——它是給儀表板看的「已下載完成，重開就生效」，
+# 留著會在更新完成後繼續叫客戶重開軟體（實測時就出現這個假提示）。
+import shutil
+shutil.rmtree(STAGING, ignore_errors=True)
+try:
+    (DATA / ".update_download.json").unlink(missing_ok=True)
+except OSError:
+    pass
+sys.exit(10)

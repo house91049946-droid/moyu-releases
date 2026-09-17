@@ -1,0 +1,53 @@
+"""開機時檢查並下載更新。由啟動器在「起服務之前」呼叫。
+
+為什麼放在啟動流程裡而不是只靠背景檢查：客戶要的是「打開就是最新版」。
+背景下載＋下次啟動才套用，等於客戶這一次用的永遠是舊版，而且他完全不知道
+自己手上有一包沒裝的更新。改成開機時先抓好、當場裝，行為才符合直覺。
+
+離開碼：
+    0  沒有更新可下載（或功能未啟用／查不到）→ 照常啟動
+    10 已下載完成，等著被 _apply_update.py 套用
+    1  這次檢查失敗 → 照常啟動舊版（更新永遠不該擋住開機）
+
+⚠️ 網路慢或雲端沒回應時，啟動器會在逾時後直接放行。寧可用舊版開起來，
+   也不能讓客戶盯著一個不會動的視窗。
+"""
+import os
+import sys
+from pathlib import Path
+
+# 必須在 ssl 被用到之前：裝置路徑的 SSLKEYLOGFILE 會讓 OpenSSL abort（不是例外，
+# 攔不到），更新檢查一走 HTTPS 整個進程就死掉，客戶只看到啟動器卡住、日誌全空。
+os.environ.pop("SSLKEYLOGFILE", None)
+
+BASE = Path(__file__).resolve().parent
+
+# 資料層位置與 backend/app/config.py 同一份規則（SPEC-P23 §3.2）
+_root = os.environ.get("MOYU_DATA_ROOT", "").strip()
+sys.path.insert(0, str(BASE / "backend"))
+
+try:
+    from app.update_downloader import check_and_stage
+except Exception as e:                          # noqa: BLE001 - 缺檔/語法錯都不該擋啟動
+    print(f"[update] 無法載入更新模組（略過）：{e}")
+    sys.exit(0)
+
+try:
+    r = check_and_stage(timeout=45)
+except Exception as e:                          # noqa: BLE001
+    print(f"[update] 檢查失敗（略過）：{e}")
+    sys.exit(1)
+
+status = r.get("status")
+if status == "staged":
+    mb = (r.get("bytes") or 0) / 1e6
+    print(f"[update] 已下載 {r.get('version')}（{r.get('files')} 個檔案，{mb:.1f} MB）")
+    sys.exit(10)
+if status == "full":
+    print(f"[update] 需要整包更新：{r.get('reason')}")
+    sys.exit(0)
+if status == "error":
+    print(f"[update] {r.get('reason')}")
+    sys.exit(1)
+print(f"[update] {r.get('reason') or status}")
+sys.exit(0)
