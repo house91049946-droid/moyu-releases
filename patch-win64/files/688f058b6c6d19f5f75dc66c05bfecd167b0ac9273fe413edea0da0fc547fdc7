@@ -1,0 +1,62 @@
+"""匯入只能拿「這間房自己的照片」（客戶 2026-09-17：抓到別人的、甚至別家品牌的照片）。"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.run_import_url import _pick_candidates, photo_id, photo_index  # noqa: E402
+
+OG = "https://static.rakuya.com.tw/r2/n552/e1/39/35469552_1_b.jpeg?1789374297"
+MINE = [f"https://static.rakuya.com.tw/r2/n552/e1/39/35469552_{i}_b.jpeg?1789374297" for i in range(1, 23)]
+OTHERS = [
+    "https://static.rakuya.com.tw/r2/n997/76/37/35475997_1_c.jpeg",      # 推薦物件（別人的）
+    "https://static.rakuya.com.tw/r2/n963/5c/40/35166963_15_c.jpeg",     # 社區其他物件
+    "https://static.rakuya.com.tw/avatars/40/avatar_1039240_160.jpeg",   # 經紀人頭像
+    "https://community.rakuya.com.tw/static/img/logo-LINE@_typeB.png",   # 廣告／logo
+]
+
+
+def test_photo_id():
+    assert photo_id(OG) == "35469552" and photo_index(MINE[11]) == 12
+    assert photo_id(OTHERS[0]) == "35475997" and photo_id(OTHERS[3]) == ""
+
+
+def test_only_own_photos():
+    raw = [{"src": u} for u in OTHERS[:2] + MINE + OTHERS[2:]]
+    got = _pick_candidates(raw, OG, 40)
+    assert all(photo_id(u) == "35469552" for u in got), got
+    assert len(got) == 22 and photo_index(got[0]) == 1 and photo_index(got[-1]) == 22
+
+
+def test_gallery_fallback_when_no_id():
+    """別的網站沒有編號規則 → 只收相簿容器裡的圖。"""
+    raw = [{"src": "https://x.com/ads/banner.jpg"},
+           {"src": "https://x.com/p/a.jpg", "gal": True},
+           {"src": "https://x.com/p/b.jpg", "gal": True},
+           {"src": "https://x.com/other/listing2.jpg"}]
+    got = _pick_candidates(raw, "", 10)
+    assert got == ["https://x.com/p/a.jpg", "https://x.com/p/b.jpg"]
+
+
+def test_plain_page_keeps_old_behaviour():
+    raw = [{"src": "https://y.com/img/1.jpg"}, {"src": "https://y.com/img/2.jpg"}]
+    got = _pick_candidates(raw, "https://y.com/img/1.jpg", 10)
+    assert got == ["https://y.com/img/1.jpg", "https://y.com/img/2.jpg"]
+
+
+PLACEHOLDER = "https://assets.rakuya.com.tw/static/vue3/img/default/default_b.jpg"
+
+
+def test_照片準備中的佔位圖不匯入():
+    """樂屋每個相簿最後掛一張「照片準備中」，480x360 過得了尺寸門檻，
+    不擋掉就會變成這間房的一張照片（老闆 2026-09-20 回報）。"""
+    raw = [{"src": u, "gal": True} for u in MINE[:3] + [PLACEHOLDER]]
+    picked = _pick_candidates(raw, OG, 30)
+    assert PLACEHOLDER not in picked
+    assert len([p for p in picked if "35469552_" in p]) == 3
+
+
+def test_沒有編號線索時也擋得掉():
+    raw = [{"src": PLACEHOLDER, "gal": True},
+           {"src": "https://static.rakuya.com.tw/r2/n731/c5/88/29772731_1_b.jpeg", "gal": True}]
+    picked = _pick_candidates(raw, "", 30)
+    assert picked == ["https://static.rakuya.com.tw/r2/n731/c5/88/29772731_1_b.jpeg"]
