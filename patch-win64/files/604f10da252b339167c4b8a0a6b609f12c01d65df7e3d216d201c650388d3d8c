@@ -1,0 +1,886 @@
+"""摸魚啟動器（有視窗的版本）。點桌面圖示走這支。
+
+客戶看得見進度，不再是點完圖示後十幾秒的空白：
+    [魚在水裡游] 檢查更新中…… → 啟動中（倒數秒數）→ [進入儀表板]
+
+魚是用 Canvas 手繪的（造型取自 frontend/public/favicon.svg），不必多帶圖檔，
+也才能真的游起來。整個視窗就是一塊 Canvas——macOS 的 tk.Button 不吃 bg，
+自己畫按鈕才能在 Windows 與 mac 長得一樣。
+
+tkinter 可用：包內 Python（python-build-standalone）已把 _tkinter 靜態編進去，
+不必多帶依賴。純文字版的 啟動.bat / 啟動.command 保留給排錯用。
+
+GUI 執行緒不做任何等待——實際工作都在背景執行緒，用佇列回報進度。
+
+※ 設定值由 HEAD 樣板注入，程式本體是 raw string：GUI 程式碼裡的大括號太多，
+   整檔跑 .format() 只會換來一堆轉義錯誤（不像 _apply_update.py 幾乎沒有）。
+"""
+BACK_PORT = "13081"
+FRONT_PORT = "13000"
+CLOUD_URL = "https://morefishs.com"
+VERSION = "1.0.64"
+
+# ⚠️ 必須在任何 ssl 相關動作之前。TLS 監控軟體會把 SSLKEYLOGFILE 注入成裝置
+# 路徑，OpenSSL 拿到會直接 abort（不是例外，攔不到），啟動器整個死在對話框上，
+# 服務永遠起不來且沒有任何日誌（2026-08-06 Windows 實測）。
+import os as _os
+_os.environ.pop("SSLKEYLOGFILE", None)
+
+import contextlib
+import json
+import math
+import os
+import queue
+import random
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import webbrowser
+from pathlib import Path
+
+import tkinter as tk
+
+BASE = Path(__file__).resolve().parent
+IS_WIN = sys.platform.startswith("win")
+
+HEALTH = f"http://127.0.0.1:{BACK_PORT}/api/health"
+# 資料夾（跟 _apply_update.py 同一套規則）：後端寫的「請現在套用更新」記號放這裡（2026-09-10）
+_data_root = os.environ.get("MOYU_DATA_ROOT", "")
+if not _data_root and IS_WIN and (BASE / "_installed").exists():
+    # 安裝版：跟 child_env() 同一條規則，不然啟動器盯的是 Program Files 下永遠不會出現的記號
+    _data_root = str(Path(os.environ.get("LOCALAPPDATA", "")) / "moyu")
+DATA = (Path(_data_root).expanduser() / "backend") if _data_root else (BASE / "backend" / "data")
+UPDATE_MARKER = DATA / ".update_apply_request"
+STAGING_PENDING = DATA / ".update_staging" / "pending_update.json"   # 後端背景下載好、等著套用的版本
+DASHBOARD = f"http://localhost:{FRONT_PORT}"
+
+# 配色取自 favicon.svg（魚身 #38bdf8、眼睛 #0f172a）
+SEA = "#0f172a"
+DEEP = "#0b1220"
+FISH = "#38bdf8"
+FISH_FAR = "#1e5b82"      # 遠景那條：同色系壓暗，做出景深
+FISH_DIM = "#64748b"      # 失敗／已停止時的灰
+WEED = "#12324a"
+STOP_BG = "#f59e0b"       # 左上角「停止服務」的底色：橘色，客戶要看得到（老闆 2026-09-17）
+STOP_HOVER = "#fbbf24"    # 滑過時提亮
+INK = "#e2e8f0"
+MUTED = "#94a3b8"
+DANGER = "#f87171"
+FONT = "Microsoft JhengHei UI" if IS_WIN else "PingFang TC"
+
+W, H = 420, 372
+SEA_H = 150
+WAIT_TICKS, WAIT_EVERY = 45, 2      # 健康檢查：45 次 × 2 秒 = 90 秒
+HINT_RUNNING = "服務會在背景執行，關掉視窗不影響排程發文"
+
+
+def port_taken(port: str) -> bool:
+    """埠上有沒有東西在聽（不管它健不健康）。"""
+    import socket
+    with socket.socket() as sk:
+        sk.settimeout(0.6)
+        try:
+            sk.connect(("127.0.0.1", int(port)))
+            return True
+        except OSError:
+            return False
+
+
+def service_up(timeout=2) -> bool:
+    """服務是否「真的」可用：後端健康、版本相符、而且**前端也回得了話**。
+
+    原本只打後端 /api/health 就算數，帶來兩個實際故障（2026-08-04 在開發機重現）：
+      1. 前端 node 掛掉但仍占著埠時，後端照樣回 200 → 啟動器顯示「已在執行中」
+         → 客戶按「進入儀表板」→ 瀏覽器開了卻一直轉，這就是「無法順利開啟儀表板」
+      2. 舊版本的服務還在背景跑時，啟動新版的包也會被判定為「已在執行中」，
+         客戶看到的其實是舊版畫面，會以為新版沒生效
+    所以三個條件都要成立才算「已在執行中」，否則就照正常流程重新啟動服務。
+    """
+    try:
+        with urllib.request.urlopen(HEALTH, timeout=timeout) as r:
+            body = r.read(400).decode("utf-8", "replace")
+        if '"status"' not in body:
+            return False
+        # 版本要跟這個包一致，否則背景跑的是別版，得由我們接手。
+        # ⚠️ 要拿 manifest 的真實版本比，不能拿打包時寫死的 VERSION：補丁更新後 VERSION
+        # 就過期了，會把自己剛更新好的正常服務當成「別版」砍掉重開——常駐（launchd）
+        # 的服務砍了會立刻復活，兩邊搶埠，客戶看到「啟動失敗」（老闆 2026-09-08）。
+        mine = local_version()
+        if f'"version":"{mine}"' not in body.replace(" ", ""):
+            print(f"[launcher] 背景服務不是這一版（本包 {mine}），將重新啟動", flush=True)
+            return False
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+    # 前端也要活著——儀表板是客戶真正要看到的東西
+    try:
+        with urllib.request.urlopen(DASHBOARD, timeout=max(timeout, 5)) as r:
+            r.read(1)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"[launcher] 後端活著但前端沒回應（{e}），將重新啟動", flush=True)
+        return False
+    return True
+
+
+def strip_ssl_keylog(env: dict) -> None:
+    """拿掉 SSLKEYLOGFILE——這個變數可以讓整個啟動器當場死掉。
+
+    CPython 的 ssl.create_default_context() 最後會把 SSLKEYLOGFILE 的值交給
+    OpenSSL 去 fopen。企業常見的 TLS 監控軟體會把它注入成**裝置路徑**
+    （例如 \\\\.\\nllMonFltProxy\\<id>），而包內 Python 的 OpenSSL DLL 沒有
+    applink，拿到那種 FILE* 會直接 abort——**不是丟例外，try/except 攔不到**。
+
+    客戶看到的是：點了「摸魚」→ 跳出「OpenSSL: FATAL / no OPENSSL_Applink」
+    模態對話框 → 服務永遠起不來 → 而且因為是 abort，logs/ 裡什麼都沒有，
+    連一鍵回報都送不出去（回報本身要走 HTTPS）。2026-08-06 Windows 驗收實測。
+
+    摸魚本來就不需要側錄 TLS 金鑰，拔掉零風險。
+    """
+    env.pop("SSLKEYLOGFILE", None)
+
+
+def child_env() -> dict:
+    env = dict(os.environ)
+    strip_ssl_keylog(env)
+    env["MOYU_CLOUD_URL"] = CLOUD_URL
+    env["PLAYWRIGHT_BROWSERS_PATH"] = str(BASE / "browsers")
+    env["NEXT_TELEMETRY_DISABLED"] = "1"
+    env["PYTHONUTF8"] = "1"
+    env["FB_CORS_ORIGINS"] = f"http://localhost:{FRONT_PORT},http://127.0.0.1:{FRONT_PORT}"
+    # 安裝版把資料放 %LOCALAPPDATA%\moyu（規則與 _run_backend.bat 一致）
+    if (BASE / "_installed").exists() and IS_WIN:
+        env["MOYU_DATA_ROOT"] = str(Path(os.environ.get("LOCALAPPDATA", "")) / "moyu")
+    return env
+
+
+# pythonw.exe 起的 GUI 進程本身沒有 console，但它每呼叫一次 subprocess.run 去跑
+# python.exe / netstat / taskkill，Windows 就會**替那個子進程開一個新的主控台視窗**
+# ——客戶看到的「不用操作、也沒東西在跑的 CMD 黑窗」就是這個（2026-08-02 回報）。
+# 所有短命子進程都要帶 CREATE_NO_WINDOW。
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
+
+
+def run_quiet(cmd, **kw):
+    """subprocess.run 但在 Windows 上絕不彈出主控台視窗。"""
+    return subprocess.run(cmd, **{**NO_WINDOW, **kw})
+
+
+def hide_siblings():
+    """把包內除啟動器外的項目設為隱藏。
+
+    打包時已經做過一次，但 zip 不會保留隱藏屬性，客戶解壓出來又是滿滿一整頁
+    ——所以每次啟動再做一次（很快，且冪等）。客戶反映「希望只看到一個可以點
+    的圖示」（2026-08-03）。
+    """
+    keep = {"摸魚.exe", "摸魚.vbs", "摸魚.app", "README.txt"}
+    if (BASE / "摸魚.exe").exists():
+        keep.discard("摸魚.vbs")   # 有帶魚圖示的 exe 時它才是唯一入口，vbs 留作備援一起藏
+    # logs/ 是服務啟動時才建立的，晚於本函式執行時點——先建好一起藏，否則
+    # 第一次啟動後客戶會多看到一個 logs 資料夾（2026-08-06 Windows 驗收發現）
+    with contextlib.suppress(OSError):
+        (BASE / "logs").mkdir(exist_ok=True)
+    try:
+        targets = [p for p in BASE.iterdir() if p.name not in keep and not p.name.startswith(".")]
+    except OSError:
+        return
+    if not targets:
+        return
+    try:
+        if IS_WIN:
+            for t in targets:
+                run_quiet(["attrib", "+h", str(t)], capture_output=True, timeout=10)
+        else:
+            run_quiet(["chflags", "hidden", *[str(t) for t in targets]],
+                      capture_output=True, timeout=10)
+    except Exception:
+        pass          # 純美觀，失敗絕不能擋住啟動
+
+
+def ensure_desktop_shortcut():
+    """在桌面放一個捷徑指回啟動器（沒有就建，冪等）。
+
+    便攜包是解壓即用、沒有安裝程序——客戶解到「下載」裡，之後就再也找不到
+    怎麼打開。安裝版的 Inno Setup 本來就會建桌面捷徑，便攜版沒有；這裡補上，
+    兩種安裝方式體驗一致。
+
+    Windows 用一支臨時 VBS 來建：
+      - 桌面路徑交給 sh.SpecialFolders("Desktop") 問系統，OneDrive 轉址過的
+        桌面才找得到（直接組 %USERPROFILE% 底下的 Desktop 在那些機器上會落空）。
+      - 檔案必須寫成 UTF-16：WScript 預設以系統 ANSI 讀 .vbs，UTF-8 的中文
+        在 Big5 機器上會變亂碼（同包其他 vbs 都刻意只用 ASCII 就是為了避開
+        這件事，這裡需要中文檔名，所以改用 UTF-16）。
+      - 「已存在就不建」的判斷也放在 VBS 裡，因為桌面路徑只有它知道。
+
+    失敗一律吞掉——這是便利功能，絕不能擋住啟動。
+    """
+    try:
+        if IS_WIN:
+            target = BASE / ("摸魚.exe" if (BASE / "摸魚.exe").exists() else "摸魚.vbs")
+            if not target.exists():
+                return
+            icon = BASE / "frontend/public/favicon.ico"
+            lines = [
+                'Set sh = CreateObject("WScript.Shell")',
+                'Set fso = CreateObject("Scripting.FileSystemObject")',
+                'p = sh.SpecialFolders("Desktop") & "\\摸魚.lnk"',
+                'If Not fso.FileExists(p) Then',
+                '  Set lnk = sh.CreateShortcut(p)',
+                '  lnk.TargetPath = "%s"' % target,
+                '  lnk.WorkingDirectory = "%s"' % BASE,
+                '  lnk.Description = "開啟摸魚"',
+            ]
+            if icon.exists():
+                lines.append('  lnk.IconLocation = "%s"' % icon)
+            lines += ['  lnk.Save', 'End If']
+            vbs = BASE / "_mkshortcut.vbs"
+            vbs.write_text("\r\n".join(lines), encoding="utf-16")
+            wscript = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "wscript.exe"
+            run_quiet([str(wscript) if wscript.exists() else "wscript", str(vbs)],
+                      capture_output=True, timeout=20)
+            with contextlib.suppress(OSError):
+                vbs.unlink()
+        else:
+            desktop = Path.home() / "Desktop"
+            app = BASE / "摸魚.app"
+            if not desktop.is_dir() or not app.exists():
+                return
+            # 連結要保留 .app 副檔名：Finder 才會顯示 app 本身的圖示，
+            # 沒有副檔名的符號連結會變成通用替身圖示。
+            link = desktop / "摸魚.app"
+            # 桌面上已經有任一種摸魚連結就不動——不論是客戶自己放的、還是
+            # 舊版建的無副檔名版本。多一個同名圖示比沒有更糟。
+            for name in ("摸魚.app", "摸魚"):
+                q = desktop / name
+                if q.exists() or q.is_symlink():
+                    return
+            link.symlink_to(app)
+    except Exception:
+        pass          # 便利功能，失敗絕不能擋住啟動
+
+
+def spawn_detached(cmd, cwd, log_name, env):
+    """啟動服務並與本進程脫離——關掉啟動器視窗不能影響排程發文。"""
+    logs = BASE / "logs"
+    logs.mkdir(exist_ok=True)
+    out = open(logs / log_name, "ab")
+    kw = {"cwd": str(cwd), "env": env, "stdout": out, "stderr": out,
+          "stdin": subprocess.DEVNULL}
+    if IS_WIN:
+        kw["creationflags"] = (subprocess.CREATE_NO_WINDOW
+                               | subprocess.DETACHED_PROCESS
+                               | subprocess.CREATE_NEW_PROCESS_GROUP)
+    else:
+        kw["start_new_session"] = True
+    return subprocess.Popen(cmd, **kw)
+
+
+def _vtuple(v: str) -> tuple:
+    try:
+        return tuple(int(x) for x in (v or "").strip().split("."))
+    except ValueError:
+        return ()
+
+
+def staged_pending_version() -> str:
+    """後端已經下載好、等著套用的版本；沒有就回空字串。"""
+    try:
+        return str(json.loads(STAGING_PENDING.read_text(encoding="utf-8")).get("version") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def local_version() -> str:
+    """真實版本讀包根的 manifest.json，不用打包時寫死的 VERSION。
+
+    啟動器自己不在補丁範圍內（執行中的腳本覆蓋自己會出事），所以更新後 VERSION
+    這個常數就過期了。先前實測時畫面顯示 v1.0.4、狀態卻說「已是最新版本」，
+    看起來就像「它說 1.0.4 是最新版」——其實內部早就是 1.0.5 了。
+    """
+    try:
+        data = json.loads((BASE / "manifest.json").read_text(encoding="utf-8"))
+        return str(data.get("version") or VERSION)
+    except (OSError, ValueError, TypeError):
+        return VERSION
+
+
+def linger(since: float, seconds: float) -> None:
+    """階段太快結束就補足停留時間。
+
+    補丁通常只有幾 KB，抓完＋換檔不到一秒——訊息一閃而過，客戶會以為根本沒檢查
+    更新（實測時就是這樣：更新確實做完了，人卻沒看見）。寧可多停一秒。
+    """
+    left = seconds - (time.monotonic() - since)
+    if left > 0:
+        time.sleep(left)
+
+
+def wave_pts(y, amp=3.5, n=8):
+    """一條橫貫水域的和緩波紋（smooth 折線的控制點）。"""
+    pts = []
+    for i in range(n + 1):
+        pts += [W * i / n, y + amp * math.sin(i * 1.3 + y * 0.11)]
+    return pts
+
+
+def round_rect(cv, x1, y1, x2, y2, r, **kw):
+    """圓角矩形。Canvas 沒有現成的，用 smooth 多邊形逼近（轉角各給兩個點）。"""
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
+class Fish:
+    """會游的魚。造型照 favicon.svg 的座標（身體橢圓 rx11 ry7、尾鰭三角、眼睛在左），
+    scale 就是那份 32×32 座標的放大倍率。
+
+    碰到邊會轉身游回來，不用「游出畫面再從另一邊出現」——那會有幾秒空水槽，
+    而客戶看到空水槽的時機偏偏常是「準備就緒」那一刻。
+    """
+
+    def __init__(self, cv, scale, color, speed, y, phase=0.0):
+        self.cv, self.s, self.color, self.speed = cv, scale, color, speed
+        self.body = cv.create_oval(0, 0, 0, 0, fill=color, outline="")
+        self.tail = cv.create_polygon(0, 0, 0, 0, 0, 0, fill=color, outline="")
+        self.eye = cv.create_oval(0, 0, 0, 0, fill=SEA, outline="")
+        self.x, self.y, self.phase = W * 0.7, y, phase
+        self.head = -1.0                  # -1 朝左、+1 朝右（favicon 原圖朝左）
+
+    def swim(self, t):
+        s, d = self.s, self.head
+        self.x += self.speed * d
+        edge = 20 * s
+        if self.x < edge or self.x > W - edge:      # 到邊轉身，順便換個水深
+            self.head = -d
+            self.x = min(max(self.x, edge), W - edge)
+            self.y += random.uniform(-14, 14)
+            self.y = min(max(self.y, 30), SEA_H - 30)
+        x = self.x
+        y = self.y + 5 * math.sin(t * 0.06 + self.phase)
+        wag = math.cos(t * 0.28 + self.phase)
+        spread = 6 * s * (0.4 + 0.6 * abs(wag))
+        self.cv.coords(self.body, x - 11 * s, y - 7 * s, x + 11 * s, y + 7 * s)
+        self.cv.coords(self.tail, x - d * 9 * s, y,
+                       x - d * 18 * s, y - spread + 3 * s * wag,
+                       x - d * 18 * s, y + spread + 3 * s * wag)
+        self.cv.coords(self.eye, x + d * 6.4 * s, y - 3.4 * s,
+                       x + d * 3.6 * s, y - 0.6 * s)
+        return x + d * 11 * s, y - 4      # 嘴巴位置（吐泡泡用）
+
+    def recolor(self, color):
+        self.cv.itemconfigure(self.body, fill=color)
+        self.cv.itemconfigure(self.tail, fill=color)
+
+
+class Launcher(tk.Tk):
+    HOVER = {FISH: "#7dd3fc", DANGER: "#fca5a5"}
+
+    def __init__(self):
+        super().__init__()
+        self.title("摸魚 房仲快樂生活")
+        self.resizable(False, False)
+        self.configure(bg=DEEP)
+        self.q = queue.Queue()
+        self.t = 0                 # 動畫節拍（每 40ms 一拍）
+        self.updating = False        # 正在為了套用更新而重啟
+        self.force_restart = False   # 更新要求：即使服務在跑也要停掉重來
+        self.can_enter = False
+        self.failed = False
+        self.stopped = False
+        self.stop_armed = False    # 停止鈕按過一次、等第二次確認
+        self.left = 0              # 倒數秒數，0 = 不顯示
+        self.dots = "檢查更新中"    # 會被接上跳動的點
+        self.btn_fill = FISH
+        self.btn_action = "enter"
+
+        cv = self.cv = tk.Canvas(self, width=W, height=H, bg=DEEP,
+                                 highlightthickness=0)
+        cv.pack()
+
+        # ── 水域：魚在這裡游（畫的順序＝前後順序，遠景先畫）──
+        cv.create_rectangle(0, 0, W, SEA_H, fill=SEA, outline="")
+        for y, tone in ((44, "#16223a"), (86, "#141d31"), (124, "#121a2b")):
+            cv.create_line(wave_pts(y), smooth=True, fill=tone, width=2)
+        self.weeds = [[cv.create_polygon(0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                         smooth=True, fill=WEED, outline=""), x, h, ph]
+                      for x, h, ph in ((26, 42, 0.0), (52, 30, 1.7),
+                                       (372, 34, 0.9), (398, 46, 2.4))]
+        # 兩條魚：遠景那條小、暗、慢，水槽才有深度，也不會有空無一物的空檔
+        self.fishes = [Fish(cv, 1.35, FISH_FAR, 0.9, SEA_H * 0.3, 2.1),
+                       Fish(cv, 2.3, FISH, 1.7, SEA_H * 0.55)]
+        self.fishes[0].x = W * 0.3            # 兩條錯開，別黏在一起游
+        cv.create_line(0, SEA_H, W, SEA_H, fill="#22304d")
+        self.bubbles = []
+
+        # ── 文字 ──
+        cv.create_text(W / 2, 182, text="摸魚 房仲快樂生活", fill=INK,
+                       font=(FONT, 17, "bold"))
+        self.t_ver = cv.create_text(W / 2, 205, text="v" + local_version(),
+                                    fill=MUTED, font=(FONT, 10))
+        self.t_status = cv.create_text(W / 2, 242, text=self.dots, fill=INK,
+                                       font=(FONT, 14))
+        self.t_detail = cv.create_text(W / 2, 267, text="", fill=MUTED,
+                                       font=(FONT, 10), width=W - 60)
+        self.t_count = cv.create_text(W / 2, 291, text="", fill=FISH,
+                                      font=(FONT, 11, "bold"))
+        self.t_hint = cv.create_text(W / 2, H - 16, text=HINT_RUNNING,
+                                     fill="#5b6b85", font=(FONT, 9))
+
+        # ── 左上角：停止服務（服務就緒後才出現）──
+        # 位置維持在角落（主要動線還是進儀表板），但顏色改橘色——原本的深藍底
+        # 融進背景，客戶根本找不到這顆按鈕（老闆 2026-09-17）。
+        self.stop_bg = round_rect(cv, 12, 12, 104, 38, 9, fill=STOP_BG, outline="",
+                                  tags="stop", state="hidden")
+        self.stop_tx = cv.create_text(58, 25, text="停止服務", fill=SEA,
+                                      font=(FONT, 10, "bold"), tags="stop", state="hidden")
+        cv.tag_bind("stop", "<Button-1>", lambda _e: self.stop_click())
+        cv.tag_bind("stop", "<Enter>", lambda _e: self.stop_hover(True))
+        cv.tag_bind("stop", "<Leave>", lambda _e: self.stop_hover(False))
+
+        # ── 右上角：立即更新（服務就緒後才出現）──
+        # 原本要手動更新得先「停止服務」再按「啟動｜更新」兩步，客戶找不到
+        # （老闆 2026-09-21）。這顆一次做完：停服務 → 檢查更新 → 套用 → 自動開回來。
+        self.upd_bg = round_rect(cv, W - 104, 12, W - 12, 38, 9, fill=FISH, outline="",
+                                 tags="upd", state="hidden")
+        self.upd_tx = cv.create_text(W - 58, 25, text="立即更新", fill=SEA,
+                                     font=(FONT, 10, "bold"), tags="upd", state="hidden")
+        cv.tag_bind("upd", "<Button-1>", lambda _e: self.update_click())
+        cv.tag_bind("upd", "<Enter>", lambda _e: self.upd_hover(True))
+        cv.tag_bind("upd", "<Leave>", lambda _e: self.upd_hover(False))
+
+        # ── 自己畫的按鈕（就緒才出現；失敗時變成「開啟疑難排解」）──
+        bw, bh, by = 168, 36, 324
+        self.btn_bg = round_rect(cv, (W - bw) / 2, by - bh / 2, (W + bw) / 2,
+                                 by + bh / 2, 10, fill=FISH, outline="",
+                                 tags="btn", state="hidden")
+        self.btn_tx = cv.create_text(W / 2, by, text="進入儀表板", fill=SEA,
+                                     font=(FONT, 12, "bold"), tags="btn",
+                                     state="hidden")
+        cv.tag_bind("btn", "<Button-1>", lambda _e: self.click())
+        cv.tag_bind("btn", "<Enter>", lambda _e: self.hover(True))
+        cv.tag_bind("btn", "<Leave>", lambda _e: self.hover(False))
+
+        self.center()
+        # 關視窗一律走 bye()（不要讓 Tk 自己拆）——原因見 bye() 的註解
+        self.protocol("WM_DELETE_WINDOW", self.bye)
+        if not IS_WIN:
+            # .app 起來時視窗不會自動到前景（客戶就以為沒點到）
+            self.lift()
+            self.attributes("-topmost", True)
+            self.after(500, lambda: self.attributes("-topmost", False))
+        threading.Thread(target=self.work, daemon=True).start()
+        self.tick()
+        self.after(1000, self.countdown)
+
+    def center(self):
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() - W) // 2
+        y = (self.winfo_screenheight() - H) // 3
+        self.geometry(f"{W}x{H}+{x}+{y}")
+
+    # ── 背景工作（不碰 widget，一律走佇列）──
+    # ── 停止服務（左上角）──
+    def show_stop(self, on=True):
+        st = "normal" if on else "hidden"
+        self.cv.itemconfigure(self.stop_bg, state=st)
+        self.cv.itemconfigure(self.stop_tx, state=st)
+
+    def show_update(self, on=True):
+        st = "normal" if on else "hidden"
+        self.cv.itemconfigure(self.upd_bg, state=st)
+        self.cv.itemconfigure(self.upd_tx, state=st)
+
+    def upd_hover(self, on):
+        if self.cv.itemcget(self.upd_bg, "state") == "hidden":
+            return
+        self.cv.itemconfigure(self.upd_bg, fill=self.HOVER[FISH] if on else FISH)
+        self.cv.config(cursor="hand2" if on else "")
+
+    def update_click(self):
+        """服務跑著的時候也能按：停服務 → 檢查更新 → 套用 → 重開（跟開機那條路同一支）。
+        沒有新版就只是重開一次服務，不會有別的副作用。"""
+        if not self.can_enter or self.updating:
+            return
+        self.updating = True
+        self.force_restart = True
+        self.say("檢查更新中", "先停服務，有新版就裝起來，之後會自動開回來")
+        self.restart()
+
+    def stop_hover(self, on):
+        if self.cv.itemcget(self.stop_bg, "state") == "hidden" or self.stop_armed:
+            return
+        self.cv.itemconfigure(self.stop_bg, fill=STOP_HOVER if on else STOP_BG)
+        self.cv.config(cursor="hand2" if on else "")
+
+    def stop_click(self):
+        """停止會一併中斷排程發文，所以不一按就砍。用「再按一次」當確認——
+        比彈系統對話框輕，也不會有對話框卡住視窗的風險。4 秒沒動作就自己取消。"""
+        if not self.stop_armed:
+            self.stop_armed = True
+            self.cv.itemconfigure(self.stop_bg, fill=DANGER)
+            self.cv.itemconfigure(self.stop_tx, text="再按確認", fill=SEA)
+            self.after(4000, self.disarm_stop)
+            return
+        self.disarm_stop()
+        self.show_stop(False)
+        self.say("停止中", "正在關閉背景服務")
+        threading.Thread(target=self._do_stop, daemon=True).start()
+
+    def disarm_stop(self):
+        if not self.stop_armed:
+            return
+        self.stop_armed = False
+        self.cv.itemconfigure(self.stop_bg, fill=STOP_BG)
+        self.cv.itemconfigure(self.stop_tx, text="停止服務", fill=SEA)
+
+    def _do_stop(self):
+        self.kill_services()
+        self.say("已停止服務", "排程發文也一併停止了。", stopped=True)
+
+    def restart(self):
+        """停掉之後想再開，不必關視窗重點圖示。整個流程從頭跑一次
+        （包含檢查更新——剛好此刻服務沒在跑，是能安全換檔的時機）。"""
+        self.stopped = self.failed = self.can_enter = False
+        self.hide_btn()
+        self.show_stop(False)
+        self.show_update(False)
+        self.cv.itemconfigure(self.t_status, fill=INK)
+        self.cv.itemconfigure(self.t_hint, text=HINT_RUNNING)
+        for f in self.fishes:
+            f.recolor(f.color)
+        threading.Thread(target=self.work, daemon=True).start()
+
+    def say(self, status=None, detail=None, done=None, failed=None, count=None,
+            stopped=None, version_changed=None):
+        # 同時印出來：.app 的 stdout 會進系統日誌，從終端機跑也看得到流程，
+        # 客戶回報「卡在哪一步」時這是最直接的線索
+        if status:
+            print("[launcher] " + status + (" — " + detail if detail else ""), flush=True)
+        if done or failed or stopped:
+            self.updating = False        # 更新流程走到底（成功或失敗）都要放開，不然記號檔再也不會被看
+        self.q.put({"status": status, "detail": detail, "done": done,
+                    "failed": failed, "count": count, "stopped": stopped,
+                    "version_changed": version_changed})
+
+    def work(self):
+        py = BASE / ("python/python.exe" if IS_WIN else "python/bin/python3")
+        env = child_env()
+
+        # 桌面捷徑要在任何提前返回之前做：客戶常常服務開著又點一次圖示，
+        # 那時走的是下面的「已在執行中」捷徑路徑——擺在後面就永遠建不出來。
+        ensure_desktop_shortcut()
+
+        # 後端寫的「請套用更新」記號（客戶按了立即更新／每晚自動）。啟動器多半已經不在了——
+        # 按「進入儀表板」就退出——所以後端會把啟動器重新叫起來；開機第一件事看記號，
+        # 有就走「停服務→套用→重開」，不走下面「已在執行中」的捷徑。
+        try:
+            if UPDATE_MARKER.is_file():
+                UPDATE_MARKER.unlink()
+                self.force_restart = True
+                self.updating = True
+                self.say("收到更新要求", "先停服務、套用新版本、再重新啟動（約一分鐘）")
+        except OSError:
+            pass
+
+        # 服務已在跑 → 不重啟、不套更新，直接讓客戶進去（更新要求例外：要停掉再套）
+        if getattr(self, "force_restart", False):
+            self.force_restart = False
+            self.kill_services()
+            time.sleep(2)
+        elif service_up():
+            # 但補丁已經下載好就要套：客戶平常把摸魚開著，點圖示一律走這條捷徑，
+            # 等於永遠不會更新（Windows 客戶 2026-09-17 回報卡在舊版）。半夜 03:30 那條
+            # 自動套用要電腦開著才有用。這裡看到排好隊的新版就停服務、套用、重開。
+            staged = staged_pending_version()
+            if staged and _vtuple(staged) > _vtuple(local_version()):
+                self.updating = True
+                self.say("有新版本，正在更新", f"{local_version()} → {staged}（約一分鐘，之後會自動重開）")
+                self.kill_services()
+                time.sleep(2)
+            else:
+                self.say("已在執行中", "服務本來就在背景執行，可直接進入。", done=True)
+                return
+
+        # 1) 先下載再套用。順序不能顛倒，也不能只做套用——客戶要的是「打開就是
+        #    最新版」，而不是「這次先用舊的、下次啟動才生效」。
+        #    此刻服務未啟動，檔案沒被鎖，正是唯一能安全換檔的時機。
+        hide_siblings()          # 每次啟動整理一次外觀（zip 不保留隱藏屬性）
+        self.say("檢查更新中", "")
+        t0 = time.monotonic()
+        check_msg = ""            # 檢查更新那支印的最後一行（沒下載時要拿它當理由，不能一律說「已是最新版本」）
+        try:
+            d = run_quiet([str(py), str(BASE / "_check_update.py")],
+                               cwd=str(BASE), env=env, capture_output=True,
+                               text=True, timeout=180)
+            lines = (d.stdout or "").strip().splitlines()
+            check_msg = lines[-1].replace("[update] ", "") if lines else ""
+            if d.returncode == 10:
+                linger(t0, 1.2)
+                self.say("正在安裝更新", check_msg)
+                t0 = time.monotonic()
+        except (subprocess.TimeoutExpired, OSError) as e:
+            # 網路慢不能讓客戶卡在這裡——用現有版本照常啟動
+            self.say("略過更新下載", str(e))
+        linger(t0, 1.2)
+
+        applied = 0
+        t0 = time.monotonic()
+        try:
+            r = run_quiet([str(py), str(BASE / "_apply_update.py"), "apply"],
+                               cwd=str(BASE), env=env, capture_output=True,
+                               text=True, timeout=600)
+            applied = r.returncode
+            msg = (r.stdout or "").strip().splitlines()
+            if applied == 10:
+                self.say("已完成更新", msg[-1] if msg else "已套用新版本",
+                         version_changed=True)
+            elif applied == 1:
+                self.say("更新未套用，將使用目前版本", msg[-1] if msg else "")
+            elif check_msg and not any(k in check_msg for k in ("最新", "已是", "up to date")):
+                # 2026-09-14：客戶卡在 1.0.52，畫面卻說「已是最新版本」——其實是檢查那步沒下載
+                # （取不到設定／下載失敗／要整包），理由被吞掉。這裡把真正的理由講出來。
+                self.say("這次沒有更新到", check_msg)
+            else:
+                self.say("已是最新版本", "")
+        except (subprocess.TimeoutExpired, OSError) as e:
+            self.say("略過更新檢查", str(e))
+        # 換檔是「新檔取代舊檔」，隱藏屬性會跟著掉——套用後補一次，
+        # 不然更新完那次啟動客戶又會看到一整頁檔案
+        hide_siblings()
+        linger(t0, 1.4)      # 「已完成更新」要讓客戶看得到，不能一閃而過
+
+        # 2) 啟動服務並等健康檢查（倒數給客戶一個預期）
+        self.say("啟動中", "第一次啟動較慢，請稍候", count=WAIT_TICKS * WAIT_EVERY)
+        self.start_services(py, env)
+        if self.await_ready():
+            self.updating = False
+            self.say("準備就緒", "", done=True)
+            return
+
+        # 3) 起不來：剛套用過更新就回滾再試一次
+        if applied == 10:
+            self.say("新版本無法啟動，正在還原", "", count=WAIT_TICKS * WAIT_EVERY)
+            self.kill_services()
+            try:
+                run_quiet([str(py), str(BASE / "_apply_update.py"), "rollback"],
+                               cwd=str(BASE), env=env, capture_output=True, timeout=300)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            self.start_services(py, env)
+            if self.await_ready():
+                self.say("已還原到上一個版本", "功能不受影響。", done=True,
+                         version_changed=True)
+                return
+
+        self.say("啟動失敗", "後端沒有起來。按下面的按鈕可以看原因並修復。", failed=True)
+
+    def await_ready(self) -> bool:
+        for _ in range(WAIT_TICKS):
+            if service_up():
+                return True
+            threading.Event().wait(WAIT_EVERY)
+        return False
+
+    def start_services(self, py, env):
+        # 埠上可能還躺著別版或掛掉的服務（service_up() 已判定不可用）。
+        # 不先清掉的話新服務綁不上埠、靜靜地死掉，客戶按進去看到的還是壞的那個。
+        if port_taken(BACK_PORT) or port_taken(FRONT_PORT):
+            print("[launcher] 埠上有殘留服務，先停掉再啟動", flush=True)
+            self.kill_services()
+            time.sleep(1.5)
+        spawn_detached([str(py), "-m", "uvicorn", "app.main:app",
+                        "--host", "127.0.0.1", "--port", BACK_PORT],
+                       BASE / "backend", "backend.log", env)
+        node = BASE / ("node/node.exe" if IS_WIN else "node/node")
+        fenv = dict(env, PORT=FRONT_PORT, HOSTNAME="127.0.0.1")
+        spawn_detached([str(node), str(BASE / "frontend/server.js")], BASE,
+                       "frontend.log", fenv)
+
+    def kill_services(self):
+        # 先請後端自己收尾（把養號／發文的 Chrome 一起關、紀錄寫成人話），等它退出再清埠。
+        # Windows 只有 taskkill /f 這種硬砍，沒有這一步的話子進程會變孤兒、Chrome 繼續跑，
+        # 下一場發文全都「這個帳號的瀏覽器還開著」。
+        try:
+            req = urllib.request.Request(HEALTH + "/shutdown", method="POST", data=b"")
+            with urllib.request.urlopen(req, timeout=3) as r:
+                r.read(200)
+            for _ in range(16):
+                if not port_taken(BACK_PORT):
+                    break
+                time.sleep(0.5)
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+        for port in (BACK_PORT, FRONT_PORT):
+            if IS_WIN:
+                cmd = ('for /f "tokens=5" %p in (\'netstat -ano ^| findstr '
+                       '":' + port + '.*LISTENING"\') do taskkill /f /pid %p')
+            else:
+                # 先 SIGTERM 讓後端走 lifespan 收尾（把養號／發文的 Chrome 一起關、紀錄寫成人話），
+                # 等最多 8 秒還在才 -9。直接 -9 的話子進程變孤兒、Chrome 繼續跑，下一場「瀏覽器還開著」。
+                cmd = ("p=$(lsof -ti:" + port + " 2>/dev/null); [ -n \"$p\" ] && kill $p 2>/dev/null; "
+                       "for i in 1 2 3 4 5 6 7 8; do lsof -ti:" + port + " >/dev/null 2>&1 || break; sleep 1; done; "
+                       "lsof -ti:" + port + " 2>/dev/null | xargs kill -9 2>/dev/null; true")
+            run_quiet(cmd, shell=True, capture_output=True)
+
+    # ── 動畫與畫面更新（只在主執行緒動 widget）──
+    def tick(self):
+        self.t += 1
+        self.drain()
+        self.swim()
+        # 後端寫了「請套用更新」記號（客戶按了立即更新，或每晚 03:30 自動）→ 停服務、套補丁、重開。
+        # 每 5 秒看一次就夠（40ms 一 tick ≈ 125 tick）。
+        if self.t % 125 == 0 and self.can_enter and not self.updating:
+            try:
+                if UPDATE_MARKER.is_file():
+                    UPDATE_MARKER.unlink()
+                    self.updating = True
+                    self.say("收到更新要求", "先停服務、套用新版本、再重新啟動（約一分鐘）")
+                    self.force_restart = True
+                    self.restart()
+            except OSError:
+                pass
+        if not (self.can_enter or self.failed or self.stopped):
+            # 跳動的點：畫面沒卡住的最直接訊號（1～4 個點循環）
+            self.cv.itemconfigure(self.t_status,
+                                  text=self.dots + "." * (1 + (self.t // 8) % 4))
+        self.after(40, self.tick)
+
+    def swim(self):
+        for f in self.fishes:
+            mouth = f.swim(self.t)
+        for w in self.weeds:                  # 海草擺動：底部固定、尖端隨波
+            item, x, h, ph = w
+            tip = x + 7 * math.sin(self.t * 0.035 + ph)
+            self.cv.coords(item, x - 5, SEA_H, x - 2, SEA_H - h * 0.45,
+                           tip, SEA_H - h, x + 2, SEA_H - h * 0.45, x + 5, SEA_H)
+
+        # 吐泡泡：從主角的嘴巴（身體左端）冒出往上飄
+        if self.t % 22 == 0 and not self.failed:
+            r = random.uniform(2, 3.4)
+            self.bubbles.append([self.cv.create_oval(0, 0, 0, 0, fill="#16304d",
+                                                     outline="#3f5f85"),
+                                 mouth[0], mouth[1], r, random.uniform(0.6, 1.2)])
+        for b in list(self.bubbles):
+            b[1] -= 0.25                      # 一邊上升一邊往後飄
+            b[2] -= b[4]
+            if b[2] < -6:
+                self.cv.delete(b[0])
+                self.bubbles.remove(b)
+                continue
+            self.cv.coords(b[0], b[1] - b[3], b[2] - b[3], b[1] + b[3], b[2] + b[3])
+
+    def countdown(self):
+        if self.left > 0 and not (self.can_enter or self.failed or self.stopped):
+            self.left -= 1
+            self.cv.itemconfigure(
+                self.t_count, text=f"約 {self.left} 秒" if self.left else "就快好了")
+        self.after(1000, self.countdown)
+
+    def drain(self):
+        try:
+            while True:
+                m = self.q.get_nowait()
+                if m["status"]:
+                    self.dots = m["status"]
+                    self.cv.itemconfigure(self.t_status, text=m["status"])
+                if m["detail"] is not None:
+                    self.cv.itemconfigure(self.t_detail, text=m["detail"])
+                if m["count"] is not None:
+                    self.left = m["count"]
+                    self.cv.itemconfigure(self.t_count, text=f"約 {self.left} 秒")
+                if m["version_changed"]:
+                    self.cv.itemconfigure(self.t_ver, text="v" + local_version())
+                if m["done"]:
+                    self.can_enter = True
+                    self.clear_count()
+                    self.show_btn("進入儀表板", FISH, "enter")
+                    self.show_stop(True)      # 服務確定起來了才給停止
+                    self.show_update(True)    # 更新也是（停服務才能安全換檔）
+                    self.bind("<Return>", lambda _e: self.click())
+                if m["stopped"]:
+                    self.stopped = True
+                    self.can_enter = False
+                    self.clear_count()
+                    for f in self.fishes:     # 水槽跟著安靜下來
+                        f.recolor(FISH_DIM)
+                    self.cv.itemconfigure(self.t_hint,
+                                          text="服務已停止，排程發文不會執行")
+                    # 這條路會重跑「檢查更新 → 套用 → 起服務」，所以按鈕直接寫明白（老闆 2026-09-17）
+                    self.show_btn("啟動｜更新", FISH, "restart")
+                if m["failed"]:
+                    self.failed = True
+                    self.clear_count()
+                    self.cv.itemconfigure(self.t_status, fill=DANGER)
+                    # 這時服務並沒有在背景跑，原本那句提示會誤導
+                    self.cv.itemconfigure(self.t_hint,
+                                          text="可以先關掉視窗，修好後再點一次圖示")
+                    for f in self.fishes:     # 魚跟著失去血色
+                        f.recolor(FISH_DIM)
+                    self.show_btn("開啟疑難排解", DANGER, "troubleshoot")
+        except queue.Empty:
+            pass
+
+    def clear_count(self):
+        self.left = 0
+        self.cv.itemconfigure(self.t_count, text="")
+
+    def show_btn(self, text, fill, action):
+        self.btn_fill, self.btn_action = fill, action
+        self.cv.itemconfigure(self.btn_bg, state="normal", fill=fill)
+        self.cv.itemconfigure(self.btn_tx, state="normal", text=text)
+
+    def hide_btn(self):
+        self.cv.itemconfigure(self.btn_bg, state="hidden")
+        self.cv.itemconfigure(self.btn_tx, state="hidden")
+
+    def hover(self, on):
+        if self.cv.itemcget(self.btn_bg, "state") == "hidden":
+            return
+        self.cv.itemconfigure(self.btn_bg,
+                              fill=self.HOVER[self.btn_fill] if on else self.btn_fill)
+        self.cv.config(cursor="hand2" if on else "")
+
+    def bye(self):
+        """收工：直接結束行程，不讓 Tk 去拆視窗。
+
+        客戶回報過 crash report（macOS 26.2）：按「進入儀表板」或關視窗的瞬間，
+        Tk 在拆 canvas 時炸掉——
+            DestroyCanvas → DeleteText → Tk_FreeFont → TclpFree → Tcl_Panic → abort()
+        Tcl 的配置器判定那塊記憶體不對就直接 abort，客戶看到的是系統的「意外結束」
+        對話框。服務是 detached 的，這時早就在背景跑了，視窗只是個過場。
+
+        既然拆視窗本身沒有任何價值，就不要走那條路：畫面先收起來（客戶立刻看到
+        反應），沖掉 stdout（.app 的輸出要進系統日誌），然後 os._exit 直接離開。
+        沒有 Tk 拆解，就沒有那個 panic。
+        """
+        with contextlib.suppress(Exception):
+            self.withdraw()
+            self.update_idletasks()
+        with contextlib.suppress(Exception):
+            sys.stdout.flush()
+        os._exit(0)
+
+    def click(self):
+        if self.btn_action == "enter" and self.can_enter:
+            webbrowser.open(DASHBOARD)
+            self.bye()
+        elif self.btn_action == "troubleshoot":
+            self.troubleshoot()
+        elif self.btn_action == "restart":
+            self.restart()
+
+    def troubleshoot(self):
+        script = BASE / ("診斷後端.bat" if IS_WIN else "啟動.command")
+        try:
+            if IS_WIN:
+                subprocess.Popen(["cmd", "/c", "start", "", str(script)], cwd=str(BASE))
+            else:
+                subprocess.Popen(["open", "-a", "Terminal", str(script)])
+        except OSError:
+            webbrowser.open((BASE / "logs").as_uri())
+        self.bye()
+
+
+if __name__ == "__main__":
+    Launcher().mainloop()
