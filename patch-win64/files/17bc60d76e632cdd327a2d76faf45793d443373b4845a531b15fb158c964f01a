@@ -1,0 +1,105 @@
+"""失敗原因判斷（SPEC-P28）：分得出「登入過期」與「動作被限制」。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_meta_block.py -v
+
+誤判成 action_blocked 的代價是功能無故停 24 小時，所以寧可漏判也不能亂判。
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import meta_block as m  # noqa: E402
+
+
+class Test動作被限制:
+    def test_中文警告(self):
+        assert m.classify(page_text="很抱歉，你的動作已遭封鎖") == m.ACTION_BLOCKED
+
+    def test_英文警告(self):
+        assert m.classify(page_text="Action Blocked. We restrict certain activity") == m.ACTION_BLOCKED
+
+    def test_限制特定活動(self):
+        assert m.classify(page_text="我們限制了特定活動以保護社群") == m.ACTION_BLOCKED
+
+    def test_該停手(self):
+        assert m.is_blocking(m.ACTION_BLOCKED) is True
+
+
+class Test其他原因:
+    def test_節流不算封鎖(self):
+        """節流是短期的，下一個場次本來就過了——不該停 24 小時。"""
+        r = m.classify(page_text="你的動作太快，請稍後再試")
+        assert r in (m.RATE_LIMITED, m.ACTION_BLOCKED)
+        assert m.is_blocking(m.RATE_LIMITED) is False
+
+    def test_登入過期(self):
+        assert m.classify(page_text="登入 Instagram\n忘記密碼？") == m.LOGGED_OUT
+
+    def test_版面改了(self):
+        """我們自己丟的「找不到按鈕」＝平台改版，是我們要修，不是客戶的錯。"""
+        assert m.classify(error_text="找不到「發佈」按鈕（截圖：/tmp/x.png）") == m.LAYOUT_CHANGED
+
+
+class Test不亂判:
+    def test_一般網路錯誤是unknown(self):
+        assert m.classify(error_text="Timeout 30000ms exceeded") == m.UNKNOWN
+
+    def test_空輸入是unknown(self):
+        assert m.classify() == m.UNKNOWN
+
+    def test_正常頁面不會被判成封鎖(self):
+        normal = "為你推薦\n追蹤中\n大安區三房 開價 1750 萬\n讚 回應 分享"
+        assert m.classify(page_text=normal) == m.UNKNOWN
+        assert m.is_blocking(m.classify(page_text=normal)) is False
+
+
+class TestIG自動化警告:
+    """老闆 2026-09-23：IG 跳出「自動化行為」警告。這是最明確的被盯上訊號，
+    原本卻判成 unknown → 系統隔天照發，等於把帳號往真正的封鎖推。"""
+
+    def test_中文自動化警告算被限制(self):
+        for txt in ("我們偵測到你的帳號有自動化行為",
+                    "系統偵測到自動化工具",
+                    "我們偵測到自動化系統的操作"):
+            assert m.classify(page_text=txt) == m.AUTOMATION_SUSPECTED, txt
+
+    def test_英文自動化警告算被限制(self):
+        assert m.classify(page_text="We Detected Automated Behavior") == m.AUTOMATION_SUSPECTED
+        assert m.classify(page_text="This looks like an automation tool") == m.AUTOMATION_SUSPECTED
+
+    def test_自動化警告要停手(self):
+        assert m.is_blocking(m.classify(page_text="偵測到自動化行為")) is True
+
+    def test_不尋常登入活動不算被限制(self):
+        """登入驗證不是動作封鎖——誤判會讓 IG 白停 7 天。"""
+        assert m.classify(page_text="我們偵測到不尋常的登入活動，請驗證身分") != m.AUTOMATION_SUSPECTED
+        assert m.classify(page_text="We detected unusual activity on your account") != m.AUTOMATION_SUSPECTED
+
+
+def test_客戶截圖的原文(): 
+    """2026-09-23 客戶手機上的 IG 警告全文（英文介面）。"""
+    txt = ("We suspect automated behavior on your account\n"
+           "To prevent your account from being temporarily restricted or permanently disabled, "
+           "ensure that no other users or tools have access to your account and that you're "
+           "following our Terms of Use.")
+    assert m.classify(page_text=txt) == m.AUTOMATION_SUSPECTED
+    assert m.is_blocking(m.classify(page_text=txt)) is True
+
+
+class TestIG發文前暖身:
+    """老闆 2026-09-23：被 IG 跳「懷疑自動化」後加的——真人不會開了就貼。"""
+
+    def test_捲動次數與停留時間在合理範圍(self):
+        import random
+        from src.run_ig_post import warmup_plan
+        for seed in range(50):
+            scrolls, secs = warmup_plan(random.Random(seed))
+            assert 2 <= scrolls <= 5
+            assert 20 <= secs <= 60
+
+    def test_每次都不一樣(self):
+        import random
+        from src.run_ig_post import warmup_plan
+        vals = {warmup_plan(random.Random(i))[1] for i in range(20)}
+        assert len(vals) > 10        # 固定秒數等於另一種指紋
