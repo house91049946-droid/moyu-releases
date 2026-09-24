@@ -1,0 +1,147 @@
+"""P17 CLI wrapper — Marketplace N 天自動刪除（供 backend bridge 呼叫）。
+
+掃賣家「你的商品/銷售中」頁，刪除張貼超過 --max-age-days 天的刊登；
+刪主刊登會連帶下架其社團「在更多地方上架」的參照。
+--dry-run 只掃描列出候選，不實際刪除。
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import os
+import sys
+
+from src.utils import launch_browser, perform_checks, wait_if_verification_needed
+from src.login import _try_cookie_login
+from src.delete_club_post import delete_old_marketplace_listings
+from src.paths import DATA_DIR
+
+_JSON_PATH: str | None = None
+_RESULT: dict | None = None
+
+
+def _load_tool_posted_titles(fbid: str) -> set:
+    """從 schedule.log 撈出本工具替這個 fbid 上架過的 Marketplace 標題。
+
+    只有這些標題比對得上的刊登才會被自動刪除；查無紀錄則一個都不刪，
+    避免刪掉帳號上手動貼的、非本工具發的商品（2026-08-09 誤刪事件後加）。
+    log 格式：ts;event_type;result;fbid;title;url;job_id
+    只認 event_type=自動上架（Marketplace 主刊登），社團上架的 title 是網址不算。
+    """
+    titles: set = set()
+    log_path = DATA_DIR / "schedule.log"
+    if not log_path.exists():
+        return titles
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.rstrip("\n").split(";")
+                if len(parts) < 5:
+                    continue
+                _ts, event_type, _result, row_fbid, title = parts[:5]
+                if event_type != "自動上架":
+                    continue
+                if row_fbid != fbid:
+                    continue
+                title = (title or "").strip()
+                if title:
+                    titles.add(title)
+    except Exception as e:
+        print(f"[del_mp] 讀 schedule.log 失敗（保守起見不刪）：{e}", flush=True)
+        return set()
+    return titles
+
+
+def main():
+    global _JSON_PATH, _RESULT
+
+    parser = argparse.ArgumentParser(description="FB Auto P17 — Marketplace 過期刊登自動刪除")
+    parser.add_argument("--fbid", required=True)
+    parser.add_argument("--max-age-days", type=int, default=7, help="超過幾天的刊登要刪除")
+    parser.add_argument("--dry-run", action="store_true", help="只掃描列出候選，不刪除")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--result-json", help="結果 JSON 輸出路徑")
+    parser.add_argument("--keep-open", action="store_true", help="遇到驗證時保持瀏覽器開啟")
+    args = parser.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {
+        "schema": 2,
+        "success": False,
+        "fbid": args.fbid,
+        "error": "未完成",
+        "data": {"scanned": 0, "deleted_count": 0, "deleted_urls": [],
+                 "candidates": [], "skipped_unknown": 0, "dry_run": args.dry_run},
+    }
+    if _JSON_PATH:
+        atexit.register(_write_result_json)
+
+    print(f"Marketplace 清理：門檻 {args.max_age_days} 天"
+          f"{'（dry-run 僅掃描）' if args.dry_run else ''}", flush=True)
+
+    browser = context = page = None
+    try:
+        browser, context, page = launch_browser(fbid=args.fbid, headless=args.headless)
+
+        if not _try_cookie_login(page, context, args.fbid):
+            _RESULT["error"] = "Cookie 登入失敗，請先用 CLI 登入一次"
+            sys.exit(1)
+
+        allowed_titles = _load_tool_posted_titles(args.fbid)
+        print(f"[del_mp] 安全比對：本工具替 {args.fbid} 上架過 "
+              f"{len(allowed_titles)} 筆標題，只有比對得上的才會刪。", flush=True)
+        _RESULT["data"]["tool_titles"] = len(allowed_titles)
+
+        r = delete_old_marketplace_listings(
+            page, args.fbid, max_age_days=args.max_age_days, dry_run=args.dry_run,
+            allowed_titles=allowed_titles,
+        )
+        _RESULT["data"]["skipped_not_mine"] = r.get("skipped_not_mine", 0)
+        if r.get("note"):
+            _RESULT["data"]["note"] = r["note"]
+        _RESULT["data"]["scanned"] = r.get("scanned", 0)
+        _RESULT["data"]["deleted_urls"] = r.get("deleted", [])
+        _RESULT["data"]["deleted_count"] = len(r.get("deleted", []))
+        _RESULT["data"]["candidates"] = r.get("candidates", [])
+        _RESULT["data"]["skipped_unknown"] = r.get("skipped_unknown", 0)
+        if not r.get("success"):
+            _RESULT["error"] = r.get("error", "刪除流程失敗")
+            sys.exit(1)
+
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        print(f"✓ 完成：掃 {_RESULT['data']['scanned']}、"
+              f"刪 {_RESULT['data']['deleted_count']}、"
+              f"候選 {len(_RESULT['data']['candidates'])}", flush=True)
+
+    except KeyboardInterrupt:
+        _RESULT["error"] = "使用者中斷"
+        sys.exit(0)
+    except Exception as e:
+        import traceback
+        print(f"[del_mp] ✗ 例外：{e}", flush=True)
+        traceback.print_exc()
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    finally:
+        if page and args.keep_open:
+            check = perform_checks(page, args.fbid)
+            wait_if_verification_needed(check, page, args.fbid)
+        if context:
+            with contextlib.suppress(Exception):
+                context.close()
+
+
+def _write_result_json():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            try:
+                from src.utils import collect_screenshots
+                _RESULT.setdefault("data", {})["screenshots"] = collect_screenshots()
+            except Exception:
+                pass
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+
+
+if __name__ == "__main__":
+    main()

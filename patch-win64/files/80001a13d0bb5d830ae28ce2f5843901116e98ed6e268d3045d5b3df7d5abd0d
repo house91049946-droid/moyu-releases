@@ -1,0 +1,92 @@
+"""抓取 FB Marketplace 建立商品頁的完整類別清單（供儀表板下拉選單用）。"""
+import argparse
+import atexit
+import contextlib
+import json
+import sys
+
+from src.utils import launch_browser, human_sleep, simulate_human_click, capture_screenshot
+from src.login import _try_cookie_login
+from src.paths import DATA_DIR
+
+_JSON_PATH = None
+_RESULT = None
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    parser = argparse.ArgumentParser(description="抓 Marketplace 類別清單")
+    parser.add_argument("--fbid", required=True)
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--result-json")
+    args = parser.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {"schema": 2, "success": False, "fbid": args.fbid, "error": "未完成", "data": {"categories": []}}
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    browser, context, page = launch_browser(fbid=args.fbid, headless=args.headless)
+    try:
+        if not _try_cookie_login(page, context, args.fbid):
+            _RESULT["error"] = "Cookie 登入失敗"
+            sys.exit(1)
+
+        page.goto("https://www.facebook.com/marketplace/create/item/", wait_until="domcontentloaded")
+        page.wait_for_timeout(5000)
+
+        combos = page.locator("label[role='combobox']").all()
+        if not combos:
+            _RESULT["error"] = "找不到類別選單"
+            capture_screenshot(page, args.fbid, "cat_no_combo")
+            sys.exit(1)
+
+        simulate_human_click(page, combos[0])
+        human_sleep(1.5, 2.5)
+
+        cats, seen = [], set()
+        for _ in range(12):
+            for o in page.locator("[role='option']").all():
+                try:
+                    t = (o.inner_text() or "").strip().split("\n")[0].strip()
+                    if t and t not in seen:
+                        seen.add(t)
+                        cats.append(t)
+                except Exception:
+                    continue
+            try:
+                opts = page.locator("[role='option']").all()
+                if opts:
+                    opts[-1].scroll_into_view_if_needed(timeout=1500)
+            except Exception:
+                pass
+            page.mouse.wheel(0, 400)
+            human_sleep(0.3, 0.6)
+
+        if not cats:
+            _RESULT["error"] = "未抓到任何類別"
+            capture_screenshot(page, args.fbid, "cat_empty")
+            sys.exit(1)
+
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+        _RESULT["data"]["categories"] = cats
+        with open(DATA_DIR / "mp_categories.json", "w", encoding="utf-8") as f:
+            json.dump(cats, f, ensure_ascii=False, indent=2)
+        print(f"抓到 {len(cats)} 個類別: {cats[:8]}...")
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    finally:
+        with contextlib.suppress(Exception):
+            context.close()
+
+
+if __name__ == "__main__":
+    main()

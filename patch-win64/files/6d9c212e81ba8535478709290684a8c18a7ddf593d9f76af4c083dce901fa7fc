@@ -1,0 +1,583 @@
+"""FB 備份刪文的離線測試（SPEC-P32 §2）。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_fb_cleanup.py -v
+
+刪文不可逆，所以這裡守的全是「不該刪的絕對不刪」：天數下限夾得住、一輪上限夾得住、
+日期讀不到一律跳過、留言連結／社團貼文／別人的貼文根本不會進清單、置頂不動、
+被擋要停但已刪的照樣回報、dry-run 一則都不動。另外兩個本專案踩過的坑各有一條測試守著：
+JS 字串裡的換行地雷、以及「卡片要往上爬再在卡片內查」。全部不開真瀏覽器。
+"""
+import datetime
+import json
+import subprocess
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("playwright")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import run_fb_cleanup as cl  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+NOW = datetime.datetime(2026, 9, 3, 12, 0, 0)      # 注入用的假現在，免得測試變成時間炸彈
+FBID = "100012345"
+
+
+class Test天數與數量上限:
+    def test_預設三十天(self):
+        assert cl.effective_older_than(None) == cl.DEFAULT_OLDER_THAN == 30
+        assert cl.effective_older_than(0) == 30
+
+    def test_太小的天數被提高到七天(self):
+        """老闆設 1 天也不能真的照做——那等於發完就刪。"""
+        assert cl.effective_older_than(3) == cl.MIN_OLDER_THAN == 7
+        assert cl.effective_older_than(-5) == 30      # 負數當沒設定，回預設
+
+    def test_合理天數照收(self):
+        assert cl.effective_older_than(45) == 45
+
+    def test_每輪上限預設二十硬上限五十(self):
+        assert cl.effective_max(None) == cl.DEFAULT_MAX == 20
+        assert cl.effective_max(999) == cl.HARD_CAP == 50
+        assert cl.effective_max(5) == 5
+
+    def test_每則之間十到三十秒(self):
+        """連續刪最像腳本，間隔不能被改小。"""
+        assert cl.DELETE_GAP == (10, 30)
+
+
+class Test年齡解析:
+    @pytest.mark.parametrize("text,days", [
+        ("今天 下午3:20", 0), ("剛剛", 0), ("昨天上午10:15", 1), ("前天 09:00", 2),
+    ])
+    def test_FB專屬的今天昨天前天(self, text, days):
+        """Threads／IG 不這樣寫，所以共用的那份解析沒收——沒有這段會全部變成「讀不到」。"""
+        assert cl.parse_age_days(text, now=NOW) == days
+
+    def test_ISO與中文絕對日期(self):
+        assert cl.parse_age_days("2026-07-12T08:30:00.000Z", now=NOW) == 53
+        assert cl.parse_age_days("2026年7月12日", now=NOW) == 53
+        assert cl.parse_age_days("8月30日 上午10:15", now=NOW) == 4
+
+    @pytest.mark.parametrize("text,days", [
+        ("3天前", 3), ("2週", 14), ("1個月前", 30), ("5 小時", 0), ("3 days ago", 3),
+    ])
+    def test_相對時間沿用同一份解析(self, text, days):
+        assert cl.parse_age_days(text) == days
+
+    @pytest.mark.parametrize("text", ["", None, "查看更多", "3 則留言", "讚 · 回覆"])
+    def test_判不出來回None而不是零(self, text):
+        """回 0 看似無害，但一旦門檻反過來就會誤刪——判不出來一律 None，交給呼叫端跳過。"""
+        assert cl.parse_age_days(text, now=NOW) is None
+
+
+class Test該不該刪:
+    def test_剛好等於門檻就刪(self):
+        assert cl.should_delete(30, 30) is True
+        assert cl.should_delete(41, 30) is True
+
+    def test_還沒到門檻不刪(self):
+        assert cl.should_delete(29, 30) is False
+        assert cl.should_delete(0, 7) is False
+
+    def test_日期讀不到絕不刪(self):
+        assert cl.should_delete(None, 30) is False
+        assert cl.should_delete(-1, 30) is False
+        assert cl.should_delete("不知道", 30) is False
+
+
+class Test只認自己的貼文:
+    def test_自己的永久連結(self):
+        u = f"https://www.facebook.com/permalink.php?story_fbid=pfbidAAA&id={FBID}"
+        assert cl.post_key_from_url(u, FBID) == "pfbidAAA"
+
+    def test_別人的貼文一律不收(self):
+        """別人 tag 你、朋友貼到你的時報，都會出現在時報上——那不是我們能刪的。"""
+        u = "https://www.facebook.com/permalink.php?story_fbid=pfbidBBB&id=999999"
+        assert cl.post_key_from_url(u, FBID) == ""
+        assert cl.post_key_from_url("https://www.facebook.com/someone/posts/pfbidC", FBID) == ""
+
+    def test_數字id與自己的代稱都算自己(self):
+        assert cl.post_key_from_url(f"https://www.facebook.com/{FBID}/posts/pfbidD", FBID) == "pfbidD"
+        assert cl.post_key_from_url("https://www.facebook.com/ted.tsai/posts/pfbidE",
+                                    FBID, vanity="ted.tsai") == "pfbidE"
+
+    def test_留言的永久連結不是貼文(self):
+        """FB 留言區到處都是帶 comment_id 的連結，收進來就會去刪錯東西。"""
+        u = (f"https://www.facebook.com/{FBID}/posts/pfbidF?comment_id=123")
+        assert cl.post_key_from_url(u, FBID) == ""
+
+    def test_社團貼文不在本支的範圍(self):
+        assert cl.post_key_from_url("https://www.facebook.com/groups/555/posts/pfbidG", FBID) == ""
+
+    @pytest.mark.parametrize("u", [
+        "https://www.facebook.com/photo/?fbid=123",
+        "https://www.facebook.com/reel/999/",
+        "https://www.facebook.com/watch/?v=123",
+        "https://www.facebook.com/marketplace/item/123/",
+        "", "https://www.facebook.com/",
+    ])
+    def test_附件與其他頁面都不收(self, u):
+        assert cl.post_key_from_url(u, FBID) == ""
+
+    def test_追蹤參數要收斂掉(self):
+        """同一則會因為 __cft__／__tn__ 不同被當成好幾則，一輪的額度就被同一篇吃光。"""
+        u = (f"https://www.facebook.com/{FBID}/posts/pfbidH"
+             "?__cft__[0]=ABCDEF&__tn__=%2CO%2CP-R")
+        assert cl.canonical_post_url(u, FBID) == f"https://www.facebook.com/{FBID}/posts/pfbidH"
+        v = f"https://www.facebook.com/permalink.php?story_fbid=pfbidI&id={FBID}&notif_id=9"
+        assert cl.canonical_post_url(v, FBID) == (
+            f"https://www.facebook.com/permalink.php?story_fbid=pfbidI&id={FBID}")
+
+
+class Test卡片轉候選:
+    def _card(self, sid, stamp, head="", pinned=False):
+        return {"href": f"https://www.facebook.com/{FBID}/posts/{sid}",
+                "stamp": stamp, "head": head, "pinned": pinned}
+
+    def test_年齡讀時間戳連結的文字(self):
+        got = cl.cards_to_posts([self._card("A", "2週")], FBID, now=NOW)
+        assert got[0]["age_days"] == 14 and got[0]["url"].endswith("/posts/A")
+
+    def test_時間戳空白時退回卡片開頭(self):
+        got = cl.cards_to_posts([self._card("B", "", head="蔡先生\n3天前 · 公開")], FBID, now=NOW)
+        assert got[0]["age_days"] == 3
+
+    def test_不拿整張卡解析否則留言的時間會蓋掉貼文的(self):
+        """卡片下半部是留言，留言的「2 小時」會把三個月前的貼文算成今天發的。"""
+        head = "蔡先生\n3個月前 · 公開\n" + "台中買房分享 " * 20 + "王小明 2 小時"
+        got = cl.cards_to_posts([self._card("C", "", head=head)], FBID, now=NOW)
+        assert got[0]["age_days"] == 90
+
+    def test_同一則只留一筆(self):
+        cards = [self._card("D", "3天"), self._card("D", "3天"),
+                 {"href": "https://www.facebook.com/other/posts/E", "stamp": "3天"}]
+        assert [p["key"] for p in cl.cards_to_posts(cards, FBID, now=NOW)] == ["D"]
+
+    def test_置頂貼文標記帶出來(self):
+        got = cl.cards_to_posts([self._card("F", "5週", pinned=True)], FBID, now=NOW)
+        assert got[0]["pinned"] is True
+
+    def test_日期讀不到也要留在清單裡但年齡是None(self):
+        """要讓客戶看到「有 N 則日期讀不到、留著」，不能悄悄消失。"""
+        got = cl.cards_to_posts([self._card("G", "查看更多")], FBID, now=NOW)
+        assert got[0]["age_days"] is None
+
+
+class Test被擋判斷:
+    @pytest.mark.parametrize("text", [
+        "你暫時被封鎖", "你目前無法使用此功能", "You're Temporarily Blocked",
+        "很抱歉，你的動作已遭封鎖",
+    ])
+    def test_封鎖字樣要停(self, text):
+        assert cl.block_reason(page_text=text) == "action_blocked"
+
+    def test_一般頁面與逾時不算被擋(self):
+        """FB 到處都有「請稍後再試」，把節流也當封鎖會天天誤停。"""
+        assert cl.block_reason(page_text="動態時報\n讚 12\n台中買房分享") == ""
+        assert cl.block_reason(error_text="Timeout 30000ms exceeded") == ""
+        assert cl.block_reason(page_text="發生錯誤，請稍後再試") == ""
+
+
+class Test摘要與結果封裝:
+    def test_計數欄位(self):
+        posts = [dict(status="deleted"), dict(status="deleted"), dict(status="undated"),
+                 dict(status="recent"), dict(status="recent"), dict(status="failed"),
+                 dict(status="dry_run")]
+        assert cl.summarize(posts) == {"deleted": 2, "skipped_undated": 1, "skipped_recent": 2}
+
+    def test_結果鏡到data給後端橋接讀(self):
+        """fbauto_bridge 只讀 raw["data"]，頂層與 data 必須一模一樣（與 meta 同契約）。"""
+        env = cl.envelope({"success": True, "platform": "fb", "deleted": 6})
+        assert env["deleted"] == 6 and env["data"]["deleted"] == 6
+        assert "data" not in env["data"]
+
+    def test_紀錄文字講清楚做了什麼(self):
+        line = cl.describe({"platform": "fb", "older_than": 30,
+                            "deleted": 6, "skipped_undated": 2})
+        assert line.startswith("FB 備份刪文")
+        assert "6" in line and "30" in line and "2" in line and "留著" in line
+
+
+class TestJS的兩個地雷:
+    """本專案各踩過的坑，一個一條測試守著。"""
+
+    @pytest.mark.parametrize("js", [cl._CARDS_JS, cl._TIMES_JS])
+    def test_每一行的引號都成對(self, js):
+        """教訓 1：三引號裡的 \\n 會變成真的換行，塞進 JS 字串常值就是 SyntaxError，
+        而 evaluate 包在 suppress 裡會安靜回空——功能整個失效卻沒有任何錯誤訊息。"""
+        for line in js.splitlines():
+            assert line.count("'") % 2 == 0, line
+            assert line.count('"') % 2 == 0, line
+
+    def test_換行用fromCharCode而不是跳脫字元(self):
+        assert "String.fromCharCode(10)" in cl._TIMES_JS
+        assert "\\n" not in cl._CARDS_JS and "\\n" not in cl._TIMES_JS
+
+    def test_卡片要往上爬再在卡片內查(self):
+        """教訓 2：FB 卡片的名字／時間常常不是 <a>。從找得到的元素往上爬到整張卡，
+        再**在卡片內**查詢；對 document 全域查會把上一則的資料配到下一則身上。"""
+        assert "parentElement" in cl._CARDS_JS
+        assert "card.querySelector(" in cl._CARDS_JS
+        # 迴圈裡不准對 document 全域查（只有最外層那次「找所有時間戳連結」可以）
+        body = cl._CARDS_JS.split("for (const a of", 1)[1].split("\n", 1)[1]
+        assert "document.querySelector" not in body
+
+
+# ---------- 假頁面：走瀏覽器流程但不開瀏覽器 ----------
+
+class _Loc:
+    def __init__(self, n=0, on_click=None):
+        self.n, self.on_click, self.clicks = n, on_click, 0
+
+    @property
+    def first(self):
+        return self
+
+    @property
+    def last(self):
+        return self
+
+    def nth(self, i):
+        return self
+
+    def count(self):
+        return self.n
+
+    def is_visible(self):
+        return self.n > 0
+
+    def click(self):
+        self.clicks += 1
+        if self.on_click:
+            self.on_click()
+
+
+class FakePage:
+    """只模擬 _post_age_days / _delete_one 會碰到的介面。"""
+
+    def __init__(self, times="", body="", has_more=True, has_menu_item=True, has_confirm=True):
+        self.times, self.body = times, body
+        self.has_more, self.has_menu_item, self.has_confirm = has_more, has_menu_item, has_confirm
+        self.menu_clicked = False        # 選單項目按過就消失（真實行為），確認框才不會誤配到它
+        self.url = f"https://www.facebook.com/{FBID}/posts/pfbidAAA"
+        self.steps, self.gotos = [], []
+        self.keyboard = types.SimpleNamespace(press=lambda k: self.steps.append("escape"))
+        self.mouse = types.SimpleNamespace(wheel=lambda x, y: None)
+
+    def goto(self, url, **kw):
+        self.gotos.append(url)
+
+    def evaluate(self, js, *a):
+        if "body.innerText" in js:
+            return self.body
+        if "getAttribute('datetime')" in js:
+            return self.times
+        return []
+
+    def locator(self, sel):
+        # ⋯ 按鈕現在也限定在 dialog 內找（selector 同時含 role="dialog" 與 aria-label*=），
+        # 先判「更多」才不會把它當成確認鈕；確認鈕的 aria-label 選擇器是相等比對，沒有 *=
+        if "aria-label*=" in sel:
+            return _Loc(1, lambda: self.steps.append("more")) if self.has_more else _Loc(0)
+        if 'role="dialog"' in sel:
+            if not self.has_confirm:
+                return _Loc(0)
+
+            def _confirm():
+                self.steps.append("confirm")
+                self.body = "已移到垃圾桶"
+            return _Loc(1, _confirm)
+        if "aria-label" in sel and self.has_more:
+            return _Loc(1, lambda: self.steps.append("more"))
+        return _Loc(0)
+
+    def get_by_role(self, role, name=None, exact=False):
+        if self.has_menu_item and not self.menu_clicked and name in cl._DELETE_TEXTS:
+            def _menu():
+                self.steps.append("menu")
+                self.menu_clicked = True
+            return _Loc(1, _menu)
+        return _Loc(0)
+
+    def get_by_text(self, t, exact=False):
+        return _Loc(0)
+
+
+@pytest.fixture
+def quiet(monkeypatch):
+    monkeypatch.setattr(cl, "human_sleep", lambda a, b: None)
+
+
+class Test貼文頁年齡:
+    def test_取第一個讀得懂的時間(self, quiet):
+        pg = FakePage(times="2026-07-12T08:30:00.000Z\n1天前")
+        assert cl._post_age_days(pg, now=NOW) == 53
+
+    def test_都讀不懂就是None(self, quiet):
+        assert cl._post_age_days(FakePage(times="已編輯\n查看更多"), now=NOW) is None
+
+
+class Test單則刪除:
+    def test_完整走完才算刪掉(self, quiet):
+        pg = FakePage()
+        assert cl._delete_one(pg, pg.url) is True
+        assert pg.steps == ["more", "menu", "confirm"]
+
+    def test_找不到更多按鈕就跳過(self, quiet):
+        pg = FakePage(has_more=False)
+        assert cl._delete_one(pg, pg.url) is False
+        assert pg.steps == []
+
+    def test_選單裡沒有刪除就跳過並關掉選單(self, quiet):
+        """選單裡沒有「刪除」通常代表那不是自己的貼文——更不能亂點。"""
+        pg = FakePage(has_menu_item=False)
+        assert cl._delete_one(pg, pg.url) is False
+        assert "escape" in pg.steps
+
+    def test_沒出現確認框就Escape收手不亂點(self, quiet):
+        """「刪除」同時是選單項目也是確認鈕。確認框沒開就代表這步沒成功——
+        不准退回全頁找同名文字，否則會把剛按過的選單項目再點一次。"""
+        pg = FakePage(has_confirm=False)
+        assert cl._delete_one(pg, pg.url) is False
+        assert pg.steps.count("menu") == 1        # 選單只按一次，沒有第二次亂點
+        assert pg.steps[-1] == "escape"
+
+    def test_確認鈕只在對話框裡找(self, quiet):
+        pg = FakePage()
+        seen = []
+        real = pg.locator
+        pg.locator = lambda sel: (seen.append(sel), real(sel))[1]
+        assert cl._delete_one(pg, pg.url) is True
+        assert all('role="dialog"' in s for s in seen if "更多" not in s and "aria-label" not in s)
+
+    def test_按了確認但沒有任何刪除跡象就不算成功(self, quiet, monkeypatch):
+        """數字灌水比少刪一則糟糕得多：客戶會以為舊文清乾淨了，其實還掛在牆上。"""
+        pg = FakePage()
+        monkeypatch.setattr(pg, "locator", lambda sel: (
+            _Loc(1, lambda: pg.steps.append("confirm")) if 'role="dialog"' in sel
+            else _Loc(1, lambda: pg.steps.append("more")) if "aria-label" in sel
+            else _Loc(0)))
+        assert cl._delete_one(pg, pg.url) is False
+        assert pg.gotos == [pg.url]          # 有回頭複驗那則貼文還在不在
+
+
+class Test邊捲邊收:
+    """FB 動態時報跟 IG 九宮格一樣是虛擬清單：捲完再抓只會抓到最後一屏。"""
+
+    class _P:
+        class mouse:
+            @staticmethod
+            def wheel(*a):
+                pass
+
+    def test_累積多輪的候選而不是只看最後一屏(self, monkeypatch):
+        screens = [[{"href": f"https://www.facebook.com/{FBID}/posts/{k}", "stamp": "9週"}]
+                   for k in ("A", "B", "C")] + [[]]
+        calls = {"i": 0}
+
+        def fake_cards(page):
+            i = min(calls["i"], len(screens) - 1)
+            calls["i"] += 1
+            return list(screens[i])
+
+        monkeypatch.setattr(cl, "_collect_cards", fake_cards)
+        monkeypatch.setattr(cl, "human_sleep", lambda *a, **k: None)
+        got = cl._collect_while_scrolling(self._P(), FBID, "", want=10, rounds=6, now=NOW)
+        assert [p["key"] for p in got] == ["A", "B", "C"]
+
+    def test_連續幾輪沒有新東西就停(self, monkeypatch):
+        monkeypatch.setattr(cl, "_collect_cards", lambda page: [
+            {"href": f"https://www.facebook.com/{FBID}/posts/X", "stamp": "9週"}])
+        monkeypatch.setattr(cl, "human_sleep", lambda *a, **k: None)
+        got = cl._collect_while_scrolling(self._P(), FBID, "", want=99, rounds=50, now=NOW)
+        assert [p["key"] for p in got] == ["X"]     # 不會空捲 50 次
+
+
+# ---------- 主程式與結果 JSON ----------
+
+class Test主程式結果JSON:
+    def _run(self, out, argv, fake_body):
+        code = (
+            "import sys; sys.argv=%r\n"
+            "import src.run_fb_cleanup as m\n"
+            "%s\n"
+            "try: m.main()\n"
+            "except SystemExit as e: print('EXIT', e.code)\n"
+        ) % (argv, fake_body)
+        r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        return r.stdout, json.loads(out.read_text(encoding="utf-8"))
+
+    def test_dry_run只列不刪(self, tmp_path):
+        out = tmp_path / "r.json"
+        fake = (
+            "def fake(fbid,older,mx,headless,dry_run=False,profile_dir=None,only=None):\n"
+            "    assert dry_run is True and fbid=='100012345'\n"
+            "    return {'posts':["
+            "{'url':'https://www.facebook.com/100012345/posts/A','age_days':41,'status':'dry_run'},"
+            "{'url':'https://www.facebook.com/100012345/posts/B','age_days':None,'status':'undated'},"
+            "{'url':'https://www.facebook.com/100012345/posts/C','age_days':3,'status':'recent'}],"
+            "'blocked':False,'block_reason':'','skipped_pinned':1}\n"
+            "m.do_cleanup=fake"
+        )
+        argv = ["x", "--fbid", FBID, "--older-than", "30", "--dry-run", "--result-json", str(out)]
+        stdout, d = self._run(out, argv, fake)
+        assert "EXIT" not in stdout
+        assert d["success"] is True and d["platform"] == "fb" and d["deleted"] == 0
+        assert d["skipped_undated"] == 1 and d["skipped_recent"] == 1 and d["skipped_pinned"] == 1
+        assert d["posts"][0]["age_days"] == 41 and d["posts"][0]["status"] == "dry_run"
+        assert d["data"]["deleted"] == 0 and d["data"]["platform"] == "fb"
+        assert "41" in stdout and "posts/A" in stdout      # dry-run 清單要看得出網址與天數
+        assert "posts/B" in stdout                          # 日期讀不到的也要講
+
+    def test_被擋中止但保留已刪的(self, tmp_path):
+        out = tmp_path / "r.json"
+        fake = (
+            "def fake(fbid,older,mx,headless,dry_run=False,profile_dir=None,only=None):\n"
+            "    assert (older,mx)==(7,50),(older,mx)\n"       # 3 天被提高、99 則被夾住
+            "    return {'posts':[{'url':'u1','age_days':41,'status':'deleted'},"
+            "{'url':'u2','age_days':60,'status':'deleted'},"
+            "{'url':'u3','age_days':None,'status':'undated'},"
+            "{'url':'u4','age_days':55,'status':'failed'}],"
+            "'blocked':True,'block_reason':'action_blocked','skipped_pinned':0}\n"
+            "m.do_cleanup=fake"
+        )
+        argv = ["x", "--fbid", FBID, "--older-than", "3", "--max", "99", "--result-json", str(out)]
+        stdout, d = self._run(out, argv, fake)
+        assert "EXIT 1" in stdout
+        assert "最少 7" in stdout and "50" in stdout           # 夾住要講明白
+        assert d["success"] is False and d["fbid"] == FBID
+        assert d["blocked"] is True and d["block_reason"] == "action_blocked"
+        assert d["deleted"] == 2 and d["skipped_undated"] == 1
+        assert len(d["posts"]) == 4                            # 已刪的不能白刪
+        assert d["data"]["blocked"] is True
+
+    def test_例外也留下結果檔(self, tmp_path):
+        out = tmp_path / "r.json"
+        fake = ("def fake(fbid,older,mx,headless,dry_run=False,profile_dir=None,only=None):\n"
+                "    raise RuntimeError('Cookie 登入失敗，請先用 CLI 登入一次')\n"
+                "m.do_cleanup=fake")
+        argv = ["x", "--fbid", FBID, "--result-json", str(out)]
+        stdout, d = self._run(out, argv, fake)
+        assert "EXIT 1" in stdout
+        assert d["success"] is False and "Cookie 登入失敗" in d["error"]
+        assert d["older_than"] == 30 and d["max"] == 20 and d["data"]["posts"] == []
+
+
+class Test代稱取得:
+    """2026-09-03 mini 實測：個人頁沒有 og:url，但 profile.php?id= 會導到 /代稱/。
+    取不到代稱時，vanity 型網址的貼文一則都收不到——實測就是掃到 0 則。"""
+
+    def test_從導向後的網址取代稱(self):
+        import src.run_fb_cleanup as cl
+
+        class P:
+            url = "https://www.facebook.com/chunhao.tsai1/"
+            def evaluate(self, *a, **k): return ""
+        assert cl._my_vanity(P()) == "chunhao.tsai1"
+
+    def test_數字頁沒有代稱就回空(self):
+        import src.run_fb_cleanup as cl
+
+        class P:
+            url = "https://www.facebook.com/profile.php?id=123"
+            def evaluate(self, *a, **k): return ""
+        assert cl._my_vanity(P()) == ""
+
+
+class Test活動紀錄:
+    """2026-09-03 實測：時報只掃到 1 則、mbasic 被導回新版；活動紀錄 8 次捲動 62 則。"""
+
+    def test_年齡只信分組標頭_列內文的年份不能用(self):
+        import src.run_fb_cleanup as cl
+        now = datetime.datetime(2026, 9, 3)
+        cards = [{"href": "https://www.facebook.com/chunhao.tsai1/posts/pfbid0AAA",
+                  "stamp": "2026年8月25日", "head": "", "pinned": False}]
+        posts = cl.cards_to_posts(cards, "123", "chunhao.tsai1", now=now)
+        assert posts[0]["age_days"] == 9
+        cards[0]["stamp"] = ""          # 標頭找不到 → undated，絕不會拿內文算
+        assert cl.cards_to_posts(cards, "123", "chunhao.tsai1", now=now)[0]["age_days"] is None
+
+    def test_活動紀錄JS不會把內文塞進head(self):
+        import src.run_fb_cleanup as cl
+        assert "head: ''" in cl._ACTIVITY_JS          # 安全機制：內文有「2011年9月1日的生活要事」這種年份
+
+    def test_沒年份的月日當今年_未來就算去年(self):
+        import src.run_fb_cleanup as cl
+        now = datetime.datetime(2026, 9, 3)
+        assert cl.parse_age_days("7月12日 下午2:10", now=now) == 53
+        assert cl.parse_age_days("12月25日", now=now) == 252
+        assert cl.parse_age_days("3天", now=now) == 3
+
+    def test_活動紀錄網址(self):
+        import src.run_fb_cleanup as cl
+        assert cl.activity_url("123").endswith("/123/allactivity?activity_history=false&category_key=STATUSCLUSTER")
+
+
+    def test_活動紀錄來的候選標記為不必複驗(self, monkeypatch):
+        """實測：貼文頁上留言的時間把 23 則舊貼文全複驗成「太新」，一則都沒刪。"""
+        import src.run_fb_cleanup as cl
+        monkeypatch.setattr(cl, "human_sleep", lambda *a, **k: None)
+
+        class P:
+            url = "https://www.facebook.com/123/allactivity?x"
+            class mouse:
+                @staticmethod
+                def wheel(*a): pass
+            def goto(self, *a, **k): pass
+            def evaluate(self, js, *a):
+                return [{"href": "https://www.facebook.com/123/posts/pfbid0AAA",
+                         "stamp": "2026年6月1日", "head": "", "pinned": False}]
+        got = cl._collect_activity_log(P(), "123", "", want=5, rounds=2,
+                                       now=datetime.datetime(2026, 9, 3))
+        assert got and got[0]["dated_by"] == "activity" and got[0]["age_days"] == 94
+
+
+    def test_額度看按了幾次確認_驗證誤判也不能多刪(self, monkeypatch):
+        """實測：驗證把刪成功記成失敗，設定 1 則卻刪了 3 則。"""
+        import src.run_fb_cleanup as cl
+        monkeypatch.setattr(cl, "human_sleep", lambda *a, **k: None)
+        monkeypatch.setattr(cl, "_CONFIRM_CLICKS", 0)
+        monkeypatch.setattr(cl, "_deleted_ok", lambda page, url: False)   # 驗證一律說失敗
+        pg = FakePage()
+        assert cl._delete_one(pg, pg.url) is False
+        assert cl._CONFIRM_CLICKS == 1            # 但確認確實按了一次，額度要算
+
+
+class Test只刪摸魚發的_FB:
+    def test_網址與內文兩種對法(self):
+        import src.run_fb_cleanup as cl
+        only = {"urls": ["https://www.facebook.com/groups/123/posts/A"],
+                "phrases": ["方舟不動產 經紀業字號"]}
+        assert cl.is_ours("https://www.facebook.com/groups/123/posts/A?__cft__=x", "", only)
+        assert cl.is_ours("https://www.facebook.com/me/posts/Z", "…方舟不動產 經紀業字號…", only)
+        assert not cl.is_ours("https://www.facebook.com/me/posts/Z", "純聊天", only)
+
+    def test_空白名單不刪_沒白名單照舊(self):
+        import src.run_fb_cleanup as cl
+        assert not cl.is_ours("u", "x", {"urls": [], "phrases": []})
+        assert cl.is_ours("u", "x", None)
+
+
+def test_force_recent_允許零天():
+    """老闆 2026-09-08：「這幾天摸魚發的文都刪除」——手動＋只刪摸魚發的才放行天數下限。"""
+    from src.run_fb_cleanup import effective_older_than, MIN_OLDER_THAN
+    assert effective_older_than(0) >= MIN_OLDER_THAN                  # 平常 0 = 用預設
+    assert effective_older_than(0, force_recent=True) == 0
+    assert effective_older_than(3, force_recent=True) == 3
+    assert effective_older_than(None, force_recent=True) >= MIN_OLDER_THAN
+
+
+def test_before_moyu_比摸魚第一次發文早的直接跳過(tmp_path):
+    import json
+    from src.run_fb_cleanup import before_moyu, load_only
+    f = tmp_path / "only.json"; f.write_text(json.dumps({"urls": [], "phrases": ["x"], "max_age_days": 4}))
+    only = load_only(str(f))
+    assert only["max_age_days"] == 4
+    assert before_moyu(5, only) and not before_moyu(4, only) and not before_moyu(0, only)
+    assert not before_moyu(None, only) and not before_moyu(99, None)
+    assert not before_moyu(99, {"urls": [], "phrases": []})       # 沒給就照舊全比

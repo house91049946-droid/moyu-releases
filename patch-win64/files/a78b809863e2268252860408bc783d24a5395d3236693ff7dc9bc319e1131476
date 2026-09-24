@@ -1,0 +1,390 @@
+"""FB 社團探索與自動加入的離線測試（SPEC-P32 §3）。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_fb_group_join.py -v
+
+守的是「保守」：關鍵字最多 3 個、頁數最多 2、每輪硬上限 3、人數多的優先、
+入社問題一律跳過不答、被擋立刻停但已加入的要保留。全程不開瀏覽器。
+"""
+import inspect
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("playwright")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import run_fb_group_join as gj  # noqa: E402
+from src import run_fb_group_search as gs  # noqa: E402
+from src.meta_block import ACTION_BLOCKED, UNKNOWN  # noqa: E402
+
+
+# ------------------------------------------------------------------ 探索（search）
+
+class Test關鍵字:
+    def test_最多三個多的丟掉(self):
+        """§3.2 硬規則：關鍵字最多 3 個。多打的忽略，不是報錯。"""
+        assert gs.parse_keywords("a,b,c,d,e") == ["a", "b", "c"]
+        assert gs.MAX_KEYWORDS == 3
+
+    def test_去空白去重保順序(self):
+        assert gs.parse_keywords(" 台中 買房 , 台中 租屋 ,台中 買房, ") == ["台中 買房", "台中 租屋"]
+
+    def test_空字串回空清單(self):
+        assert gs.parse_keywords("") == [] and gs.parse_keywords(" , ,") == []
+
+
+class Test頁數:
+    def test_預設兩頁(self):
+        assert gs.effective_pages(None) == 2 and gs.effective_pages(0) == 2
+
+    def test_不准超過兩頁(self):
+        """§3.2 寫死「抓前 2 頁」——設定填 10 也只抓 2 頁。"""
+        assert gs.effective_pages(10) == gs.MAX_PAGES == 2
+
+    def test_一頁照收(self):
+        assert gs.effective_pages(1) == 1
+
+
+class Test成員數解析:
+    def test_中文萬位(self):
+        assert gs.parse_member_count("公開 · 1.2萬位成員") == 12000
+        assert gs.parse_member_count("2.3 萬名成員") == 23000
+
+    def test_千分位逗號(self):
+        assert gs.parse_member_count("Public · 3,456 members") == 3456
+        assert gs.parse_member_count("8,742 位成員") == 8742
+
+    def test_英文縮寫(self):
+        assert gs.parse_member_count("12K members") == 12000
+        assert gs.parse_member_count("1.5M members") == 1500000
+
+    def test_讀不到回零(self):
+        """讀不到就 0，排序時排最後——不猜數字。"""
+        assert gs.parse_member_count("每天約 10 則貼文") == 0
+        assert gs.parse_member_count("") == 0
+        assert gs.parse_member_count("台中買房交流區") == 0
+
+
+class Test隱私解析:
+    def test_中英都認(self):
+        assert gs.parse_privacy("公開 · 1.2萬位成員") == "公開"
+        assert gs.parse_privacy("私密 · 320位成員") == "私密"
+        assert gs.parse_privacy("Public · 3,456 members") == "公開"
+        assert gs.parse_privacy("Private group") == "私密"
+
+    def test_名字裡的公開不算(self):
+        """只認行首那一行；社團名叫「台中房產公開資訊站」不該被判成公開。"""
+        text = "台中房產公開資訊站\n私密 · 500位成員"
+        assert gs.parse_privacy(text) == "私密"
+
+
+class Test社團網址:
+    def test_數字id與代稱(self):
+        assert gs.group_key_from_url("https://www.facebook.com/groups/123456/posts/9/") == "123456"
+        assert gs.group_key_from_url("https://www.facebook.com/groups/Taichung.House/") == "taichung.house"
+
+    def test_正規化成同一種寫法(self):
+        for u in ("https://m.facebook.com/groups/123456?ref=share",
+                  "https://mbasic.facebook.com/groups/123456/",
+                  "https://www.facebook.com/groups/123456/user/9/"):
+            assert gs.normalize_group_url(u) == "https://www.facebook.com/groups/123456/", u
+
+    def test_功能頁不是社團(self):
+        for u in ("https://www.facebook.com/groups/discover/",
+                  "https://www.facebook.com/groups/joins/",
+                  "https://www.facebook.com/john.doe", ""):
+            assert gs.group_key_from_url(u) == "" and gs.normalize_group_url(u) == ""
+
+
+class Test卡片解析:
+    def test_中文卡片(self):
+        text = "台中買房交流區\n公開 · 2.3萬位成員\n每天約 10 則貼文\n加入社團"
+        g = gs.parse_group_card(text, "https://www.facebook.com/groups/998877/?ref=search", "台中 買房")
+        assert g == {"url": "https://www.facebook.com/groups/998877/", "name": "台中買房交流區",
+                     "members": 23000, "privacy": "公開", "keyword": "台中 買房"}
+
+    def test_英文卡片(self):
+        text = "Taichung Housing\nPrivate · 3,456 members\nJoin group"
+        g = gs.parse_group_card(text, "https://www.facebook.com/groups/tc.house/", "rent")
+        assert g["name"] == "Taichung Housing" and g["members"] == 3456 and g["privacy"] == "私密"
+
+    def test_按鈕字排在前面也能取到名字(self):
+        """卡片有時第一行就是「贊助」「已加入」這種字，名字在後面。"""
+        text = "贊助\n已加入\n北屯房地產\n公開 · 500位成員"
+        g = gs.parse_group_card(text, "https://www.facebook.com/groups/555/")
+        assert g["name"] == "北屯房地產"
+
+    def test_不是社團或沒名字回None(self):
+        assert gs.parse_group_card("隨便\n文字", "https://www.facebook.com/watch/") is None
+        assert gs.parse_group_card("加入社團", "https://www.facebook.com/groups/555/") is None
+
+
+class Test去重與排序:
+    def test_同社團兩筆合併互補(self):
+        """同一張卡我們從按鈕與連結各往上走一次，資訊會落在不同層——要補不要丟。"""
+        raw = [{"url": "https://www.facebook.com/groups/1/", "name": "甲社團", "members": 0, "privacy": ""},
+               {"url": "https://www.facebook.com/groups/1/", "name": "甲社團（台中）", "members": 900, "privacy": "公開"},
+               {"url": "https://www.facebook.com/groups/2/", "name": "乙社團", "members": 5, "privacy": "私密"}]
+        out = gs.dedupe_groups(raw)
+        assert len(out) == 2
+        assert out[0]["members"] == 900 and out[0]["privacy"] == "公開" and out[0]["name"] == "甲社團（台中）"
+
+    def test_人數多的排前面(self):
+        """老闆硬規則：人數多的優先。"""
+        raw = [{"members": 100}, {"members": 23000}, {"members": 0}, {"members": 900}]
+        assert [g["members"] for g in gs.sort_by_members(raw)] == [23000, 900, 100, 0]
+
+    def test_同人數保持原順序(self):
+        raw = [{"members": 5, "name": "先"}, {"members": 5, "name": "後"}]
+        assert [g["name"] for g in gs.sort_by_members(raw)] == ["先", "後"]
+
+    def test_沒有members欄位當零(self):
+        assert gs.sort_by_members([{"name": "x"}, {"members": 3, "name": "y"}])[0]["name"] == "y"
+
+
+class Test搜尋摘要:
+    def test_計數(self):
+        gs_list = [{"privacy": "公開", "members": 10}, {"privacy": "私密", "members": 0},
+                   {"privacy": "", "members": 5}]
+        assert gs.summarize(gs_list) == {"found": 3, "public": 1, "private": 1, "with_members": 2}
+
+
+# ------------------------------------------------------------------ 加入（join）
+
+class Test額度:
+    def test_預設兩個(self):
+        assert gj.effective_max(None) == 2 and gj.effective_max(0) == 2 == gj.DEFAULT_MAX
+
+    def test_不准超過硬上限三(self):
+        """§3.1：每日上限 2、硬上限 3，任何一項都不准放寬。"""
+        assert gj.effective_max(100) == gj.HARD_CAP == 3
+
+    def test_合理值照收(self):
+        assert gj.effective_max(1) == 1 and gj.effective_max(3) == 3
+
+
+class Test網址清單:
+    def test_去重丟掉非社團(self):
+        arg = ("https://www.facebook.com/groups/111/, https://m.facebook.com/groups/111?ref=x,"
+               "https://www.facebook.com/groups/discover/, ,https://www.facebook.com/groups/abc/")
+        out = gj.parse_urls(arg)
+        assert [t["url"] for t in out] == ["https://www.facebook.com/groups/111/",
+                                           "https://www.facebook.com/groups/abc/"]
+        assert out[0]["key"] == "111"
+
+    def test_全部不合法回空(self):
+        assert gj.parse_urls("https://www.facebook.com/john.doe") == []
+
+
+class Test排除清單:
+    def test_網址與鍵都吃(self, tmp_path):
+        p = tmp_path / "known.json"
+        p.write_text(json.dumps(["https://www.facebook.com/groups/111/", "abc", 222]), encoding="utf-8")
+        known = gj.load_exclude_keys(str(p))
+        assert known == {"111", "abc", "222"}
+        kept, n = gj.drop_known([{"key": "111"}, {"key": "999"}, {"key": "abc"}], known)
+        assert [t["key"] for t in kept] == ["999"] and n == 2
+
+    def test_檔案不在或壞掉當空的(self, tmp_path):
+        assert gj.load_exclude_keys(None) == set()
+        assert gj.load_exclude_keys(str(tmp_path / "nope.json")) == set()
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        assert gj.load_exclude_keys(str(bad)) == set()
+        obj = tmp_path / "obj.json"
+        obj.write_text('{"a": 1}', encoding="utf-8")
+        assert gj.load_exclude_keys(str(obj)) == set()
+
+
+class Test按鈕狀態:
+    def test_四種狀態(self):
+        assert gj.join_button_status("加入社團") == "join"
+        assert gj.join_button_status("Join group") == "join"
+        assert gj.join_button_status("已加入") == "existing"
+        assert gj.join_button_status("Joined") == "existing"
+        assert gj.join_button_status("取消要求") == "requested"
+        assert gj.join_button_status("Requested") == "requested"
+        assert gj.join_button_status("") == ""
+
+    def test_已加入已申請優先於可加(self):
+        """漏判會變成「再按一次＝退出社團／取消申請」，比沒加更糟。"""
+        assert gj.join_button_status("已要求加入") == "requested"
+        assert gj.join_button_status("已加入社團") == "existing"
+
+
+class Test入社問題:
+    def test_認得出問題對話框(self):
+        for t in ("這個社團要求你回答問題", "管理員想了解你", "Answer questions to join",
+                  "Membership questions"):
+            assert gj.looks_like_question_dialog(t), t
+
+    def test_一般對話框不誤判(self):
+        for t in ("", "你已加入這個社團", "社團規則"):
+            assert not gj.looks_like_question_dialog(t), t
+
+
+class Test額度計數:
+    def test_只有已是成員不算(self):
+        """只要頁面開了、鈕按了，FB 就看得到動作——寧可少加也不要超量。"""
+        for st in ("joined", "requested", "question", "failed", "dry_run"):
+            assert gj.counts_toward_quota(st) is True, st
+        assert gj.counts_toward_quota("existing") is False
+
+
+class Test結果統計:
+    def test_依status計數(self):
+        rows = [{"status": "joined"}, {"status": "requested"}, {"status": "question"},
+                {"status": "existing"}, {"status": "failed"}, {"status": "dry_run"},
+                {"status": "joined"}]
+        assert gj.summarize(rows) == {"joined": 2, "requested": 1, "question": 1,
+                                      "existing": 1, "failed": 1, "dry_run": 1}
+
+
+class Test封鎖判斷:
+    def test_社團專屬字樣(self):
+        assert gj.classify_fb_block("你目前無法加入社團") == ACTION_BLOCKED
+        assert gs.classify_fb_block("You're joining groups too quickly") == ACTION_BLOCKED
+
+    def test_沿用加好友那支校正過的FB字樣(self):
+        assert gs.classify_fb_block("你暫時被封鎖") == ACTION_BLOCKED
+        assert gj.classify_fb_block("Action Blocked") == ACTION_BLOCKED
+
+    def test_一般頁面不誤判(self):
+        assert gs.classify_fb_block("台中買房交流區 公開 · 2.3萬位成員 加入社團") == UNKNOWN
+
+
+class Test處理流程:
+    """用假的 join_one 走 process_groups，不開瀏覽器。"""
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self, monkeypatch):
+        monkeypatch.setattr(gj, "human_sleep", lambda *a, **k: None)
+
+    def _targets(self, n):
+        return [{"key": str(i), "name": f"社團{i}", "url": f"https://www.facebook.com/groups/{i}/"}
+                for i in range(n)]
+
+    def test_做滿額度就停(self):
+        calls = []
+
+        def fake(page, fbid, t, dry_run):
+            calls.append(t["key"])
+            return "joined", t["name"], ""
+
+        r = gj.process_groups(None, "1", self._targets(10), 2, False, join_one=fake, gap=(0, 0))
+        assert len(calls) == 2 and gj.summarize(r["groups"])["joined"] == 2
+        assert r["blocked"] is False
+
+    def test_已是成員不算額度(self):
+        seq = iter([("existing", "甲", ""), ("joined", "乙", ""), ("requested", "丙", "")])
+
+        def fake(page, fbid, t, dry_run):
+            return next(seq)
+
+        r = gj.process_groups(None, "1", self._targets(3), 2, False, join_one=fake, gap=(0, 0))
+        assert gj.summarize(r["groups"]) == {"joined": 1, "requested": 1, "question": 0,
+                                             "existing": 1, "failed": 0, "dry_run": 0}
+
+    def test_有入社問題記question且算額度(self):
+        """§3.1：答錯比不答糟——一律跳過不答，但這次動作照樣算額度。"""
+        seq = iter([("question", "甲", "社團要求回答入社問題，已跳過不答"), ("joined", "乙", "")])
+        calls = []
+
+        def fake(page, fbid, t, dry_run):
+            calls.append(t["key"])
+            return next(seq)
+
+        r = gj.process_groups(None, "1", self._targets(5), 2, False, join_one=fake, gap=(0, 0))
+        assert len(calls) == 2
+        s = gj.summarize(r["groups"])
+        assert s["question"] == 1 and s["joined"] == 1
+        assert r["groups"][0]["reason"].startswith("社團要求回答入社問題")
+        # 後端 record_joins 落庫讀的是 note，UI 靠它顯示「請自己去答」
+        assert r["groups"][0]["note"] == r["groups"][0]["reason"]
+
+    def test_被擋立刻停但保留已做的(self):
+        seq = iter([("joined", "甲", ""), ("blocked", "", ACTION_BLOCKED), ("joined", "丙", "")])
+        calls = []
+
+        def fake(page, fbid, t, dry_run):
+            calls.append(t["key"])
+            return next(seq)
+
+        r = gj.process_groups(None, "1", self._targets(3), 3, False, join_one=fake, gap=(0, 0))
+        assert r["blocked"] is True and r["block_reason"] == ACTION_BLOCKED
+        assert len(calls) == 2                                  # 第三個沒碰
+        assert gj.summarize(r["groups"])["joined"] == 1          # 已加入的保留
+        assert r["groups"][-1]["status"] == "failed"             # 被擋那筆不算加入成功
+
+    def test_例外當失敗不整批炸掉(self):
+        def fake(page, fbid, t, dry_run):
+            raise RuntimeError("版面改了")
+
+        r = gj.process_groups(None, "1", self._targets(2), 2, False, join_one=fake, gap=(0, 0))
+        assert gj.summarize(r["groups"])["failed"] == 2 and r["blocked"] is False
+
+    def test_dry_run不點任何東西(self):
+        def fake(page, fbid, t, dry_run):
+            assert dry_run is True
+            return "dry_run", t["name"], ""
+
+        r = gj.process_groups(None, "1", self._targets(5), 2, True, join_one=fake, gap=(0, 0))
+        assert gj.summarize(r["groups"])["dry_run"] == 2
+
+    def test_真的dry_run不開頁面(self):
+        """`_join_one` 在 dry-run 下必須直接回傳，連 page 都不能碰（傳 None 進去驗證）。"""
+        assert gj._join_one(None, "1", {"url": "u", "name": "甲"}, True) == ("dry_run", "甲", "")
+
+
+class Test安全預設:
+    def test_上限與間隔都是硬規則(self):
+        assert gj.DEFAULT_MAX == 2 and gj.HARD_CAP == 3
+        assert gj.GAP == (60, 180)          # 同一輪內 60–180 秒；跨輪 30 分鐘由後端排程管
+        assert gs.MAX_KEYWORDS == 3 and gs.MAX_PAGES == 2
+
+    def test_已加入已申請的標籤涵蓋中英(self):
+        for lab in ("已加入", "Joined"):
+            assert lab in gj._MEMBER_LABELS
+        for lab in ("取消要求", "Requested"):
+            assert lab in gj._REQUESTED_LABELS
+
+    def test_搜尋那支不含任何加入動作(self):
+        """探索只找不加——整份原始碼不該出現點加入鈕的程式碼。"""
+        src = inspect.getsource(gs)
+        assert ".click(" not in src
+
+
+class Test實作陷阱:
+    def test_JS片段不得含真換行(self):
+        """踩過兩次的坑：Python 字串裡寫 \\n，JS 收到真換行 → 整段語法錯誤、默默回空。"""
+        for mod in (gs, gj):
+            for line in inspect.getsource(mod).splitlines():
+                if not any(t in line for t in ("querySelector", "innerText", "document.")):
+                    continue
+                assert "\\n" not in line, line
+                if "split(" in line:
+                    assert "fromCharCode" in line, line
+
+
+class Test實測校正_2026_09_03:
+    """mini 實測：加入其實成功了（FB 通知寫著「你現在可以在○○…」），
+    但當下按鈕文字沒變 → 被記成失敗，下次還會再按一次。"""
+
+    def test_額度看按了幾次加入(self, monkeypatch):
+        import src.run_fb_group_join as gj
+        monkeypatch.setattr(gj, "_CLICKED", 1)
+        calls = []
+
+        def fake_join(*a, **k):
+            calls.append(1)
+            return "failed", "x", "驗證看不到"
+
+        out = gj.process_groups(None, "1", [{"url": "u1"}, {"url": "u2"}],
+                                max_join=1, dry_run=False, join_one=fake_join, gap=(0, 0))
+        assert calls == [] and out["groups"] == []
+
+    def test_社團名不會讀到通知面板(self):
+        import src.run_fb_group_join as gj
+        assert "通知" in gj._SKIP_HEADINGS and "Notifications" in gj._SKIP_HEADINGS

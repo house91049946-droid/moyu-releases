@@ -1,0 +1,150 @@
+"""CLI wrapper — Cookie 登入（不輸入帳密，直接用已儲存的 cookie 登入主頁）。"""
+import argparse
+import atexit
+import json
+import sys
+import time
+
+from src.utils import launch_browser, capture_screenshot
+
+
+_JSON_PATH: str | None = None
+_RESULT: dict | None = None
+
+
+MANUAL_LOGIN_TIMEOUT = 600   # 版面認不得時，留給客戶自己登入的時間（秒）
+
+
+def _auto_or_manual_login(page, context, email: str, password: str) -> None:
+    """先試自動填帳密；FB 換了版面（或需要驗證）就把瀏覽器留給客戶手動登入。
+
+    無論走哪條路，最後都是「等 cookie 出現」——只要客戶在這個視窗裡登入成功，
+    我們就拿得到 cookie，不必看得懂 FB 這次長什麼樣子。
+    """
+    from src.login import login_facebook, _get_fbid_from_cookies
+
+    try:
+        result = login_facebook(page, context, email, password)
+        print(f"[cookie_login] 自動登入結果: {result.status} — {result.message}", flush=True)
+        if result.fbid:
+            return
+    except Exception as e:
+        print(f"[cookie_login] 自動登入過程出錯（改走手動）：{e}", flush=True)
+
+    if _get_fbid_from_cookies(context):
+        return
+
+    print("═" * 55, flush=True)
+    print("  自動登入沒有完成（FB 版面不同或需要驗證）。", flush=True)
+    print("  瀏覽器保持開啟，請直接在視窗裡完成登入／驗證，", flush=True)
+    print(f"  系統會自動偵測登入完成（最長等待 {MANUAL_LOGIN_TIMEOUT} 秒）。", flush=True)
+    print("═" * 55, flush=True)
+
+    # 事件驅動地等：客戶正在打字時我們一個指令都不發（與 run_login 同一套理由）
+    start = time.time()
+    while time.time() - start < MANUAL_LOGIN_TIMEOUT:
+        if page.is_closed() or not context.pages:
+            print("[cookie_login] 客戶關掉了瀏覽器，結束等待", flush=True)
+            break
+        if _get_fbid_from_cookies(context):
+            print("[cookie_login] ✓ 偵測到登入完成", flush=True)
+            return
+        time.sleep(2)
+
+
+def main():
+    global _JSON_PATH, _RESULT
+
+    parser = argparse.ArgumentParser(description="FB Auto — Cookie 登入（直接進主頁）")
+    parser.add_argument("--fbid", required=True, help="FB numeric ID（必須已有 cookie）")
+    parser.add_argument("--email", default="", help="cookie 失效時用來自動登入的帳號")
+    parser.add_argument("--password", default="", help="cookie 失效時用來自動填入的密碼")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--keep-open", action="store_true", help="登入後保持瀏覽器開啟，不自動關閉")
+    parser.add_argument("--result-json", help="結果 JSON 輸出路徑")
+    args = parser.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {"schema": 2, "success": False, "fbid": args.fbid, "error": "未完成", "data": {}}
+    if _JSON_PATH:
+        atexit.register(_write_result_json)
+
+    browser = context = page = None
+    try:
+        browser, context, page = launch_browser(fbid=args.fbid, headless=args.headless)
+
+        from src.login import _try_cookie_login, _get_fbid_from_cookies
+
+        if not _try_cookie_login(page, context, args.fbid):
+            # cookie 失效 → 自動帶密碼登入；認不得版面就把瀏覽器留給客戶自己登。
+            # 原本直接關掉視窗退出，客戶按「登入」等於什麼都沒發生
+            # （2026-08-02 客戶回報）。
+            print("[cookie_login] cookie 已失效，改以帳密自動登入…", flush=True)
+            if not (args.email and args.password):
+                _RESULT["error"] = "Cookie 已失效，且此帳號未設定密碼，無法自動登入"
+                print(f"❌ {_RESULT['error']}")
+                sys.exit(1)
+            _auto_or_manual_login(page, context, args.email, args.password)
+
+        actual_fbid = _get_fbid_from_cookies(context)
+        if not actual_fbid:
+            _RESULT["error"] = "Cookie 登入後無法取得 fbid"
+            sys.exit(1)
+        # login_facebook 會輪流試 cookies/ 底下所有帳號的 cookie，多帳號時可能
+        # 登成別人。登錯帳號比登不進去更糟（會用錯的身分發文），直接擋下。
+        if actual_fbid != args.fbid:
+            _RESULT["error"] = (
+                f"登入後的帳號不是這一個（預期 {args.fbid}，實際 {actual_fbid}）。"
+                "請在瀏覽器登出後重試，或到帳號設定重新綁定。"
+            )
+            print(f"❌ {_RESULT['error']}", flush=True)
+            sys.exit(1)
+        # 手動／帳密路徑拿到的是新 cookie，存起來供後續排程使用
+        from src.login import _save_cookies_to_file
+        _save_cookies_to_file(context, actual_fbid)
+
+        print(f"✓ Cookie 登入成功 — fbid={actual_fbid}")
+        _RESULT["success"] = True
+        _RESULT["fbid"] = actual_fbid
+        _RESULT["error"] = ""
+
+        if args.keep_open:
+            # 保持瀏覽器開啟直到使用者手動關閉視窗
+            print(f"\n{'═' * 55}")
+            print("瀏覽器保持開啟中，請手動使用。")
+            print("關閉瀏覽器視窗後此程式會自動結束。")
+            print(f"{'═' * 55}")
+            try:
+                # 輪詢等待瀏覽器被使用者關閉。
+                # 用 is_closed()（本地狀態，不打瀏覽器）而不是 page.title()——
+                # title() 每秒都要進頁面執行一次 JS，客戶正在打字或捲動時會被插隊。
+                while not page.is_closed() and context.pages:
+                    time.sleep(1)
+                print("瀏覽器已關閉，程式結束。")
+            except KeyboardInterrupt:
+                print("使用者中斷")
+
+    except KeyboardInterrupt:
+        _RESULT["error"] = "使用者中斷"
+        sys.exit(0)
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        if page:
+            capture_screenshot(page, args.fbid, "cookie_login_error")
+        sys.exit(1)
+    finally:
+        if context:
+            context.close()  # launch_browser 的 browser 與 context 同物件，close 一次即可
+
+
+def _write_result_json():
+    if _JSON_PATH and _RESULT is not None:
+        try:
+            with open(_JSON_PATH, "w", encoding="utf-8") as f:
+                json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[result-json] 寫檔失敗: {e}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

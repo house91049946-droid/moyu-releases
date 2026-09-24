@@ -1,0 +1,70 @@
+"""成效回收 CLI：開「你的商品」頁，把每個刊登的點擊數讀回來（不改任何東西）。
+
+用法：python -m src.run_metrics --fbid <id> --headless --result-json out.json
+結果：{"success": true, "data": {"results": [{"title","price","posted","clicks","views","status","shared"}]}}
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import sys
+import time
+
+from src.metrics_parse import parse_selling_lines
+
+SELLING_URL = "https://www.facebook.com/marketplace/you/selling"
+_JSON_PATH = None
+_RESULT = None
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser(description="讀 Marketplace 刊登的點擊數")
+    ap.add_argument("--fbid", required=True)
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--result-json")
+    args = ap.parse_args()
+    _JSON_PATH = args.result_json
+    _RESULT = {"schema": 1, "success": False, "error": "未完成", "fbid": args.fbid, "data": {"results": []}}
+    if _JSON_PATH:
+        atexit.register(_write)
+
+    from src.utils import launch_browser
+    res = launch_browser(args.fbid, headless=args.headless)
+    ctx = res[0]
+    page = res[2] if len(res) > 2 else (ctx.pages[0] if ctx.pages else ctx.new_page())
+    try:
+        page.goto(SELLING_URL, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(6000)
+        if "login" in page.url:
+            _RESULT["error"] = "FB 未登入（被導到登入頁）"
+            sys.exit(1)
+        last, stable, t0 = -1, 0, time.time()
+        while time.time() - t0 < 40 and stable < 3:          # 捲到卡片數不再增加
+            page.mouse.wheel(0, 1600)
+            page.wait_for_timeout(900)
+            n = page.evaluate("() => (document.body.innerText.match(/次點擊/g) || []).length")
+            stable = stable + 1 if n == last else 0
+            last = n
+        lines = [l for l in page.evaluate("() => document.body.innerText").split("\n")]
+        items = parse_selling_lines(lines)
+        _RESULT.update({"success": True, "error": "", "data": {"results": items}})
+        print(f"[metrics] 你的商品：{len(items)} 筆，點擊合計 {sum(i['clicks'] for i in items)}", flush=True)
+    except SystemExit:
+        raise
+    except Exception as e:                                   # noqa: BLE001
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    finally:
+        with contextlib.suppress(Exception):
+            ctx.close()
+
+
+if __name__ == "__main__":
+    main()

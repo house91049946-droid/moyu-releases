@@ -1,0 +1,68 @@
+"""授權管理（本地 UI 用）：查狀態、輸入/清除 license key。"""
+import asyncio
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from ..cloud_client import (license_status, set_license_key, clear_license_key,
+                            apply_trial, referral_info, CloudError)
+
+router = APIRouter(prefix="/api/license", tags=["license"], redirect_slashes=False)
+
+
+@router.get("/status")
+async def get_status(probe: bool = True):
+    """授權狀態。probe=true 會先打一次 heartbeat（短逾時）取即時結果。"""
+    return await asyncio.to_thread(license_status, probe)
+
+
+class KeyIn(BaseModel):
+    license_key: str
+
+
+@router.post("/key")
+async def save_key(data: KeyIn):
+    """儲存授權金鑰並立即嘗試啟用，回啟用後狀態。"""
+    key = data.license_key.strip()
+    if not key:
+        raise HTTPException(status_code=422, detail="授權金鑰不可為空")
+    return await asyncio.to_thread(set_license_key, key)
+
+
+@router.delete("/key")
+async def delete_key():
+    """清除本機授權金鑰與快取狀態。"""
+    await asyncio.to_thread(clear_license_key)
+    return {"ok": True}
+
+
+@router.get("/referral")
+async def get_referral():
+    """我的介紹碼＋可分享的綁定連結（朋友點了 → 申請試用自動綁定介紹碼）。"""
+    try:
+        return await asyncio.to_thread(referral_info)
+    except CloudError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class ApplyIn(BaseModel):
+    name: str
+    phone: str
+    email: str
+    company: str = ""
+    referral_code: str = ""
+
+
+@router.post("/apply")
+async def apply(data: ApplyIn):
+    """申請試用：雲端自動發鑰（同機器只能領一次）→ 立即存檔啟用。"""
+    if not (data.name.strip() and data.phone.strip() and data.email.strip()):
+        raise HTTPException(status_code=422, detail="姓名、電話、email 為必填")
+    try:
+        result = await asyncio.to_thread(
+            apply_trial, data.name.strip(), data.phone.strip(), data.email.strip(),
+            data.company.strip(), data.referral_code.strip())
+    except CloudError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    status = await asyncio.to_thread(set_license_key, result["license_key"])
+    return {**status, "applied": True, "trial_days": result.get("trial_days")}

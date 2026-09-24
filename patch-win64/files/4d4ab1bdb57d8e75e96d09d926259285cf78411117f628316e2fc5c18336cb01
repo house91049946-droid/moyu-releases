@@ -1,0 +1,159 @@
+"""AI 讀社團規則（老闆 2026-09-15：社團分類應由 AI 進行，減少被拒絕發文）。
+
+每天 06:10：
+  1. 挑還沒讀過（或 30 天前讀的）房地產社團，排序：物件目標名單裡有的優先、人多的優先；一次 40 個
+  2. 開瀏覽器讀每個社團的「關於」頁（描述＋管理員規則）
+  3. 每 25 個送雲端 AI → 存 ai_rules，同時用 AI 的類別／區域覆蓋規則分類
+發文時 group_match.filter_by_rules 會把規則不合的社團拿掉（限屋齡、只收某縣市、禁止仲介…）。
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import tempfile
+
+from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy import select
+
+from ..database import SyncSession, Account, Group, Property, TAIPEI
+from .task_runner import scheduler
+
+RUN_AT = (6, 10)
+BATCH = 40
+RECHECK_DAYS = 30
+
+
+def _gid(g) -> str:
+    if g.group_id:
+        return str(g.group_id)
+    for part in (g.group_url or "").rstrip("/").split("/")[-2:]:
+        if part.isdigit():
+            return part
+    return ""
+
+
+def pick_groups_to_check(account_id: int, limit: int = BATCH, now: datetime.datetime | None = None) -> list[dict]:
+    now = now or datetime.datetime.utcnow()
+    with SyncSession() as s:
+        rows = s.execute(select(Group).where(Group.account_id == account_id)).scalars().all()
+        wanted = set()
+        for p in s.execute(select(Property).where(Property.account_id == account_id)).scalars().all():
+            wanted.update(p.target_groups or []); wanted.update(p.gp_target_groups or [])
+    cands = []
+    for g in rows:
+        gid = _gid(g)
+        if not gid or "非房產" in (g.tags or []) or g.post_blocked:
+            continue
+        if g.rules_checked_at and (now - g.rules_checked_at).days < RECHECK_DAYS:
+            continue
+        cands.append((0 if g.group_name in wanted else 1, -(g.member_count or 0), gid, g.group_name))
+    cands.sort()
+    return [{"id": gid, "name": name} for _, _, gid, name in cands[:limit]]
+
+
+def save_about(account_id: int, items: list[dict]) -> int:
+    now = datetime.datetime.utcnow()
+    with SyncSession() as s:
+        rows = {(_gid(g)): g for g in s.execute(select(Group).where(Group.account_id == account_id)).scalars().all()}
+        n = 0
+        for it in items or []:
+            g = rows.get(str(it.get("id") or ""))
+            if g is None:
+                continue
+            g.about_text = (it.get("about") or "")[:1500]
+            if it.get("members"):
+                g.member_count = int(it["members"])
+            g.rules_checked_at = now
+            n += 1
+        s.commit()
+        return n
+
+
+def apply_ai(account_id: int, results: list[dict]) -> int:
+    """AI 結果寫回：ai_rules 全存；類別／區域有給就覆蓋規則分類；AI 說不是房地產就標非房產。"""
+    with SyncSession() as s:
+        rows = {(_gid(g)): g for g in s.execute(select(Group).where(Group.account_id == account_id)).scalars().all()}
+        n = 0
+        for r in results or []:
+            g = rows.get(str(r.get("id") or ""))
+            if g is None:
+                continue
+            g.ai_rules = {k: r.get(k) for k in ("real_estate", "deal", "agent_allowed", "ads_allowed", "region_only",
+                                                 "max_age_years", "excluded_types", "required", "summary")}
+            if r.get("real_estate") is False:
+                g.tags = ["非房產"]
+            elif r.get("tags"):
+                g.tags = list(r["tags"])
+            if r.get("region"):
+                g.region = r["region"]
+            n += 1
+        s.commit()
+        return n
+
+
+def classify_pending(account_id: int, limit: int = 200) -> dict:
+    """讀過關於頁、還沒給 AI 判斷的社團 → 分批送雲端。同步函式（在 thread 裡跑）。"""
+    from ..cloud_client import ai_classify_groups, CloudError
+    with SyncSession() as s:
+        rows = s.execute(select(Group).where(Group.account_id == account_id, Group.rules_checked_at.is_not(None),
+                                             Group.ai_rules.is_(None))).scalars().all()
+        items = [{"id": _gid(g), "name": g.group_name, "about": g.about_text or ""} for g in rows if _gid(g)][:limit]
+    done, errors = 0, []
+    for i in range(0, len(items), 25):
+        try:
+            done += apply_ai(account_id, ai_classify_groups(items[i:i + 25]))
+        except CloudError as e:
+            errors.append(str(e)); break
+        except Exception as e:                       # noqa: BLE001  網路斷線、逾時：下次再補，不能讓排程炸掉
+            errors.append(f"連線失敗：{e}"); break
+    return {"classified": done, "pending": len(items), "errors": errors}
+
+
+async def run_once(account_id: int | None = None) -> dict:
+    import asyncio
+    from ..fbauto_bridge import start_long_op, wait_fbid_free, cookie_exists
+
+    def _accounts():
+        with SyncSession() as s:
+            q = select(Account)
+            if account_id:
+                q = q.where(Account.id == account_id)
+            return [(a.id, a.fb_user_id) for a in s.execute(q).scalars().all() if a.fb_user_id]
+    out = {"jobs": [], "notes": []}
+    for aid, fbid in await asyncio.to_thread(_accounts):
+        # 先把上次讀過、還沒 AI 判斷的補完（不用開瀏覽器）
+        r0 = await asyncio.to_thread(classify_pending, aid)
+        if r0["classified"]:
+            out["notes"].append(f"補判 {r0['classified']} 個")
+        groups = await asyncio.to_thread(pick_groups_to_check, aid)
+        if not groups or not cookie_exists(fbid):
+            continue
+        busy = await wait_fbid_free(fbid, max_wait_sec=900, tag="[rules]")
+        if busy is not None:
+            out["notes"].append(f"瀏覽器被「{busy.op}」占著"); continue
+        path = tempfile.mkstemp(prefix="gr_", suffix=".json")[1]
+        json.dump(groups, open(path, "w", encoding="utf-8"), ensure_ascii=False)
+        loop = asyncio.get_running_loop()
+
+        def _on_done(result, _aid=aid):
+            if not result.success:
+                print(f"[rules] 讀社團規則失敗：{result.error}", flush=True); return
+            n = save_about(_aid, (result.data or {}).get("items") or [])
+            print(f"[rules] 讀了 {n} 個社團的規則，送 AI 判斷…", flush=True)
+
+            def _cls():
+                r = classify_pending(_aid)
+                print(f"[rules] AI 判斷完 {r['classified']} 個" + (f"（{r['errors'][0]}）" if r["errors"] else ""), flush=True)
+            loop.run_in_executor(None, _cls)
+        try:
+            out["jobs"].append(start_long_op("group_rules", "src.run_group_rules",
+                                             ["--fbid", fbid, "--groups-json", path, "--headless"],
+                                             account_id=aid, fbid=fbid, on_done=_on_done))
+        except RuntimeError as e:
+            out["notes"].append(str(e))
+    return out
+
+
+async def restore_group_rules_check():
+    scheduler.add_job(func=run_once, trigger=CronTrigger(hour=RUN_AT[0], minute=RUN_AT[1], timezone=TAIPEI),
+                      id="group_rules_daily", replace_existing=True)

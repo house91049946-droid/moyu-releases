@@ -1,0 +1,145 @@
+"""錯誤自動回收：客戶端失敗的執行紀錄，去掉個資後回傳雲端，我們在 console 看「哪個錯最多」。
+
+老闆 2026-09-10：「是否可以讓使用者錯誤訊息自動回收回來，作為我們修正的方向」。
+
+做法：
+  - 每小時（跟雲端心跳同一條迴圈）把 RunLog 裡 status 是 failed／needs_manual、id 比上次送過的大的，
+    最多 50 筆，POST 到雲端 /telemetry/errors（帶授權 token，雲端知道是哪個 license）。
+  - 送之前先洗：手機、市話、Email、LINE ID、10 位以上的數字串（FB 帳號 id）、家目錄裡的使用者名稱。
+  - 送成功才把 last_id 往前推（DATA/.error_report_state）；失敗就下次再送，不會漏也不會重。
+  - 客戶可以在「系統維護」關掉（SystemState.error_report_enabled，預設開）。
+"""
+from __future__ import annotations
+
+import json
+import platform
+import re
+import sys
+import time
+
+from .config import DATA_DIR, settings
+
+STATE_FILE = DATA_DIR / ".error_report_state"
+BATCH = 50
+MAX_TEXT = 600
+TAIL_CHARS = 400
+
+# 個資樣式：台灣手機／市話、Email、LINE ID、長數字串（FB id）、家目錄使用者名稱
+_PHONE_RE = re.compile(r"(?<!\d)(?:\+?886[\s\-]?)?0?9\d{2}[\s\-]?\d{3}[\s\-]?\d{3}(?!\d)")
+_TEL_RE = re.compile(r"(?<!\d)\(?0\d{1,2}\)?[\s\-]?\d{3,4}[\s\-]?\d{4}(?!\d)")
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_LINE_RE = re.compile(r"(?i)(line\s*(?:id)?\s*[:：]?\s*)@?[A-Za-z0-9._\-]{3,}")
+_LONG_NUM_RE = re.compile(r"(?<!\d)\d{10,}(?!\d)")
+_HOME_RE = re.compile(r"(/Users/|/home/|[A-Za-z]:\\Users\\)[^/\\\s]+")
+
+
+def scrub(text: str | None, limit: int = MAX_TEXT) -> str:
+    """去掉個資、砍長度。純函式，測試直接打。"""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    t = _EMAIL_RE.sub("[email]", t)
+    t = _LINE_RE.sub(lambda m: m.group(1) + "[line]", t)
+    t = _PHONE_RE.sub("[phone]", t)
+    t = _TEL_RE.sub("[tel]", t)
+    t = _LONG_NUM_RE.sub("[id]", t)
+    t = _HOME_RE.sub(lambda m: m.group(1) + "~", t)
+    if len(t) > limit:
+        t = t[:limit] + "…"
+    return t
+
+
+def _load_state() -> dict:
+    try:
+        d = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(d: dict) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(d), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def last_sent_id() -> int:
+    try:
+        return int(_load_state().get("last_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def log_to_item(log) -> dict:
+    """一筆 RunLog → 要送的欄位（已洗）。"""
+    tail = (getattr(log, "output_tail", "") or "")[-TAIL_CHARS:]
+    created = getattr(log, "created_at", None)
+    return {
+        "client_log_id": int(log.id),
+        "task_type": (getattr(log, "task_type", "") or "")[:50],
+        "status": (getattr(log, "status", "") or "")[:20],
+        "error": scrub(getattr(log, "error_message", "")),
+        "summary": scrub(getattr(log, "summary", ""), 200),
+        "output_tail": scrub(tail),
+        "duration_sec": int(getattr(log, "duration_sec", 0) or 0),
+        "occurred_at": created.isoformat() + "Z" if created else None,
+    }
+
+
+def collect_sync(after_id: int, limit: int = BATCH) -> list[dict]:
+    """撈 id > after_id 的失敗紀錄（舊→新），洗過。"""
+    from sqlalchemy import select
+    from .database import SyncSession, RunLog
+    with SyncSession() as s:
+        rows = s.execute(select(RunLog).where(RunLog.id > after_id,
+                                              RunLog.status.in_(("failed", "needs_manual")))
+                         .order_by(RunLog.id).limit(limit)).scalars().all()
+        return [log_to_item(r) for r in rows]
+
+
+def enabled_sync() -> bool:
+    from .database import error_report_enabled_sync
+    return error_report_enabled_sync()
+
+
+def send_pending(timeout: float = 15) -> dict:
+    """撈→送→推進。best-effort：任何失敗回 {"sent": 0, "reason": ...} 不拋。
+    回 {"sent": n} 表示這批送成功。"""
+    from . import cloud_client as cc
+    if not cc.cloud_enabled():
+        return {"sent": 0, "reason": "no-cloud"}
+    if not enabled_sync():
+        return {"sent": 0, "reason": "disabled"}
+    after = last_sent_id()
+    items = collect_sync(after)
+    if not items:
+        return {"sent": 0, "reason": "nothing"}
+    body = {"version": settings.app_version,
+            "platform": f"{platform.system()} {platform.release()}",
+            "items": items}
+    try:
+        import httpx
+        from . import http_client
+        url = f"{cc.cloud_url()}/telemetry/errors"
+
+        def _post(token: str):
+            with http_client.client(timeout) as c:
+                return c.post(url, headers={"Authorization": f"Bearer {token}"}, json=body)
+        r = _post(cc.get_token())
+        if r.status_code == 401:
+            cc._token_cache["token"] = ""
+            r = _post(cc.get_token())
+        if r.status_code != 200:
+            print(f"[error-report] 回傳失敗 HTTP {r.status_code}: {r.text[:120]}", file=sys.stderr, flush=True)
+            return {"sent": 0, "reason": f"http-{r.status_code}"}
+    except Exception as e:                       # noqa: BLE001  連線／授權／其他都吞
+        print(f"[error-report] 回傳失敗：{e}", file=sys.stderr, flush=True)
+        return {"sent": 0, "reason": str(e)[:120]}
+    st = _load_state()
+    st["last_id"] = items[-1]["client_log_id"]
+    st["last_sent_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    st["last_sent_n"] = len(items)
+    _save_state(st)
+    return {"sent": len(items)}

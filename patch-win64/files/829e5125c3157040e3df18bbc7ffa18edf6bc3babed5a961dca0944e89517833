@@ -1,0 +1,12 @@
+"""FB 出租房屋表單：房型對照（老闆 2026-09-10）"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def test_rental_type_for():
+    from src.marketplacePost import rental_type_for, RENTAL_TYPE_OPTIONS
+    assert rental_type_for("套房") == "僅限房間" and rental_type_for("分租") == "僅限房間"
+    assert rental_type_for("透天") == "獨棟住宅" and rental_type_for("別墅") == "獨棟住宅"
+    assert rental_type_for("大廈") == "公寓／大廈" and rental_type_for("") == "公寓／大廈"
+    assert all(rental_type_for(k) in RENTAL_TYPE_OPTIONS for k in ("套房", "透天", "連棟", "x"))

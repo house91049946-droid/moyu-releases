@@ -1,0 +1,56 @@
+"""無頭瀏覽器的偽裝（老闆 2026-09-23：客戶只是養號就被 IG 判「懷疑自動化」）。
+
+真兇：Playwright 的 headless=True 讓 Chrome 自報 HeadlessChrome，UA 與 Sec-CH-UA
+每個 request 都帶出去，行為再像人也沒用。這支測試把「UA 不准出現 Headless」釘住。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_stealth_headless.py -v
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.utils import real_chrome_ua, stealth_headless  # noqa: E402
+
+
+class Test無頭偽裝:
+    def test_無頭時不走playwright的headless(self):
+        k = stealth_headless(True)
+        assert k["headless"] is False            # 開著它就會加上會自報身分的舊 --headless
+        assert "--headless=new" in k["args"]     # 改用 Chrome 自己的新無頭
+
+    def test_UA不含Headless字樣(self):
+        k = stealth_headless(True)
+        assert k["user_agent"] and "Headless" not in k["user_agent"]
+        assert "Chrome/" in k["user_agent"]
+        assert any(a.startswith("--user-agent=") and "Headless" not in a for a in k["args"])
+
+    def test_有頭模式不動它(self):
+        k = stealth_headless(False)
+        assert k == {"headless": False, "args": [], "user_agent": None}
+
+    def test_版號抓得到且是數字(self):
+        ua = real_chrome_ua()
+        ver = ua.split("Chrome/")[1].split(".")[0]
+        assert ver.isdigit() and int(ver) >= 100
+
+
+class Test其他指紋:
+    """2026-09-23 拿同一台 mac 的無頭 vs 有頭逐欄比對抓出來的差異。"""
+
+    def test_colorDepth補成真機的值(self):
+        from src.utils import stealth_init_script
+        js = stealth_init_script()
+        assert "colorDepth" in js and "pixelDepth" in js
+
+    def test_languages不只一種(self):
+        from src.utils import stealth_init_script
+        assert "'zh-TW', 'zh', 'en-US', 'en'" in stealth_init_script()
+
+    def test_每個帳號的視窗大小固定但彼此不同(self):
+        from src.utils import profile_viewport
+        assert profile_viewport("/a/ig") == profile_viewport("/a/ig")      # 同帳號要穩定
+        sizes = {tuple(profile_viewport(f"/p/{i}").values()) for i in range(30)}
+        assert len(sizes) >= 3                                             # 不要所有客戶長一樣
+        for w, h in sizes:
+            assert w >= 1280 and h >= 760                                  # 太小版面會跑掉

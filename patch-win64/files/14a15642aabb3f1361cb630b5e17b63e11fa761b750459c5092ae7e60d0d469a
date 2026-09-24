@@ -1,0 +1,80 @@
+"""讀 FB 通知頁：哪些社團的管理員拒絕／批准了我們的貼文（老闆 2026-09-14）。
+
+只讀不動：開通知頁、往下捲幾輪、把「管理員拒絕了你在…發佈的貼文」這類項目撈出來，交給後端把社團停發。
+用法：python -m src.run_group_notices --fbid <id> --headless --result-json out.json
+"""
+import argparse
+import atexit
+import contextlib
+import json
+import sys
+
+from src.notice_parse import parse_notice
+from src.utils import launch_browser
+
+_JSON_PATH = None
+_RESULT = None
+
+ITEMS_JS = r"""
+() => [...document.querySelectorAll('[role="listitem"], [role="article"]')].map(e => ({
+  t: (e.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+  href: (e.querySelector('a[href*="/groups/"]') || {}).href || ''
+})).filter(x => x.t)
+"""
+
+
+def _write():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+
+
+def main():
+    global _JSON_PATH, _RESULT
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fbid", required=True)
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--scrolls", type=int, default=8)
+    ap.add_argument("--result-json")
+    a = ap.parse_args()
+    _JSON_PATH = a.result_json
+    _RESULT = {"schema": 1, "success": False, "error": "未完成", "data": {"declined": [], "approved": [], "removed": [], "scanned": 0}}
+    if _JSON_PATH:
+        atexit.register(_write)
+    res = launch_browser(a.fbid, headless=a.headless)
+    ctx = res[0]
+    page = res[2] if len(res) > 2 else ctx.pages[0]
+    try:
+        page.goto("https://www.facebook.com/notifications", wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(6000)
+        for _ in range(max(0, a.scrolls)):
+            page.mouse.wheel(0, 1600)
+            page.wait_for_timeout(700)
+        items = page.evaluate(ITEMS_JS)
+        seen = set()
+        for it in items:
+            n = parse_notice(it["t"], it["href"])
+            if not n:
+                continue
+            key = (n["kind"], n["group_id"] or n["group_name"])
+            if key in seen:
+                continue
+            seen.add(key)
+            _RESULT["data"][n["kind"]].append({"group_name": n["group_name"], "group_id": n["group_id"], "text": it["t"][:160]})
+        _RESULT["data"]["scanned"] = len(items)
+        d = _RESULT["data"]
+        print(f"[notice] 通知 {len(items)} 則：拒絕 {len(d['declined'])}、移除 {len(d['removed'])}、批准 {len(d['approved'])}", flush=True)
+        for x in d["declined"] + d["removed"]:
+            print(f"[notice] 拒絕／移除：{x['group_name']}（{x['group_id'] or '無 id'}）", flush=True)
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+    except Exception as e:                    # noqa: BLE001
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    finally:
+        with contextlib.suppress(Exception):
+            ctx.close()
+
+
+if __name__ == "__main__":
+    main()

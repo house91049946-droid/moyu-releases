@@ -1,0 +1,564 @@
+"""FB 登入模組：cookie 優先登入、語言切換、取得 fbid。"""
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+from playwright.sync_api import Page, BrowserContext
+
+from src.config_loader import T
+from src.paths import COOKIES_DIR
+from src.utils import (
+    CheckResult,
+    enhanced_get,
+    human_sleep,
+    perform_checks,
+    capture_screenshot,
+)
+
+
+@dataclass
+class LoginResult:
+    status: str  # 'ok' | 'bad_credential' | 'need_human' | 'locked' | 'logged_out'
+    fbid: str | None = None
+    message: str = ""
+
+
+def _get_fbid_from_cookies(context: BrowserContext) -> str | None:
+    """從 Playwright context 的 cookies 中取得 c_user（FB numeric ID）。"""
+    cookies = context.cookies()
+    for cookie in cookies:
+        if cookie["name"] == "c_user":
+            return cookie["value"]
+    return None
+
+
+def _save_cookies_to_file(context: BrowserContext, fbid: str):
+    """將當前 context 的 cookies 序列化存到 data/cookies/<fbid>.json。"""
+    cookies = context.cookies()
+    cookie_path = COOKIES_DIR / f"{fbid}.json"
+    with open(cookie_path, "w", encoding="utf-8") as f:
+        json.dump(cookies, f, ensure_ascii=False)
+    print(f"[login] Cookies saved: {cookie_path}")
+
+
+def _load_cookies_from_file(fbid: str) -> list[dict] | None:
+    """從 data/cookies/<fbid>.json 讀取 cookies。"""
+    cookie_path = COOKIES_DIR / f"{fbid}.json"
+    if not cookie_path.exists():
+        return None
+    with open(cookie_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _has_required_cookies(fbid: str) -> bool:
+    """檢查是否有已儲存的 cookies。"""
+    return (COOKIES_DIR / f"{fbid}.json").exists()
+
+
+def _click_continue_if_present(page: Page, rounds: int = 3) -> bool:
+    """FB 登入後常出現「繼續 / Continue / 繼續以 X 身分 / 儲存登入資訊」確認頁，
+    需點掉才能往下（否則後續流程卡住）。最多處理 rounds 個連續確認頁。"""
+    selectors = [
+        "div[aria-label='繼續']",
+        "div[aria-label='Continue']",
+        "div[role='button']:has-text('繼續')",
+        "div[role='button']:has-text('Continue')",
+        "[aria-label='儲存']",
+        "[aria-label='Save']",
+    ]
+    clicked_any = False
+    for _ in range(rounds):
+        clicked = False
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() > 0 and loc.is_visible():
+                    loc.click(timeout=3000)
+                    print(f"[login] 點掉確認頁按鈕: {sel}")
+                    human_sleep(1.5, 2.5)
+                    clicked = True
+                    clicked_any = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            break
+    return clicked_any
+
+
+def _session_alive_in_profile(page: Page, context: BrowserContext) -> str | None:
+    """持久 profile 自己可能就是登入狀態（每帳號固定 profile 之後的常態）。
+
+    這個檢查必須排在所有登入手段之前：已登入的瀏覽器再走密碼流程，會在
+    好幾個登入網址之間硬闖（每個 30 秒逾時＋重試＋等待），客戶看到的就是
+    「視窗自己一直導航、載入框一直轉、點什麼都沒反應」好幾分鐘——
+    2026-08-01 客戶流程實測的『嚴重 LAG』就是這條路。
+    """
+    fbid = _get_fbid_from_cookies(context)
+    if not fbid:
+        return None
+    print(f"[login] profile 已有 c_user={fbid}，驗證 session 是否仍有效…")
+    if not enhanced_get(page, "https://www.facebook.com/", retries=1):
+        print("[login] 首頁載入失敗，session 狀態不明 → 改走一般登入流程")
+        return None
+    _click_continue_if_present(page)
+    if page.locator("input[type='password']").first.count() > 0:
+        print("[login] session 已失效（首頁出現密碼欄）→ 改走一般登入流程")
+        return None
+    if _get_fbid_from_cookies(context):
+        print(f"[login] ✓ profile session 仍有效，直接使用 fbid={fbid}")
+        return fbid
+    print("[login] c_user 在載入後消失（session 被 FB 註銷）→ 改走一般登入流程")
+    return None
+
+
+def _try_cookie_login(page: Page, context: BrowserContext, fbid: str) -> bool:
+    """嘗試用已儲存的 cookie 登入。回傳是否成功。
+
+    失敗一律印出原因：這裡靜默失敗的話，後面的密碼流程會在已登入的瀏覽器裡
+    亂逛好幾分鐘，而日誌上完全看不出為什麼（2026-08-01 就是這樣追了半天）。
+    """
+    cookies = _load_cookies_from_file(fbid)
+    if not cookies:
+        return False
+
+    print(f"[login] 嘗試 cookie 登入（{fbid}）…")
+    context.add_cookies(cookies)
+    # 用 domcontentloaded 而非 networkidle：FB 主頁有持續背景請求，networkidle 會一直 timeout
+    try:
+        page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=20000)
+    except Exception as e:
+        print(f"[login] cookie 登入失敗：首頁載入逾時（{type(e).__name__}）")
+        return False
+    human_sleep(1, 2)
+
+    # 點掉「繼續／確認」頁（否則會停在確認頁導致後續卡住）
+    _click_continue_if_present(page)
+
+    # 驗證：如果頁面沒有登入提示（密碼欄位），表示已登入
+    body_text = page.locator("body").inner_text()
+    if "登入" in body_text and "密碼" in body_text:
+        print("[login] cookie 登入失敗：頁面仍顯示登入表單")
+        return False
+
+    # 檢查 c_user cookie 是否存在
+    current_fbid = _get_fbid_from_cookies(context)
+    if current_fbid:
+        print(f"[login] Cookie login successful — fbid: {current_fbid}")
+        return True
+
+    print("[login] cookie 登入失敗：載入後沒有 c_user（cookie 已被 FB 註銷）")
+    return False
+
+
+def _disable_popup_messages(page: Page):
+    """關掉通知、新功能導覽等可能干擾自動化的彈窗。"""
+    # 常見的彈窗關閉方式
+    close_selectors = [
+        "text=稍後再說",
+        "text=Not Now",
+        "[aria-label='關閉']",
+        "[aria-label='Close']",
+    ]
+    for sel in close_selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                loc.click(timeout=3000)
+                human_sleep(0.5, 1)
+        except Exception:
+            pass
+
+
+# FB 記住帳號時，密碼欄不在頁面上，而是點了「以 XXX 的身分繼續」之後跳出來的
+# 浮動對話框。原本的做法是點一下就 human_sleep 幾秒盲填，對話框還沒渲染好就
+# 找不到欄位，於是又被別的分支點一次——客戶看到的就是「視窗開了好幾次才對」
+# （2026-08-02 回報）。改成：點一次 → 明確等密碼欄出現 → 才動手。
+_CONTINUE_AS_SELECTORS = [
+    "div[role='button']:has-text('的身分繼續')",
+    "div[role='button']:has-text('身分繼續')",
+    "div[role='button']:has-text('Continue as')",
+    "button:has-text('Continue as')",
+    "div[role='button']:has-text('繼續')",
+]
+
+
+def _password_field(scope):
+    """回傳可見的密碼欄（沒有就 None）。scope 可以是 page 或對話框 locator。"""
+    loc = scope.locator("input[type='password']").first
+    try:
+        return loc if loc.count() > 0 and loc.is_visible() else None
+    except Exception:
+        return None
+
+
+def _dialog_scope(page):
+    """有浮動對話框就把搜尋範圍縮到對話框內；沒有就用整頁。
+
+    範圍不縮的話，填完密碼要送出時會找到對話框**背後**那顆「登入」，一點下去
+    對話框被關掉、流程重來，就是重複開視窗的另一半原因。
+    """
+    try:
+        dlg = page.locator("div[role='dialog']").first
+        if dlg.count() > 0 and dlg.is_visible():
+            return dlg
+    except Exception:
+        pass
+    return page
+
+
+def _open_password_dialog(page, attempts: int = 2) -> bool:
+    """確保密碼欄可用：需要的話點開「以 XXX 身分繼續」，並等欄位真的出現。"""
+    if _password_field(page) is not None:
+        return True
+    for i in range(attempts):
+        clicked = False
+        for sel in _CONTINUE_AS_SELECTORS:
+            try:
+                btn = page.locator(sel).first
+                if btn.count() > 0 and btn.is_visible():
+                    print(f"[login] 點開密碼對話框（第 {i + 1} 次）：{sel}")
+                    btn.click(timeout=5000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            return _password_field(page) is not None
+        # 盲等改成等欄位真的出現——這是「開好幾次」的根因
+        try:
+            page.wait_for_selector("input[type='password']:visible", timeout=8000)
+            print("[login] 密碼欄已出現")
+            return True
+        except Exception:
+            print("[login] 點了但密碼欄沒出現，再試一次")
+    return _password_field(page) is not None
+
+
+def login_facebook(
+    page: Page,
+    context: BrowserContext,
+    email_or_phone: str,
+    password: str,
+) -> LoginResult:
+    """
+    FB 登入主函式。
+    Args:
+        page: Playwright Page 物件
+        context: Playwright BrowserContext 物件（用於 cookie 操作）
+        email_or_phone: 登入用的 email 或手機號碼
+        password: 密碼
+    Returns:
+        LoginResult(status='ok', fbid='...') 如果成功
+    """
+
+    # Step 0: profile 本身已是有效登入 → 幾秒內直接完成，什麼都不用做
+    alive = _session_alive_in_profile(page, context)
+    if alive:
+        _disable_popup_messages(page)
+        return LoginResult(status="ok", fbid=alive)
+
+    # Step 1: 嘗試 cookie 登入（需要先有 fbid）
+    # 嘗試從 cookies/ 目錄找已有的 cookie 檔案
+    existing_fbids = []
+    for f in Path(COOKIES_DIR).glob("*.json"):
+        existing_fbids.append(f.stem)
+
+    for fbid_guess in existing_fbids:
+        if _try_cookie_login(page, context, fbid_guess):
+            current_fbid = _get_fbid_from_cookies(context)
+            if current_fbid:
+                # cookie 登入成功，跳過密碼流程
+                _disable_popup_messages(page)
+                return LoginResult(status="ok", fbid=current_fbid)
+
+    # Step 2: cookie 無效或不存在 → 用帳密登入
+    print(f"[login] Attempting password login: {email_or_phone}")
+
+    # FB 登入頁有多種可能 URL，逐一嘗試
+    login_urls = [
+        "https://www.facebook.com/login/",
+        "https://www.facebook.com/",
+        "https://mbasic.facebook.com/login/",
+    ]
+    reached = False
+    for url in login_urls:
+        if enhanced_get(page, url, retries=1):
+            human_sleep(3, 5)
+            # 載入的其實是已登入頁（登入網址被 FB 轉走）→ 直接算登入成功。
+            # 沒有這一步，會拿著已登入的瀏覽器繼續硬闖下一個登入網址，
+            # 客戶眼前的視窗就一直自己導航、一直轉圈。
+            # c_user 可能是被註銷的殘留 cookie，所以同時要求頁上沒有密碼欄。
+            live = _get_fbid_from_cookies(context)
+            if live and page.locator("input[type='password']").first.count() == 0:
+                print(f"[login] {url} 已是登入狀態（c_user={live}），不再嘗試登入頁")
+                _disable_popup_messages(page)
+                return LoginResult(status="ok", fbid=live)
+            # 確認頁面上有類似登入表單的內容
+            body = page.locator("body").inner_text()
+            if "電子郵件" in body or "email" in body.lower() or "密碼" in body or "password" in body.lower() or "登入" in body:
+                print(f"[login] 成功載入登入頁: {url}")
+                reached = True
+                break
+            else:
+                print(f"[login] {url} 似乎不是登入頁（body 前100字: {body[:100]}），嘗試下一個...")
+
+    if not reached:
+        live = _get_fbid_from_cookies(context)
+        if live and page.locator("input[type='password']").first.count() == 0:
+            print(f"[login] 登入頁都到不了，但瀏覽器其實已登入（c_user={live}）")
+            return LoginResult(status="ok", fbid=live)
+        return LoginResult(status="logged_out", message="Cannot reach login page")
+
+    # ── 處理「選擇帳號」頁面 ─────────────────────────
+    # FB 有時會顯示「以 xxx 身分繼續」而非登入表單，需先點「使用其他個人檔案」
+    body = page.locator("body").inner_text()
+    switch_keywords = [
+        "使用其他個人檔案",
+        "使用其他帳號",
+        "切換帳號",
+        "登入其他帳號",
+        "Switch account",
+        "Log into another account",
+    ]
+
+    # 先檢查是否有 password 欄位可直接輸入
+    has_pass_input = page.locator("input[type='password']").first
+    has_email_input = page.locator("input[name='email'], input#email, input[autocomplete='username']").first
+
+    # 「以 XXX 身分繼續」的版面優先走它自己的浮動密碼框：那才是 FB 要我們走的路，
+    # 只要打密碼就好。原本會先去點「使用其他個人檔案／新增帳號」，那些各自又會
+    # 開一次視窗／換一次頁，加起來就是客戶看到的「開好幾次才對」。
+    remembered = has_email_input.count() == 0 and _open_password_dialog(page)
+    if remembered:
+        print("[login] 走「以此帳號繼續」的浮動密碼框，不再點『使用其他帳號』")
+
+    if not remembered and (has_pass_input.count() == 0 or has_email_input.count() == 0):
+        # 可能在「選擇帳號」頁面 — 找「登入其他帳號」按鈕
+        for kw in switch_keywords:
+            try:
+                label = kw if isinstance(kw, str) else kw[0] if isinstance(kw, list) else ""
+                btn = page.locator(f"text={label}").first
+                if btn.count() > 0 and btn.is_visible():
+                    print(f"[login] 偵測到「選擇帳號」頁面，點擊「{label}」...")
+                    btn.click()
+                    human_sleep(3, 5)
+                    break
+            except Exception:
+                continue
+
+        # 再檢查一次，還是沒輸入框 → 嘗試其他方式
+        has_pass_input = page.locator("input[type='password']").first
+        if has_pass_input.count() == 0:
+            # 試著用「切換為…」或找「新增帳號」連結
+            more_btns = page.locator("text=新增帳號, text=Add account, text=Not you").first
+            if more_btns.count() > 0:
+                try:
+                    more_btns.click()
+                    human_sleep(2, 4)
+                except Exception:
+                    pass
+
+    # 除錯：截圖跟印出所有 input
+    capture_screenshot(page, "unknown", "login_page")
+    _debug_inputs = page.locator("input:not([type='hidden']):not([type='submit']):not([type='button'])")
+    print(f"[login] 頁面上找到 {_debug_inputs.count()} 個輸入框:")
+    for di in range(min(_debug_inputs.count(), 5)):
+        try:
+            _inp = _debug_inputs.nth(di)
+            _tp = _inp.get_attribute("type") or ""
+            _nm = _inp.get_attribute("name") or ""
+            _ph = _inp.get_attribute("placeholder") or ""
+            _ar = _inp.get_attribute("aria-label") or ""
+            print(f"[login]   input[{di}]: type={_tp} name={_nm} placeholder={_ph[:30]} aria={_ar[:30]}")
+        except Exception:
+            pass
+
+    # 填寫 email — 多種選擇器策略
+    email_sel_candidates = [
+        "input[name='email']",
+        "input#email",
+        "input[type='text'][aria-label*='電子郵件' i]",
+        "input[aria-label*='電子郵件' i]",
+        "input[aria-label*='email' i]",
+        "input[placeholder*='電子郵件' i]",
+        "input[placeholder*='email' i]",
+        "input[autocomplete='username']",
+        "input[data-testid='royal_email']",
+        "#email",
+    ]
+    email_input = None
+    for sel in email_sel_candidates:
+        loc = page.locator(sel).first
+        if loc.count() > 0:
+            try:
+                if loc.is_visible():
+                    email_input = loc
+                    break
+            except Exception:
+                continue
+
+    if email_input is None:
+        # 「以 xxx 身分繼續」那種版面：FB 記得這個帳號，只給一個密碼欄，沒有
+        # email 欄。原本一律當失敗處理，客戶按登入什麼都不會發生——但這種版面
+        # 其實只要填密碼就能過（2026-08-02 客戶回報「版面跟一般登入不一樣」）。
+        if _open_password_dialog(page):
+            print("[login] 沒有帳號欄、只有密碼欄（FB 記住此帳號的版面）→ 只填密碼")
+        else:
+            # 真的認不得這個版面：交回給呼叫端改走手動登入，不要當成帳密錯誤
+            capture_screenshot(page, "unknown", "no_email_input")
+            return LoginResult(status="need_manual_login",
+                               message="登入頁版面不是預期的樣子（找不到帳號欄）")
+    else:
+        email_input.fill(email_or_phone)
+        human_sleep(1, 2)
+
+        # ── FB 分兩步：輸入 email 後可能要按「下一步」 ──
+        next_keywords = ["下一步", "繼續", "Next", "Continue"]
+        for nk in next_keywords:
+            next_btn = page.locator(f"button:has-text('{nk}'), div[role='button']:has-text('{nk}')").first
+            if next_btn.count() > 0:
+                try:
+                    if next_btn.is_visible():
+                        print(f"[login] 偵測到兩步登入，點擊「{nk}」...")
+                        next_btn.click()
+                        human_sleep(3, 5)
+                        break
+                except Exception:
+                    continue
+
+    # 填寫 password — 多種選擇器策略
+    pass_sel_candidates = [
+        "input[name='pass']",
+        "input#pass",
+        "input[type='password']",
+        "input[aria-label*='密碼' i]",
+        "input[aria-label*='password' i]",
+        "input[placeholder*='密碼' i]",
+        "input[placeholder*='password' i]",
+        "input[autocomplete='current-password']",
+        "#pass",
+    ]
+    # 對話框開著就只在對話框裡找，避免抓到背景頁殘留的欄位
+    scope = _dialog_scope(page)
+    pass_input = None
+    for sel in pass_sel_candidates:
+        loc = scope.locator(sel).first
+        if loc.count() > 0:
+            try:
+                if loc.is_visible():
+                    pass_input = loc
+                    break
+            except Exception:
+                continue
+
+    if pass_input is None:
+        # 同上：認不得的版面 → 讓呼叫端退回手動登入，別報成登入失敗
+        capture_screenshot(page, "unknown", "no_pass_input")
+        return LoginResult(status="need_manual_login",
+                           message="登入頁版面不是預期的樣子（找不到密碼欄）")
+
+    pass_input.fill(password)
+    human_sleep(1, 2)
+
+    # ── 送出登入表單 ─────────────────────────────────
+    # 策略 1：先點密碼欄位確保焦點正確 → 按 Enter（最自然）
+    pass_input.click()
+    human_sleep(0.3, 0.6)
+    print(f"[login] 按 Enter 送出登入表單...")
+    page.keyboard.press("Enter")
+    human_sleep(3, 6)
+
+    # 策略 2：檢查是否還在登入頁，補點按鈕
+    # 先看 c_user：已經登入就什麼都別點。原本只看 body 有沒有「密碼」二字，
+    # 登入成功後的頁面照樣可能有，於是又去點一顆按鈕、把浮動視窗重新叫出來。
+    if _get_fbid_from_cookies(context):
+        print("[login] 送出後已取得 c_user，不再補點按鈕")
+        still_has_login = False
+    else:
+        current_body = page.locator("body").inner_text()
+        still_has_login = "密碼" in current_body or "password" in current_body.lower()
+    if still_has_login:
+        print(f"[login] Enter 後仍在登入頁，嘗試點擊登入按鈕...")
+        login_btn_candidates = [
+            "div[role='button']:has-text('登入')",
+            "button:has-text('登入')",
+            "div[role='button']:has-text('Log in')",
+            "button:has-text('Log in')",
+            "button[name='login']",
+            "input[value='登入']",
+            "button[type='submit']",
+            "#loginbutton",
+        ]
+        # 頁面已經載入完，按鈕不在 DOM 就是不在——用 count() 瞬間判斷，
+        # 在才點（3 秒逾時、不重試）。原本每個選擇器 enhanced_click 等
+        # 15 秒 × 3 次重試，八個全滅要 6–7 分鐘（2026-08-01 實測 7 分鐘
+        # 全耗在這裡，客戶以為登入壞掉了）。
+        btn_scope = _dialog_scope(page)     # 只點對話框內的送出鍵，不碰背景那顆
+        for sel in login_btn_candidates:
+            try:
+                loc = btn_scope.locator(sel).first
+                if loc.count() == 0:
+                    continue
+                loc.click(timeout=3000)
+                print(f"[login] 登入按鈕點擊成功: {sel}")
+                human_sleep(2, 4)
+                break
+            except Exception:
+                continue
+        else:
+            # 策略 3：全都失敗 → Tab + Enter
+            print(f"[login] 按鈕點擊全失敗，嘗試 Tab + Enter...")
+            page.keyboard.press("Tab")
+            human_sleep(0.3, 0.5)
+            page.keyboard.press("Enter")
+            human_sleep(2, 4)
+
+    # 等待登入結果
+    human_sleep(3, 6)
+
+    # Step 3: 檢查登入後的狀態
+    check = perform_checks(page, "unknown")
+
+    if check == CheckResult.LOCKED:
+        capture_screenshot(page, "unknown", "account_locked")
+        return LoginResult(status="locked", message="Account is locked")
+
+    if check == CheckResult.NEED_2FA:
+        capture_screenshot(page, "unknown", "need_2fa")
+        return LoginResult(status="need_human", message="2FA required — screenshot saved")
+
+    if check == CheckResult.CAPTCHA:
+        capture_screenshot(page, "unknown", "captcha")
+        return LoginResult(status="need_human", message="Captcha required — screenshot saved")
+
+    # 檢查帳密錯誤
+    body_text = page.locator("body").inner_text()
+    for key in ("incorrect_account", "incorrect_password"):
+        try:
+            vals = T(key)
+            if isinstance(vals, str):
+                vals = [vals]
+            for v in vals:
+                if v in body_text:
+                    return LoginResult(status="bad_credential", message=v)
+        except KeyError:
+            pass
+
+    # Step 4: 取得 fbid
+    fbid = _get_fbid_from_cookies(context)
+    if not fbid:
+        # 登入成功必有 c_user cookie；走到這裡幾乎必是 perform_checks 沒認出的驗證變體。
+        # 絕不能在此導航（會毀掉使用者驗證到一半的頁面），交回人工等待。
+        capture_screenshot(page, "unknown", "login_unrecognized")
+        return LoginResult(status="need_human", message="疑似驗證頁（未分類）— 請在瀏覽器完成驗證")
+
+    print(f"[login] Login successful — fbid: {fbid}")
+
+    # Step 5: 關閉彈窗干擾
+    _disable_popup_messages(page)
+
+    # Step 6: 儲存 cookie 供下次使用
+    _save_cookies_to_file(context, fbid)
+
+    return LoginResult(status="ok", fbid=fbid)

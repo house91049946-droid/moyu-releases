@@ -1,0 +1,85 @@
+"""新手村：從付錢到看見第一篇文，每一關過了沒有。
+
+老闆 2026-09-06：「新手村所有項目都勾選完成，新手村的選項隱藏。」
+
+「完成了沒」這件事必須只有一份答案。側欄要靠它決定顯不顯示入口，
+新手村頁要靠它畫打勾——兩邊各算一次遲早會不一致（而且側欄每換一頁
+就要打六、七支 API）。所以規則寫在這裡，前端只負責標題與連結。
+
+刻意不放進 /api/dashboard/summary：那支是首頁每 30 秒輪詢的，
+這支只在進頁面／換頁時問一次，混在一起會讓首頁白白多做一堆查詢。
+"""
+from __future__ import annotations
+
+import asyncio
+
+from fastapi import APIRouter, Depends
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..database import (get_session, Account, Group, Property, MarketplaceSchedule,
+                        RunLog, UserConsent)
+from ..legal import CONSENT_VERSION
+from .dashboard import POST_TYPES
+
+router = APIRouter(prefix="/api/setup", tags=["setup"], redirect_slashes=False)
+
+STEP_KEYS = ("license", "consent", "fb", "groups", "property", "schedule", "first")
+
+
+@router.get("/state")
+async def state(session: AsyncSession = Depends(get_session)):
+    """七關各自過了沒。任何一項算不出來一律當「還沒過」，不要因為雲端連不上
+    就宣告使用者「已完成」——寧可多顯示一次入口，也不要把人鎖在外面。"""
+    # 授權：不 probe（會打雲端、慢），只看本地快取的狀態
+    lic_state, lic_expires = "", None
+    try:
+        from ..cloud_client import license_status
+        lic = await asyncio.to_thread(license_status, False)
+        lic_state = lic.get("state") or ""
+        lic_expires = lic.get("expires_at")
+    except Exception:
+        pass
+
+    consent = (await session.execute(
+        select(UserConsent).where(UserConsent.doc_version == CONSENT_VERSION)
+        .order_by(UserConsent.agreed_at.desc()).limit(1))).scalars().first()
+
+    acc = (await session.execute(select(Account).order_by(Account.id))).scalars().first()
+    bound = bool(acc and acc.fb_user_id)
+
+    group_count = mp_group_count = 0
+    if acc:
+        group_count = await session.scalar(
+            select(func.count(Group.id)).where(Group.account_id == acc.id)) or 0
+        mp_group_count = await session.scalar(
+            select(func.count(Group.id)).where(
+                Group.account_id == acc.id, Group.can_post == True)) or 0    # noqa: E712
+
+    prop_count = await session.scalar(select(func.count(Property.id))) or 0
+    running = await session.scalar(
+        select(func.count(MarketplaceSchedule.id))
+        .where(MarketplaceSchedule.status == "running")) or 0
+    posted_ever = (await session.scalar(
+        select(func.count(RunLog.id)).where(
+            RunLog.status == "success", RunLog.task_type.in_(tuple(POST_TYPES))))) or 0
+
+    steps = [
+        {"key": "license", "done": lic_state in ("ok", "grace"),
+         "detail": f"到期日 {lic_expires[:10]}" if lic_expires else ""},
+        {"key": "consent", "done": consent is not None,
+         "detail": f"{consent.signer_name} 已同意" if consent else ""},
+        {"key": "fb", "done": bound,
+         "detail": f"已綁定 {acc.fb_name or acc.fb_user_id}" if bound else ""},
+        {"key": "groups", "done": group_count > 0,
+         "detail": f"{group_count} 個社團，其中 {mp_group_count} 個可轉發" if group_count else ""},
+        {"key": "property", "done": prop_count > 0,
+         "detail": f"已有 {prop_count} 個物件" if prop_count else ""},
+        {"key": "schedule", "done": running > 0,
+         "detail": f"{running} 個排程執行中" if running else ""},
+        {"key": "first", "done": posted_ever > 0,
+         "detail": f"已經發過 {posted_ever} 篇" if posted_ever else ""},
+    ]
+    done_count = sum(1 for s in steps if s["done"])
+    return {"steps": steps, "done_count": done_count, "total": len(steps),
+            "all_done": done_count == len(steps)}

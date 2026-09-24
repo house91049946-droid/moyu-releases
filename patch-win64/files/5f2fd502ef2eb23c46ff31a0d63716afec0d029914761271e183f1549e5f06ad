@@ -1,0 +1,68 @@
+"""客戶回饋 API：記錄操作頁面 + 前端日誌 + 人工輸入。"""
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from pydantic import BaseModel
+from typing import Optional
+
+from .. import http_client
+from ..database import get_session, Feedback
+
+router = APIRouter(prefix="/api/feedback", tags=["feedback"], redirect_slashes=False)
+
+
+class FeedbackIn(BaseModel):
+    message: str = ""
+    page: str = ""
+    user_agent: str = ""
+    logs: str = ""
+    meta: Optional[dict] = None
+
+
+async def _forward_to_cloud(data: "FeedbackIn") -> bool:
+    """SaaS 模式：把回饋轉發到雲端集中（附帶授權金鑰）。成功回 True。"""
+    import httpx
+    from ..cloud_client import cloud_enabled, cloud_url, license_key
+    if not cloud_enabled():
+        return False
+    try:
+        with http_client.client(15) as c:
+            r = c.post(f"{cloud_url()}/feedback", json={
+                "message": data.message, "page": data.page, "user_agent": data.user_agent,
+                "logs": data.logs, "license_key": license_key(), "meta": data.meta or {},
+            })
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+@router.post("")
+@router.post("/")
+async def submit_feedback(data: FeedbackIn, session: AsyncSession = Depends(get_session)):
+    # SaaS：優先轉發雲端集中；失敗（或未設雲端）則存本地，避免遺失
+    if await _forward_to_cloud(data):
+        return {"id": None, "message": "已收到回饋，謝謝！"}
+    fb = Feedback(
+        message=(data.message or "")[:5000],
+        page=(data.page or "")[:200],
+        user_agent=(data.user_agent or "")[:400],
+        logs=(data.logs or "")[:20000],
+        meta_json=data.meta or {},
+    )
+    session.add(fb)
+    await session.commit()
+    await session.refresh(fb)
+    return {"id": fb.id, "message": "已收到回饋，謝謝！"}
+
+
+@router.get("")
+@router.get("/")
+async def list_feedback(limit: int = 50, session: AsyncSession = Depends(get_session)):
+    rows = (await session.execute(
+        select(Feedback).order_by(Feedback.created_at.desc()).limit(limit)
+    )).scalars().all()
+    return [{
+        "id": f.id, "message": f.message, "page": f.page,
+        "user_agent": f.user_agent, "meta": f.meta_json, "logs": f.logs,
+        "created_at": f.created_at.isoformat() if f.created_at else None,
+    } for f in rows]

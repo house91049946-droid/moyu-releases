@@ -1,0 +1,146 @@
+"""社團自動分類（老闆 2026-09-07：「社團應 AI 自動分類 買賣、租賃、土地、區域、
+中古屋、透天、大樓、預售等，可以讓使用者選擇」）。
+
+兩層：
+1. **規則**——台灣房仲社團的名字很規律（「台中買房交流」「北屯租屋」「桃園透天
+   別墅」），關鍵字就能分掉絕大多數，零成本、可離線、結果可預期。
+2. **AI 補位**——規則一個都認不出的才丟給 AI。目前雲端只有 /ai/generate（生文案）
+   一支端點，沒有分類的；本機有 DeepSeek 金鑰時走本機，沒有就略過、標成「其他」。
+   要讓客戶也能用 AI 分類，得在雲端加一支 /ai/classify（cloud/ 不在本次範圍）。
+
+一個社團可以同時屬於多個類別（「台中中古屋買賣」＝買賣＋中古屋，區域台中），
+所以 tags 是清單、region 另存。
+"""
+from __future__ import annotations
+
+import re
+
+# 類別 → 關鍵字。順序無關，全部比對，命中就掛上。
+TAG_RULES: dict[str, tuple[str, ...]] = {
+    "買賣": ("買賣", "買房", "賣房", "售屋", "買屋", "賣屋", "購屋", "房屋買賣", "不動產買賣",
+             "成交", "自售", "急售", "出售", "房產", "房地產", "不動產"),
+    "租賃": ("租屋", "出租", "租房", "租賃", "招租", "租客", "房東", "找房", "租金", "分租", "雅房", "套房"),
+    "土地": ("土地", "農地", "建地", "地主", "廠房", "工業地", "農舍", "持分"),
+    "中古屋": ("中古", "二手屋", "老屋", "公寓"),
+    "透天": ("透天", "別墅", "獨棟", "連棟", "店面", "店住"),
+    "大樓": ("大樓", "電梯", "華廈", "社區", "高樓", "景觀宅", "雙車位"),
+    "預售": ("預售", "新建案", "建案", "新成屋", "接待中心", "銷售中心", "推案"),   # 「建商」單獨出現不算——土地文案常寫「建商最愛」
+}
+
+# 區域：縣市＋常見行政區／地名。命中「行政區」時也把所屬縣市帶上。
+REGIONS: dict[str, tuple[str, ...]] = {
+    "台北": ("台北", "臺北", "北市", "大安", "信義", "松山", "中山", "士林", "內湖", "文山", "南港", "萬華", "北投", "中正", "大同"),
+    "新北": ("新北", "板橋", "中和", "永和", "新莊", "三重", "土城", "樹林", "淡水", "林口", "汐止", "新店", "蘆洲", "三峽", "鶯歌", "泰山", "五股", "八里", "深坑"),
+    "桃園": ("桃園", "中壢", "平鎮", "八德", "龜山", "蘆竹", "大園", "楊梅", "龍潭", "大溪", "觀音", "新屋"),
+    "新竹": ("新竹", "竹北", "竹東", "竹科", "湖口", "新豐", "竹南"),
+    "苗栗": ("苗栗", "頭份", "後龍", "通霄", "苑裡"),
+    "台中": ("台中", "臺中", "中市", "北屯", "西屯", "南屯", "北區", "西區", "南區", "東區", "中區", "太平", "大里", "烏日", "豐原", "潭子", "大雅", "神岡", "沙鹿", "清水", "梧棲", "龍井", "大肚", "霧峰", "后里", "東勢", "新社", "石岡", "外埔", "大甲", "大安區"),
+    "彰化": ("彰化", "員林", "鹿港", "和美", "溪湖", "田中", "北斗", "二林", "花壇", "社頭", "大村", "秀水", "伸港", "線西"),
+    "南投": ("南投", "草屯", "埔里", "竹山", "名間", "集集", "魚池"),
+    "雲林": ("雲林", "斗六", "斗南", "虎尾", "西螺", "北港", "土庫"),
+    "嘉義": ("嘉義", "民雄", "太保", "朴子", "大林", "水上"),
+    "台南": ("台南", "臺南", "南市", "永康", "仁德", "安南", "安平", "東區", "北區", "中西區", "歸仁", "新市", "善化", "新化", "麻豆", "佳里", "新營", "鹽水"),
+    "高雄": ("高雄", "左營", "楠梓", "三民", "鳳山", "前鎮", "苓雅", "小港", "鼓山", "岡山", "橋頭", "仁武", "大社", "鳥松", "大寮", "林園", "旗津", "前金", "新興", "鹽埕"),
+    "屏東": ("屏東", "潮州", "東港", "恆春", "墾丁", "萬丹", "內埔"),
+    "宜蘭": ("宜蘭", "羅東", "礁溪", "頭城", "蘇澳", "冬山", "員山"),
+    "花蓮": ("花蓮", "吉安", "玉里"),
+    "台東": ("台東", "臺東"),
+    "基隆": ("基隆",),
+    "澎湖": ("澎湖", "馬公"),
+    "金門": ("金門",),
+    "馬祖": ("馬祖", "連江"),
+}
+
+# 「東區」「北區」這種多個縣市都有的區名，單獨出現時不猜縣市
+_AMBIGUOUS = {"東區", "北區", "西區", "南區", "中區", "中正", "大安區", "信義", "中山", "安平"}
+
+# 先判斷「是不是房地產社團」。實測正式機 697 個社團有 420 個是魚缸、多肉、養殖這種
+# 興趣社團——往那裡發物件就是垃圾訊息，被檢舉的機率比發到對的社團高得多。
+# 名字裡沒有任何房地產線索的，一律標「非房產」，讓使用者一鍵排除。
+RE_MARKERS = ("房", "屋", "宅", "不動產", "地產", "店面", "透天", "大樓", "公寓", "套房", "雅房",
+              "建案", "土地", "農地", "建地", "廠房", "別墅", "華廈", "社區", "房東", "仲介",
+              "預售", "新成屋", "中古", "買房", "賣房", "租屋", "建商", "厝", "物件", "格局", "坪")
+
+ALL_TAGS = ("非房產",) + tuple(TAG_RULES.keys()) + ("其他",)
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"\s+", "", (name or "")).replace("臺", "台")
+
+
+def classify_name(name: str) -> dict:
+    """{'tags': [...], 'region': '台中'}。認不出類別就 tags=['其他']；認不出區域就 ''。"""
+    n = _norm(name)
+    if not any(m in n for m in RE_MARKERS):
+        # 「二手魚缸買賣」也有「買賣」兩個字——沒有房地產線索就不套類別規則，直接非房產
+        return {"tags": ["非房產"], "region": _region_of(n)}
+    tags = [tag for tag, kws in TAG_RULES.items() if any(k in n for k in kws)]
+    return {"tags": tags or ["其他"], "region": _region_of(n)}
+
+
+def _region_of(n: str) -> str:
+    region = ""
+    # 先找縣市本名（最可靠），再找行政區
+    for city, kws in REGIONS.items():
+        if kws[0] in n or (len(kws) > 1 and kws[1] in n and kws[1].startswith(("臺", "台", "北市", "中市", "南市"))):
+            region = city
+            break
+    if not region:
+        for city, kws in REGIONS.items():
+            for k in kws[1:]:
+                if k in n and k not in _AMBIGUOUS:
+                    region = city
+                    break
+            if region:
+                break
+    return region
+
+
+def classify_many(names: list[str]) -> list[dict]:
+    return [classify_name(x) for x in names]
+
+
+def ai_classify_leftovers(names: list[str], timeout: float = 60) -> dict[str, dict]:
+    """規則認不出的丟給 AI。回 {name: {'tags': [...], 'region': ''}}；沒有 AI 可用就回空 dict。
+
+    只走本機 DeepSeek 後備（雲端目前沒有分類端點）。任何失敗都安靜回空，
+    分類是加分項，不能讓「一鍵抓取社團」因為它掛掉。
+    """
+    if not names:
+        return {}
+    try:
+        from .deepseek_client import _load_key, _MODEL, _API_URL  # type: ignore[attr-defined]
+        import json as _json
+        from . import http_client
+    except Exception:
+        return {}
+    key = _load_key() if callable(_load_key) else ""
+    if not key:
+        return {}
+    allowed = "、".join(TAG_RULES.keys())
+    regions = "、".join(REGIONS.keys())
+    prompt = (
+        "以下是台灣 Facebook 房地產社團的名稱，請幫每一個判斷：\n"
+        f"1) tags：從【{allowed}】裡挑 0~3 個最貼切的，都不像就給空陣列；\n"
+        f"2) region：從【{regions}】挑一個縣市，看不出來就給空字串。\n"
+        "只回 JSON：{\"items\": [{\"name\": \"...\", \"tags\": [...], \"region\": \"...\"}]}\n\n"
+        + "\n".join(f"- {x}" for x in names[:60])
+    )
+    try:
+        with http_client.client(timeout) as c:
+            r = c.post(_API_URL, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                       json={"model": _MODEL, "messages": [{"role": "user", "content": prompt}],
+                             "temperature": 0.1, "response_format": {"type": "json_object"}})
+        data = r.json()
+        content = data["choices"][0]["message"]["content"]
+        items = _json.loads(content).get("items", [])
+    except Exception:
+        return {}
+    out = {}
+    for it in items:
+        nm = (it.get("name") or "").strip()
+        tags = [t for t in (it.get("tags") or []) if t in TAG_RULES]
+        region = it.get("region") if it.get("region") in REGIONS else ""
+        if nm:
+            out[nm] = {"tags": tags or ["其他"], "region": region or ""}
+    return out

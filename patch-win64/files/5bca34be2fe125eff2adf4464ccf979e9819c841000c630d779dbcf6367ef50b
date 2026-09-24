@@ -1,0 +1,32 @@
+"""讀取雲端下發的設定（backend 已抓並快取到 data/served_config.json）。
+
+FB 改版時，廠商改雲端 → backend 抓取更新此檔 → CLI 用新選擇器，免更新客戶端。
+讀不到檔或缺鍵時一律回傳呼叫端給的 fallback（不會壞）。
+"""
+import json
+
+from src.paths import DATA_DIR
+
+_CONFIG_FILE = DATA_DIR / "served_config.json"
+_cache = None
+
+
+def _load() -> dict:
+    global _cache
+    if _cache is None:
+        try:
+            _cache = json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            _cache = {}
+    return _cache
+
+
+def get(path: str, default):
+    """以點路徑取值，如 get('selectors.mp_delete_menu_texts', [...])；缺則回 default。"""
+    cur = _load()
+    for k in path.split("."):
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        else:
+            return default
+    return cur if cur not in (None, "", []) else default

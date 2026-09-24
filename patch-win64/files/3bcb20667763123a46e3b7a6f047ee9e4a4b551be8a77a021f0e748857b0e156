@@ -1,0 +1,102 @@
+"""P4 CLI wrapper — 刪除舊貼文（供 backend bridge 呼叫）。"""
+import argparse
+import atexit
+import contextlib
+import json
+import os
+import sys
+
+from src.config_loader import T
+from src.utils import launch_browser, capture_screenshot, perform_checks, wait_if_verification_needed, CheckResult
+from src.login import _try_cookie_login
+from src.delete_club_post import delete_old_posts, delete_posts_by_urls
+
+_JSON_PATH: str | None = None
+_RESULT: dict | None = None
+
+
+def main():
+    global _JSON_PATH, _RESULT
+
+    parser = argparse.ArgumentParser(description="FB Auto P4 — 刪除過期貼文")
+    parser.add_argument("--fbid", required=True)
+    parser.add_argument("--max-age-days", type=int, default=7, help="幾天前的貼文要刪除（無 --targets-json 時的舊路徑）")
+    parser.add_argument("--targets-json", help="待刪貼文 URL 清單 JSON（backend 從 PostHistory 產生；優先於 max-age-days）")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--result-json", help="結果 JSON 輸出路徑")
+    parser.add_argument("--keep-open", action="store_true", help="遇到驗證時保持瀏覽器開啟")
+    args = parser.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {
+        "schema": 2,
+        "success": False,
+        "fbid": args.fbid,
+        "error": "未完成",
+        "data": {"deleted_count": 0, "deleted_urls": []},
+    }
+    if _JSON_PATH:
+        atexit.register(_write_result_json)
+
+    # 讀取待刪清單（優先）
+    target_urls = None
+    if args.targets_json:
+        try:
+            with open(args.targets_json, encoding="utf-8") as f:
+                target_urls = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            _RESULT["error"] = f"讀取 targets-json 失敗: {e}"
+            sys.exit(1)
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(args.targets_json)
+
+    browser = context = page = None
+    try:
+        browser, context, page = launch_browser(fbid=args.fbid, headless=args.headless)
+
+        if not _try_cookie_login(page, context, args.fbid):
+            _RESULT["error"] = "Cookie 登入失敗，請先用 CLI 登入一次"
+            sys.exit(1)
+
+        if target_urls is not None:
+            # 新路徑：依 backend 傳入的明確清單刪除
+            deleted_urls = delete_posts_by_urls(page, args.fbid, target_urls)
+            _RESULT["data"]["deleted_urls"] = deleted_urls
+            _RESULT["data"]["deleted_count"] = len(deleted_urls)
+        else:
+            # 舊路徑（獨立 CLI 使用）：仍走 postStatus.json
+            _RESULT["data"]["deleted_count"] = delete_old_posts(page, args.fbid, max_age_days=args.max_age_days)
+
+        _RESULT["success"] = True
+        _RESULT["error"] = ""
+
+    except KeyboardInterrupt:
+        _RESULT["error"] = "使用者中斷"
+        sys.exit(0)
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        sys.exit(1)
+    finally:
+        if page and args.keep_open:
+            check = perform_checks(page, args.fbid)
+            wait_if_verification_needed(check, page, args.fbid)
+        # launch_browser 回傳的 browser 與 context 是同一物件，close 一次即可
+        if context:
+            with contextlib.suppress(Exception):
+                context.close()
+
+
+def _write_result_json():
+    if _JSON_PATH and _RESULT is not None:
+        with open(_JSON_PATH, "w", encoding="utf-8") as f:
+            try:
+                from src.utils import collect_screenshots
+                _RESULT.setdefault("data", {})["screenshots"] = collect_screenshots()
+            except Exception:
+                pass
+            json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+
+
+if __name__ == "__main__":
+    main()

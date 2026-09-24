@@ -1,0 +1,98 @@
+"""Marketplace 自動刪除的安全網：只刪本工具上架的刊登，不碰帳號手動貼的商品。
+
+背景（2026-08-09）：自動刪除原本掃整個銷售頁、照天數刪，誤刪了帳號既有的
+商品。加了 allowed_titles 白名單後，第一版只擋住「候選計數」與 dry-run，卻
+漏掉了『實刪迴圈』——迴圈就地重收卡片、只用 age 挑下一個要刪的，繞過了標題
+比對。這支測試用「工具的 + 手動的」混合清單跑實刪迴圈，確保手動商品不被刪。
+"""
+import sys
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+pytest.importorskip("playwright")  # 需要 playwright（module 頂層 import Page）
+
+# 讓 `import src.xxx` 解得到（FB_Auto 為套件根）
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import src.delete_club_post as m  # noqa: E402
+
+
+def _mixed_cards():
+    return [
+        {"idx": 0, "title": "太平七街 四房透天 1798萬", "text": "太平七街 四房透天 1798萬", "age_days": 5},
+        {"idx": 1, "title": "可愛狗狗潔牙骨 大包裝",   "text": "可愛狗狗潔牙骨 大包裝",   "age_days": 5},
+        {"idx": 2, "title": "太平七街 四房透天 1798萬", "text": "太平七街 四房透天 1798萬", "age_days": 5},
+    ]
+
+
+def test_實刪迴圈只刪本工具_跳過手動商品():
+    allowed = {"太平七街 四房透天 1798萬"}
+    state = _mixed_cards()
+    deleted = []
+
+    def fake_collect(page):
+        return list(state), {}
+
+    def fake_scan(page, fbid, diag=True):
+        return list(state)
+
+    def fake_delete_one(page, idx):
+        nonlocal state
+        card = next((c for c in state if c["idx"] == idx), None)
+        if not card:
+            return False
+        deleted.append(card["title"])
+        state = [c for c in state if c["idx"] != idx]
+        return True
+
+    with mock.patch.object(m, "perform_checks", return_value=m.CheckResult.OK), \
+         mock.patch.object(m, "scan_selling_listings", fake_scan), \
+         mock.patch.object(m, "_collect_cards", fake_collect), \
+         mock.patch.object(m, "_delete_one_listing", fake_delete_one), \
+         mock.patch.object(m, "_open_selling_page", lambda page: True), \
+         mock.patch.object(m, "human_sleep", lambda *a, **k: None):
+        page = mock.MagicMock()
+        page.is_closed.return_value = False
+        r = m.delete_old_marketplace_listings(page, "fbid", max_age_days=0,
+                                              dry_run=False, allowed_titles=allowed)
+
+    assert "可愛狗狗潔牙骨 大包裝" not in deleted        # 手動商品絕不能刪
+    assert deleted == ["太平七街 四房透天 1798萬"] * 2   # 只刪本工具那 2 筆
+    assert r.get("skipped_not_mine") == 1
+
+
+def test_查無本工具紀錄_一筆都不刪():
+    """allowed_titles 為空 → 直接短路、不掃不刪。"""
+    r = m.delete_old_marketplace_listings(mock.MagicMock(), "fbid",
+                                          max_age_days=0, dry_run=False,
+                                          allowed_titles=set())
+    assert r["deleted"] == []
+    assert r.get("note") == "no_tool_listings_recorded"
+
+
+def test_標題比對容忍FB截斷與加後綴():
+    allowed = {"太平七街 四房透天 1798萬 全新整理"}
+    assert m._title_is_ours("太平七街 四房透天 1798萬 全新整理 近學區", allowed) is True  # FB 加後綴
+    assert m._title_is_ours("太平七街 四房透天 1798萬", allowed) is True                  # 卡片被截短
+    assert m._title_is_ours("可愛狗狗潔牙骨 大包裝好評熱賣中", allowed) is False           # 帳號手動商品
+    assert m._title_is_ours("太平七街 四房透天 1798萬 全新整理", set()) is False          # 空白名單
+
+
+def test_FB把全形標點換成半形也要比對得出來():
+    """2026-08-10 實測：工具送出全形逗號，FB 賣場頁顯示成半形，害自動刪除永遠不刪。"""
+    logged = "台中太平四房透天，23坪地，近市區機能好"      # 我們記錄的（全形）
+    on_fb = "台中太平四房透天,23坪地,近市區機能好"          # FB 頁面顯示的（半形）
+    assert m._title_is_ours(on_fb, {logged}) is True
+
+
+def test_表情符號被FB吃掉也要比對得出來():
+    logged = "🏠台中太平四房透天｜23坪地｜近市區"
+    on_fb = "台中太平四房透天 23坪地 近市區"
+    assert m._title_is_ours(on_fb, {logged}) is True
+
+
+def test_太短的標題不比對_避免誤刪():
+    """去掉標點後不足 10 字就不比——短字串太容易跟別人的刊登撞在一起。"""
+    assert m._title_is_ours("太平透天", {"太平透天"}) is False

@@ -1,0 +1,251 @@
+"""排程發文 API"""
+import datetime
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from pydantic import BaseModel
+from typing import Optional
+
+from ..database import get_session, PostTask, PostHistory, Account, Article
+from ..scheduler.task_runner import task_scheduler, run_post_task
+
+router = APIRouter(prefix="/api/posts", tags=["posts"], redirect_slashes=False)
+
+
+class PostTaskCreate(BaseModel):
+    account_id: int
+    article_id: Optional[int] = None
+    task_type: str = "post"
+    target_groups: list[dict] = []  # [{"name": "...", "url": "..."}]
+    schedule_type: str = "immediate"  # immediate / once / cycle / weekly
+    schedule_time: Optional[str] = None  # ISO format datetime
+    cycle_hours: int = 6
+    week_days: list[int] = []
+    time_of_day: str = "02:00"
+    sleep_seconds: int = 90
+    groups_per_run: int = 10
+    add_timestamp: bool = False
+    add_sequence: bool = False
+    sequence_start: int = 1
+    shuffle_groups: bool = False
+    screenshot: bool = False
+    headless: bool = False
+
+
+class PostTaskResponse(BaseModel):
+    id: int
+    account_id: int
+    task_type: str
+    target_groups_count: int
+    schedule_type: str
+    status: str
+    progress: int
+    total_count: int
+    sleep_seconds: int
+    headless: bool
+    next_run: Optional[str] = None
+    created_at: str
+
+    model_config = {"from_attributes": True}
+
+
+@router.get("", response_model=list[dict])
+@router.get("/", response_model=list[dict])
+async def list_tasks(session: AsyncSession = Depends(get_session)):
+    result = await session.execute(
+        select(PostTask).order_by(PostTask.created_at.desc())
+    )
+    tasks = result.scalars().all()
+    return [
+        {
+            "id": t.id,
+            "account_id": t.account_id,
+            "task_type": t.task_type,
+            "schedule_type": t.schedule_type,
+            "status": t.status,
+            "progress": t.progress,
+            "total_count": t.total_count,
+            "target_groups": t.target_groups,
+            "sleep_seconds": t.sleep_seconds,
+            "headless": t.headless,
+            "next_run": t.next_run.isoformat() if t.next_run else None,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        }
+        for t in tasks
+    ]
+
+
+@router.post("")
+@router.post("/")
+async def create_task(data: PostTaskCreate, session: AsyncSession = Depends(get_session)):
+    # 驗證帳號存在
+    acc_result = await session.execute(select(Account).where(Account.id == data.account_id))
+    if not acc_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="帳號不存在")
+
+    groups = data.target_groups
+    total = len(groups)
+
+    task = PostTask(
+        account_id=data.account_id,
+        article_id=data.article_id,
+        task_type=data.task_type,
+        target_groups=groups,
+        schedule_type=data.schedule_type,
+        cycle_hours=data.cycle_hours,
+        week_days=data.week_days,
+        time_of_day=data.time_of_day,
+        sleep_seconds=data.sleep_seconds,
+        groups_per_run=data.groups_per_run,
+        add_timestamp=data.add_timestamp,
+        add_sequence=data.add_sequence,
+        sequence_start=data.sequence_start,
+        shuffle_groups=data.shuffle_groups,
+        screenshot=data.screenshot,
+        headless=data.headless,
+        total_count=total,
+    )
+
+    if data.schedule_type == "once" and data.schedule_time:
+        task.next_run = datetime.datetime.fromisoformat(data.schedule_time)
+    elif data.schedule_type == "cycle":
+        task.next_run = _calc_next_cycle_time(data.time_of_day, data.cycle_hours)
+
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    # 統一走 scheduler：immediate→DateTrigger(now)、once→DateTrigger、cycle→IntervalTrigger
+    task_scheduler.add_task(task)
+
+    return {
+        "id": task.id,
+        "status": task.status,
+        "total_count": total,
+        "message": "立即發文已啟動" if data.schedule_type == "immediate" else "排程已建立",
+    }
+
+
+@router.put("/{task_id}/stop")
+async def stop_task(task_id: int, session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(PostTask).where(PostTask.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="任務不存在")
+
+    task.status = "stopped"
+    await session.commit()
+
+    # 真中止：kill 進行中子進程 + 移除排程 job
+    from ..fbauto_bridge import kill_job
+    kill_job(f"post_{task_id}")
+    task_scheduler.remove_task(task_id)
+    return {"message": "任務已停止"}
+
+
+@router.delete("/{task_id}")
+async def delete_task(task_id: int, session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(PostTask).where(PostTask.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="任務不存在")
+
+    # 真中止：kill 進行中子進程 + 移除排程 job
+    from ..fbauto_bridge import kill_job
+    kill_job(f"post_{task_id}")
+    task_scheduler.remove_task(task_id)
+
+    await session.delete(task)
+    await session.commit()
+    return {"message": "任務已刪除"}
+
+
+@router.get("/history")
+@router.get("/history/")
+async def get_post_history(account_id: Optional[int] = None, limit: int = 100, session: AsyncSession = Depends(get_session)):
+    q = select(PostHistory).order_by(PostHistory.post_time.desc())
+    if account_id:
+        q = q.where(PostHistory.account_id == account_id)
+    q = q.limit(limit)
+    result = await session.execute(q)
+    history = result.scalars().all()
+    return [
+        {
+            "id": h.id,
+            "account_id": h.account_id,
+            "group_name": h.group_name,
+            "group_url": h.group_url,
+            "post_url": h.post_url,
+            "status": h.status,
+            "screenshot_path": h.screenshot_path,
+            "error_message": h.error_message,
+            "post_time": h.post_time.isoformat() if h.post_time else None,
+        }
+        for h in history
+    ]
+
+
+def _calc_next_cycle_time(time_of_day: str, cycle_hours: int) -> datetime.datetime:
+    """計算下一個循環時間"""
+    now = datetime.datetime.now()
+    h, m = map(int, time_of_day.split(":"))
+    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if target <= now:
+        target += datetime.timedelta(hours=cycle_hours)
+    return target
+
+
+# ─── 刪除舊貼文 ────────────────────────────────────────
+
+class DeleteOldPostsRequest(BaseModel):
+    account_id: int
+    max_age_days: int = 7
+    headless: bool = False
+
+
+@router.post("/delete-old")
+async def delete_old_posts_endpoint(data: DeleteOldPostsRequest, session: AsyncSession = Depends(get_session)):
+    """刪除指定帳號的過期社團貼文。
+    待刪清單改由 PostHistory 產生（超齡 + success + 尚未刪除 + 有 post_url），
+    不再依賴從沒被寫的 postStatus.json。"""
+    import datetime, json, tempfile, os
+
+    acc_result = await session.execute(select(Account).where(Account.id == data.account_id))
+    acc = acc_result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    if not acc.fb_user_id:
+        raise HTTPException(status_code=422, detail="此帳號尚未綁定 FB ID")
+
+    from ..fbauto_bridge import start_long_op, cookie_exists
+
+    if not cookie_exists(acc.fb_user_id):
+        raise HTTPException(status_code=422, detail=f"cookie 不存在: {acc.fb_user_id}，請先用 CLI 登入")
+
+    # 從 PostHistory 撈超齡且成功、尚未刪除、有 post_url 的貼文
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=data.max_age_days)
+    rows = await session.execute(
+        select(PostHistory.post_url).where(
+            PostHistory.account_id == data.account_id,
+            PostHistory.status == "success",
+            PostHistory.deleted == False,
+            PostHistory.post_time <= cutoff,
+            PostHistory.post_url != "",
+        )
+    )
+    targets = [u for (u,) in rows.all() if u]
+    if not targets:
+        return {"job_id": None, "state": "success", "deleted_count": 0,
+                "message": f"沒有超過 {data.max_age_days} 天且可刪除的貼文"}
+
+    # 待刪清單寫暫存檔傳給 CLI（CLI 讀後自刪）
+    fd, targets_path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(targets, f, ensure_ascii=False)
+
+    args = ["--fbid", acc.fb_user_id, "--targets-json", targets_path]
+    if data.headless:
+        args.append("--headless")
+    job_id = start_long_op("delete", "src.run_delete_posts", args,
+                           account_id=acc.id, fbid=acc.fb_user_id)
+    return {"job_id": job_id, "state": "pending", "targets": len(targets)}

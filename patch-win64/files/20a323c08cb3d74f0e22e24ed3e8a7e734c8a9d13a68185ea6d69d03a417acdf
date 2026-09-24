@@ -1,0 +1,61 @@
+"""macOS App Nap 停用（best-effort）。
+
+為什麼：mini 實案（2026-08-26~28）——背景進程整夜無 HTTP 活動時，macOS 把
+asyncio 計時器節流到完全不走，排程一件都不發、無錯誤無日誌。部署層可以用
+LaunchAgent 的 ProcessType=Interactive 解，但客戶的便攜包是啟動器帶起的普通
+子進程，沒有那層。這裡從進程內部宣告「我在做使用者要的長期活動」，等同
+NSProcessInfo beginActivityWithOptions:NSActivityUserInitiated。
+
+完全 best-effort：非 mac 直接 no-op；mac 上任何一步失敗都只回報不拋——
+排程器另有 watchdog（task_runner.start_scheduler_watchdog）當第二道防線。
+"""
+import sys
+
+# 持有 activity token 的全域引用：被回收的話 activity 就結束了
+_activity_token = None
+
+
+def disable_app_nap() -> tuple[bool, str]:
+    """回 (是否成功, 說明)。只該在啟動時呼叫一次。"""
+    global _activity_token
+    if sys.platform != "darwin":
+        return False, "非 macOS，不需要"
+    if _activity_token is not None:
+        return True, "已經停用過"
+    try:
+        import ctypes
+        import ctypes.util
+
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        ctypes.cdll.LoadLibrary(ctypes.util.find_library("Foundation"))
+
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        # objc_msgSend 的簽名依呼叫而異，逐次 cast
+        send = objc.objc_msgSend
+
+        def msg(receiver, selector, *args, restype=ctypes.c_void_p, argtypes=()):
+            send.restype = restype
+            send.argtypes = [ctypes.c_void_p, ctypes.c_void_p] + list(argtypes)
+            return send(receiver, objc.sel_registerName(selector), *args)
+
+        NSProcessInfo = objc.objc_getClass(b"NSProcessInfo")
+        info = msg(NSProcessInfo, b"processInfo")
+        NSString = objc.objc_getClass(b"NSString")
+        reason = msg(NSString, b"stringWithUTF8String:",
+                     b"moyu scheduler keep-alive", argtypes=[ctypes.c_char_p])
+        # NSActivityUserInitiated = 0x00FFFFFF | NSActivityIdleSystemSleepDisabled(1<<20)
+        NSActivityUserInitiated = 0x00FFFFFF
+        token = msg(info, b"beginActivityWithOptions:reason:",
+                    ctypes.c_ulonglong(NSActivityUserInitiated), reason,
+                    argtypes=[ctypes.c_ulonglong, ctypes.c_void_p])
+        if not token:
+            return False, "beginActivity 回了空值"
+        # retain 住，activity 才不會隨 autorelease 結束
+        msg(token, b"retain")
+        _activity_token = token
+        return True, "已宣告 NSActivityUserInitiated，App Nap 不會節流本進程"
+    except Exception as e:
+        return False, f"停用失敗（走 watchdog 防線）：{e}"

@@ -1,0 +1,42 @@
+"""自動留言 API"""
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from pydantic import BaseModel
+
+from ..database import get_session, Account
+
+router = APIRouter(prefix="/api/comments", tags=["comments"], redirect_slashes=False)
+
+
+class CommentRunRequest(BaseModel):
+    account_id: int
+    post_urls: list[str]
+    content: str
+    sleep_seconds: int = 60
+    headless: bool = False
+
+
+@router.post("/run")
+async def run_comments(data: CommentRunRequest, session: AsyncSession = Depends(get_session)):
+    """對指定貼文 URL 進行自動留言"""
+
+    acc_result = await session.execute(select(Account).where(Account.id == data.account_id))
+    acc = acc_result.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    if not acc.fb_user_id:
+        raise HTTPException(status_code=422, detail="此帳號尚未綁定 FB ID")
+
+    from ..fbauto_bridge import start_long_op, cookie_exists
+
+    if not cookie_exists(acc.fb_user_id):
+        raise HTTPException(status_code=422, detail=f"cookie 不存在: {acc.fb_user_id}")
+
+    args = ["--fbid", acc.fb_user_id, "--content", data.content,
+            "--sleep", str(data.sleep_seconds), "--urls", *data.post_urls]
+    if data.headless:
+        args.append("--headless")
+    job_id = start_long_op("comment", "src.run_comment", args,
+                           account_id=acc.id, fbid=acc.fb_user_id)
+    return {"job_id": job_id, "state": "pending"}

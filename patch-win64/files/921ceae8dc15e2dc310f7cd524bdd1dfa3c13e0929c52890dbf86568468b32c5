@@ -1,0 +1,199 @@
+"""CLI wrapper — 用 cookie 登入後抓取所有社團。Marketplace 轉發檢查延後到實際發文時才做。"""
+import argparse
+import atexit
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+from src.paths import DATA_DIR, COOKIES_DIR
+
+_JSON_PATH: str | None = None
+_RESULT: dict | None = None
+
+
+def main():
+    global _JSON_PATH, _RESULT
+
+    parser = argparse.ArgumentParser(description="FB Auto — 抓取社團清單（不發文）")
+    parser.add_argument("--fbid", required=True, help="FB numeric ID（必須已有 cookie）")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--result-json", help="結果 JSON 輸出路徑")
+    args = parser.parse_args()
+
+    _JSON_PATH = args.result_json
+    _RESULT = {
+        "schema": 2,
+        "success": False,
+        "fbid": args.fbid,
+        "error": "未完成",
+        "data": {"groups": [], "total_groups": 0},
+    }
+    if _JSON_PATH:
+        atexit.register(_write_result_json)
+
+    print(f"[sync] 開始為 fbid={args.fbid} 抓取社團...", flush=True)
+
+    ctx = None
+    try:
+        # ── 載入 cookie ──
+        cookie_path = COOKIES_DIR / f"{args.fbid}.json"
+        if not cookie_path.exists():
+            _RESULT["error"] = f"Cookie 不存在: {cookie_path}"
+            sys.exit(1)
+
+        # utf-8-sig：手動搬來的 cookie 檔若帶 BOM，純 utf-8 會炸 Unexpected UTF-8 BOM
+        with open(cookie_path, encoding="utf-8-sig") as f:
+            cookies = json.load(f)
+        print(f"  ✓ 載入 {len(cookies)} 個 cookies", flush=True)
+
+        # ── 啟動瀏覽器（統一走 utils.launch_browser：stealth + 單一 profile 目錄）──
+        from src.utils import launch_browser
+
+        print(f"  ✓ 啟動瀏覽器 (headless={args.headless})...", flush=True)
+        browser, ctx, page = launch_browser(fbid=args.fbid, headless=args.headless)
+        ctx.add_cookies(cookies)
+
+        # ── Cookie 登入 ──
+        print(f"  ✓ 導航到 FB...", flush=True)
+        page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=20000)
+        time.sleep(2)
+
+        # 判定登入是否有效：以 c_user cookie 為準（頁面文字找「登入+密碼」會把
+        # 登入後的過場頁誤判成登出——2026-08-06 Windows 實測）。
+        def _logged_in() -> bool:
+            try:
+                return any(c.get("name") == "c_user" and c.get("value")
+                           for c in ctx.cookies("https://www.facebook.com"))
+            except Exception:
+                return False
+
+        if not _logged_in() or "/login" in (page.url or ""):
+            _RESULT["error"] = "Cookie 已失效，請重新用帳密登入"
+            sys.exit(1)
+        print(f"  ✓ Cookie 登入成功", flush=True)
+
+        # ── 抓取所有社團 ──
+        print(f"  → 抓取社團清單...", flush=True)
+        groups = _scrape_groups(page, args.fbid)
+
+        group_list = []
+        for name, url in groups.items():
+            m = re.search(r"/groups/(\d+)/?", url)
+            group_list.append({"name": name, "url": url, "group_id": m.group(1) if m else ""})
+        print(f"  ✓ 抓到 {len(group_list)} 個社團", flush=True)
+
+        _RESULT["success"] = True
+        _RESULT["data"]["total_groups"] = len(group_list)
+        _RESULT["data"]["groups"] = group_list
+        _RESULT["error"] = ""
+        print(f"  ✓ 完成：{len(group_list)} 個社團", flush=True)
+
+    except Exception as e:
+        _RESULT["error"] = str(e)
+        import traceback
+        traceback.print_exc()
+        print(f"  ✗ 錯誤: {e}", flush=True)
+        sys.exit(1)
+    finally:
+        if ctx:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
+def _scrape_groups(page, fbid: str) -> dict[str, str]:
+    """抓取所有已加入的社團，回傳 {名稱: mbasic_url}。"""
+    urls = [
+        "https://www.facebook.com/groups/joins/",
+        "https://www.facebook.com/groups/?category=membership",
+    ]
+    for url in urls:
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            time.sleep(1.5)
+            break
+        except Exception:
+            continue
+    else:
+        print("  ✗ 無法載入社團頁面", flush=True)
+        return {}
+
+    # 捲動載入全部。max_scrolls 從 50 放寬到 400：以前每輪萃取是平方級的、
+    # 一輪動輒數十秒，50 輪就要半小時；改成單次 evaluate 後一輪不到一秒，
+    # 上限只是保險絲——900+ 社團的帳號需要遠超過 50 輪才捲得完。
+    all_groups: dict[str, str] = {}
+    prev_count = -1
+    stale = 0
+    max_scrolls = 400
+    scroll_count = 0
+    last_print = 0
+    while stale < 4 and scroll_count < max_scrolls:
+        _extract_group_links(page, all_groups)
+        new_count = len(all_groups)
+        if new_count == prev_count:
+            stale += 1
+        else:
+            stale = 0
+        prev_count = new_count
+        page.mouse.wheel(0, 3000)
+        time.sleep(0.4)
+        scroll_count += 1
+        if new_count - last_print >= 30 or scroll_count == max_scrolls:
+            print(f"    已找到 {new_count} 個社團...", flush=True)
+            last_print = new_count
+
+    # 存檔
+    result: dict[str, str] = {}
+    for name, gid in all_groups.items():
+        result[name] = f"https://mbasic.facebook.com/groups/{gid}/"
+
+    out_path = DATA_DIR / f"{fbid}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(f"  ✓ 社團存檔: {out_path}", flush=True)
+
+    return result
+
+
+# 一次 evaluate 把整頁連結的 href+文字帶回來（單次跨進程往返）。
+#
+# 原本逐一 link.get_attribute() + link.inner_text()：每個連結兩次 RPC，而且每捲
+# 一輪就把「頁面上累積的全部連結」重掃一遍——成本平方級。2026-08-06 Windows
+# 實測 943 個社團要 27.5 分鐘（CPU 只用 80 秒，其餘都在等 RPC），遠超後端
+# 600 秒預算，大帳號必超時。改法與 getclub.py 相同。
+_EXTRACT_JS = """() => Array.from(document.querySelectorAll("a[href*='/groups/']"))
+    .map(a => [a.getAttribute('href') || '', (a.innerText || '').trim()])"""
+
+
+def _extract_group_links(page, out: dict[str, str]):
+    """從當前頁面擷取所有社團名稱和 ID 加入 out dict。"""
+    try:
+        pairs = page.evaluate(_EXTRACT_JS)
+    except Exception:
+        return
+    for href, raw_name in pairs:
+        m = re.search(r"/groups/(\d+)/?", href or "")
+        if not m:
+            continue
+        gid = m.group(1)
+        name = (raw_name or "").split("\n")[0].strip()
+        if name and gid and name not in out:
+            out[name] = gid
+
+
+def _write_result_json():
+    if _JSON_PATH and _RESULT is not None:
+        try:
+            os.makedirs(os.path.dirname(_JSON_PATH) or ".", exist_ok=True)
+            with open(_JSON_PATH, "w", encoding="utf-8") as f:
+                json.dump(_RESULT, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[result-json] 寫檔失敗: {e}", file=sys.stderr, flush=True)
+
+
+if __name__ == "__main__":
+    main()

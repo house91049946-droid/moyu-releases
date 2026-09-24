@@ -1,0 +1,177 @@
+"""抓取 FB 帳號已加入的社團清單，寫入 data/<fbid>.json。"""
+import json
+import random
+import re
+from collections.abc import Callable
+from pathlib import Path
+
+from playwright.sync_api import Page
+
+from src.paths import DATA_DIR
+from src.utils import enhanced_get, human_sleep, perform_checks, CheckResult
+
+# UI 雜訊／非社團名稱（同 id 多個連結時會灌水）
+_JUNK_NAMES = {
+    "查看社團",
+    "see group",
+    "see more",
+    "查看更多",
+    "更多",
+    "more",
+    "joined",
+    "已加入",
+    "邀請",
+    "invite",
+}
+
+
+def run_getclub(
+    page: Page,
+    fbid: str,
+    on_progress: Callable[[int], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> dict[str, str]:
+    """
+    到 FB「你加入的所有社團」頁抓取社團名稱和 group ID，
+    組成 {社團名: mbasic_url} 對照表，寫入 data/<fbid>.json。
+
+    Returns:
+        {社團名稱: "https://mbasic.facebook.com/groups/<group_id>/"}
+    """
+    print(f"[getclub] Fetching groups for fbid: {fbid}")
+
+    url = "https://www.facebook.com/groups/joins/"
+    check = perform_checks(page, fbid)
+    if check != CheckResult.OK:
+        # 剛登入完的過場頁（儲存登入資訊、安全提示…）容易被誤判。先導去社團頁
+        # 把過場頁導走，再檢查一次；仍失敗才真的放棄（2026-08-06 Windows 實測建議）。
+        print(f"[getclub] Pre-check failed: {check.value}，導向社團頁後重檢一次")
+        enhanced_get(page, url)
+        human_sleep(1, 2)
+        check = perform_checks(page, fbid)
+        if check != CheckResult.OK:
+            print(f"[getclub] Pre-check failed again: {check.value}")
+            return {}
+
+    if not enhanced_get(page, url):
+        if not enhanced_get(page, "https://www.facebook.com/groups/?category=membership"):
+            print("[getclub] Cannot reach groups page")
+            return {}
+
+    human_sleep(1, 2)
+
+    # 以 group_id 去重累積（避免「查看社團」等重複連結灌水）
+    accumulated: dict[str, str] = {}  # group_id -> name
+    _merge_batch(accumulated, _extract_groups_from_page(page))
+    if on_progress:
+        on_progress(len(accumulated))
+
+    attempts = 0
+    stable_limit = 5
+    prev_count = len(accumulated)
+    stopped_early = False
+
+    while attempts < stable_limit:
+        if should_stop and should_stop():
+            stopped_early = True
+            print("[getclub] 使用者提前結束，保留目前已收集社團")
+            break
+
+        page.mouse.wheel(0, random.randint(3000, 8000))
+        human_sleep(1, 2)
+        _merge_batch(accumulated, _extract_groups_from_page(page))
+
+        new_count = len(accumulated)
+        if on_progress and new_count != prev_count:
+            on_progress(new_count)
+
+        if new_count == prev_count:
+            attempts += 1
+        else:
+            attempts = 0
+        prev_count = new_count
+
+    print(
+        f"[getclub] Found {len(accumulated)} groups"
+        + (" (early stop)" if stopped_early else "")
+    )
+    if on_progress:
+        on_progress(len(accumulated))
+
+    result: dict[str, str] = {}
+    for group_id, name in accumulated.items():
+        result[name] = f"https://mbasic.facebook.com/groups/{group_id}/"
+
+    out_path = DATA_DIR / f"{fbid}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(f"[getclub] Saved to: {out_path}")
+
+    return result
+
+
+def _merge_batch(accumulated: dict[str, str], batch: dict[str, str]) -> None:
+    """batch: group_id -> name；同 id 偏好較乾淨／較長的名稱。"""
+    for gid, name in batch.items():
+        if not gid or not name:
+            continue
+        old = accumulated.get(gid)
+        if old is None or _name_score(name) > _name_score(old):
+            accumulated[gid] = name
+
+
+def _name_score(name: str) -> int:
+    return len(name)
+
+
+def _clean_group_name(raw: str) -> str:
+    name = (raw or "").strip()
+    if not name:
+        return ""
+    # FB 常把「上次發文時間」併在同一連結文字
+    name = name.split("\n")[0].strip()
+    for sep in ("上次發文時間", "Last post", "Last active"):
+        if sep in name:
+            name = name.split(sep)[0].strip()
+    return name
+
+
+# 一次把所有連結的 href 與文字撈回來。
+#
+# 原本是逐一 link.get_attribute() + link.inner_text()——每個連結兩次跨進程往返，
+# 而且每滾一次就把整頁重抽一遍。頁面上的連結數隨著滾動一直累積，成本是平方級的：
+# 500 個社團大約要打 40000 次往返，收集到後面會越來越慢，瀏覽器也被塞爆
+# （客戶回報的「收集社團很卡」就是這個）。改成一次 evaluate 帶回全部資料。
+_EXTRACT_JS = """() => Array.from(document.querySelectorAll("a[href*='/groups/']"))
+    .map(a => [a.getAttribute('href') || '', (a.innerText || '').trim()])"""
+
+
+def _extract_groups_from_page(page: Page) -> dict[str, str]:
+    """從當前頁面抓取社團：回傳 {group_id: name}（已過濾雜訊）。"""
+    groups: dict[str, str] = {}
+    try:
+        pairs = page.evaluate(_EXTRACT_JS)
+    except Exception as e:
+        print(f"[getclub] Error extracting groups: {e}")
+        return groups
+
+    for href, raw_name in pairs:
+        if any(x in href for x in ("/groups/joins", "/groups/feed", "/groups/discover", "/groups/create")):
+            continue
+        match = re.search(r"/groups/(\d+)/?", href)
+        if not match:
+            continue
+        group_id = match.group(1)
+        name = _clean_group_name(raw_name)
+        if not name:
+            continue
+        if name.lower() in _JUNK_NAMES or name in _JUNK_NAMES:
+            continue
+        # 過短且無中文／英數內容 → 略過
+        if len(name) < 2:
+            continue
+        old = groups.get(group_id)
+        if old is None or _name_score(name) > _name_score(old):
+            groups[group_id] = name
+
+    return groups

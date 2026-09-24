@@ -1,0 +1,263 @@
+"""IG 自動追蹤的離線測試（SPEC-P31 §7）。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_ig_follow.py -v
+
+守的是「保守」：額度不能被隨手調大、自己不會被列進候選、跨來源不重複、
+已追蹤／已要求的不會被再點（再點＝取消）、被擋會停但保留已做的部分、
+後端已記錄過的人在進頁面前就略過。全部不開真瀏覽器。
+"""
+import json
+import subprocess
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("playwright")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import meta_block as mb  # noqa: E402
+from src import run_ig_follow as fol  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class Test追蹤額度:
+    def test_預設五人(self):
+        assert fol.effective_limit(None) == 5
+        assert fol.effective_limit(0) == 5
+
+    def test_不准超過硬上限十人(self):
+        """IG 是三個平台裡管制最嚴的，額度要比 Threads 更小。"""
+        assert fol.effective_limit(100) == fol.HARD_CAP == 10
+
+    def test_合理值照收(self):
+        assert fol.effective_limit(3) == 3
+
+
+class Test來源與標籤:
+    def test_來源去重保序(self):
+        assert fol.parse_sources(" hashtags , own_posts ,hashtags,") == ["hashtags", "own_posts"]
+
+    def test_不認得的來源報錯(self):
+        """設定打錯不該默默跑成空。"""
+        with pytest.raises(ValueError):
+            fol.parse_sources("own_posts,pymk")
+
+    def test_標籤去井號去空白去重(self):
+        assert fol.parse_hashtags("#台中買房, 台中 租屋 ,台中買房,, #") == ["台中買房", "台中租屋"]
+
+
+class Test候選整理:
+    def test_跨來源去重_第一個來源優先(self):
+        raw = [fol.make_target("a", "own_posts"), fol.make_target("b", "hashtags"),
+               fol.make_target("A", "hashtags"), fol.make_target("@b", "own_posts")]
+        out = fol.dedupe_targets(raw)
+        assert [(t["key"], t["source"]) for t in out] == [("a", "own_posts"), ("b", "hashtags")]
+
+    def test_不把自己列進候選(self):
+        """自己貼文的留言區一定有自己——追蹤自己很蠢。"""
+        raw = [fol.make_target("Me", "own_posts"), fol.make_target("other", "own_posts")]
+        assert [t["key"] for t in fol.dedupe_targets(raw, me="me")] == ["other"]
+
+    def test_href過濾成帳號名(self):
+        hrefs = ["/wang.xm/", "/explore/tags/x/", "/p/ABC123/", "/wang.xm/?next=1",
+                 "/accounts/login/", "/lin_99", None, "/reel/XYZ/"]
+        assert fol.usernames_from_hrefs(hrefs) == ["wang.xm", "lin_99"]
+
+    def test_同行帳號略過(self):
+        assert fol.looks_like_agency("taichung_realty") is True
+        assert fol.looks_like_agency("abc123", "信義房屋 王經理") is True
+        assert fol.looks_like_agency("wang.xm", "王小明") is False
+
+
+class Test已追過清單:
+    def test_缺檔或壞JSON都是空集合(self, tmp_path):
+        """這個檔壞了不能讓整輪掛掉。"""
+        assert fol.load_exclude(None) == set()
+        assert fol.load_exclude(tmp_path / "nope.json") == set()
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        assert fol.load_exclude(bad) == set()
+
+    def test_讀清單並正規化(self, tmp_path):
+        p = tmp_path / "known.json"
+        p.write_text(json.dumps(["@Wang.XM", "lin_99", "", 7]), encoding="utf-8")
+        assert fol.load_exclude(p) == {"wang.xm", "lin_99"}
+
+    def test_進頁面前就剔掉並計數(self):
+        targets = [fol.make_target("wang.xm", "own_posts"), fol.make_target("new1", "hashtags")]
+        kept, n = fol.apply_exclude(targets, {"wang.xm"})
+        assert [t["key"] for t in kept] == ["new1"] and n == 1
+        assert fol.apply_exclude(targets, set()) == (targets, 0)
+
+
+class Test被擋判斷:
+    @pytest.mark.parametrize("text,reason", [
+        ("很抱歉，你的動作已遭封鎖", mb.ACTION_BLOCKED),
+        ("Action Blocked", mb.ACTION_BLOCKED),
+        ("動作已封鎖\n請稍後再試", mb.ACTION_BLOCKED),          # IG 專用句，meta_block 沒收
+        ("你的動作太快，請稍後再試", mb.RATE_LIMITED),
+        ("We limit how often you can do certain things on Instagram", mb.RATE_LIMITED),
+    ])
+    def test_封鎖與節流都要停(self, text, reason):
+        assert fol.block_reason(page_text=text) == reason
+
+    def test_正常頁面不會被判成封鎖(self):
+        assert fol.block_reason(page_text="追蹤中\n貼文 12\n粉絲 340\n台中買房分享") == ""
+        assert fol.block_reason(error_text="Timeout 30000ms exceeded") == ""
+
+
+class Test摘要:
+    def test_計數欄位(self):
+        ts = [dict(status="sent"), dict(status="sent"), dict(status="existing"),
+              dict(status="pending"), dict(status="failed"), dict(status="agency")]
+        assert fol.summarize(ts) == {"sent": 2, "skipped_existing": 1, "skipped_pending": 1}
+
+
+# ---------- 假頁面：走 _follow_one 但不開瀏覽器 ----------
+
+class _Loc:
+    def __init__(self, n=0, on_click=None):
+        self.n, self.on_click, self.clicks = n, on_click, 0
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return self.n
+
+    def is_visible(self):
+        return self.n > 0
+
+    def click(self):
+        self.clicks += 1
+        if self.on_click:
+            self.on_click()
+
+    def nth(self, i):
+        return self
+
+
+class FakePage:
+    """只模擬 _follow_one 會碰到的介面：按了「追蹤」之後按鈕變成「追蹤中」。"""
+
+    def __init__(self, body="", buttons=(), after_follow=("追蹤中",)):
+        self.body, self.buttons, self.after_follow = body, set(buttons), set(after_follow)
+        self.url = "https://www.instagram.com/x/"
+        self.gotos, self.follow_clicks = [], 0
+        self.mouse = types.SimpleNamespace(wheel=lambda x, y: None)
+        self.keyboard = types.SimpleNamespace(press=lambda k: None)
+
+    def goto(self, url, **kw):
+        self.gotos.append(url)
+
+    def evaluate(self, js, *a):
+        return self.body if "innerText" in js else []
+
+    def title(self):
+        return "王小明 (@x) • Instagram"
+
+    def get_by_role(self, role, name=None, exact=False):
+        if name in self.buttons:
+            def _clicked():
+                if name in fol._FOLLOW_LABELS:
+                    self.follow_clicks += 1
+                    self.buttons = set(self.after_follow)
+            return _Loc(1, _clicked)
+        return _Loc(0)
+
+    def get_by_text(self, t, exact=False):
+        return _Loc(0)
+
+    def locator(self, sel):
+        return _Loc(0)
+
+
+@pytest.fixture
+def quiet(monkeypatch):
+    monkeypatch.setattr(fol, "human_sleep", lambda a, b: None)
+
+
+class Test單人流程:
+    def test_已追蹤的不再點(self, quiet):
+        """再點一次＝取消追蹤，比不追蹤更糟。"""
+        pg = FakePage(buttons={"追蹤中"})
+        assert fol._follow_one(pg, fol.make_target("x", "hashtags"), 0.0) == "existing"
+        assert pg.follow_clicks == 0
+
+    def test_已要求的算pending(self, quiet):
+        pg = FakePage(buttons={"Requested"})
+        assert fol._follow_one(pg, fol.make_target("x", "hashtags"), 0.0) == "pending"
+
+    def test_進頁就看到封鎖警告(self, quiet):
+        pg = FakePage(body="動作已封鎖", buttons={"追蹤"})
+        assert fol._follow_one(pg, fol.make_target("x", "hashtags"), 0.0) == "blocked"
+        assert pg.follow_clicks == 0
+
+    def test_按了追蹤變追蹤中才算sent(self, quiet):
+        pg = FakePage(buttons={"Follow"})
+        t = fol.make_target("x", "hashtags")
+        assert fol._follow_one(pg, t, 0.0) == "sent"
+        assert pg.follow_clicks == 1 and t["name"] == "王小明" and t["liked"] is False
+
+    def test_找不到追蹤鈕算failed(self, quiet):
+        assert fol._follow_one(FakePage(buttons=set()), fol.make_target("x", "hashtags"), 0.0) == "failed"
+
+
+class Test主程式結果JSON:
+    def _run(self, out, argv, fake_body):
+        code = (
+            "import sys; sys.argv=%r\n"
+            "import src.run_ig_follow as m\n"
+            "%s\n"
+            "try: m.main()\n"
+            "except SystemExit as e: print('EXIT', e.code)\n"
+        ) % (argv, fake_body)
+        r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        return r.stdout, json.loads(out.read_text(encoding="utf-8"))
+
+    def test_被擋保留部分結果並exit1(self, tmp_path):
+        out = tmp_path / "r.json"
+        fake = (
+            "def fake(p,sources,tags,mx,h,dry_run=False,like_probability=0.3,exclude=None):\n"
+            "    assert mx==10, mx\n"                       # --max 99 被夾到硬上限
+            "    assert 'wang.xm' in exclude, exclude\n"
+            "    return {'targets':[{'key':'a','name':'','source':'own_posts','url':'u','liked':True,'status':'sent'},"
+            "{'key':'b','name':'','source':'hashtags','url':'u','liked':False,'status':'sent'},"
+            "{'key':'c','name':'','source':'hashtags','url':'u','liked':False,'status':'existing'},"
+            "{'key':'d','name':'','source':'hashtags','url':'u','liked':False,'status':'failed'}],"
+            "'blocked':True,'block_reason':'action_blocked','skipped_known':1}\n"
+            "m.do_follow=fake"
+        )
+        known = tmp_path / "known.json"
+        known.write_text('["wang.xm"]', encoding="utf-8")
+        argv = ["x", "--max", "99", "--sources", "own_posts,hashtags", "--hashtags", "台中買房",
+                "--exclude-file", str(known), "--result-json", str(out)]
+        stdout, d = self._run(out, argv, fake)
+        assert "EXIT 1" in stdout
+        assert d["success"] is False and d["platform"] == "ig"
+        assert d["blocked"] is True and d["block_reason"] == "action_blocked"
+        assert d["sent"] == 2 and d["skipped_existing"] == 1 and d["skipped_known"] == 1
+        assert len(d["targets"]) == 4                     # 已做的不能白做
+
+    def test_只給hashtags來源但沒給標籤就不跑(self, tmp_path):
+        out = tmp_path / "r.json"
+        argv = ["x", "--sources", "hashtags", "--result-json", str(out)]
+        stdout, d = self._run(out, argv, "m.do_follow=lambda *a,**k: (_ for _ in ()).throw(AssertionError('不該開瀏覽器'))")
+        assert "EXIT 1" in stdout and d["success"] is False and "hashtags" in d["error"]
+
+
+class Test安全預設:
+    def test_不是每個都按讚_且比Threads保守(self):
+        assert 0 < fol.LIKE_PROBABILITY < 1
+        assert fol.GAP[0] >= 20 and fol.GAP[1] >= fol.GAP[0]
+
+    def test_已追蹤與已要求的標籤涵蓋中英(self):
+        for lab in ("追蹤中", "Following"):
+            assert lab in fol._FOLLOWING_LABELS
+        for lab in ("已要求", "Requested"):
+            assert lab in fol._REQUESTED_LABELS

@@ -1,0 +1,139 @@
+"""Threads 發文 CLI 的離線測試（純函式＋失敗路徑，不開瀏覽器不連網）。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_threads_post.py -v
+真發文的實測要有登入態，用 --login 登入後手動跑一次 CLI 驗收。
+"""
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("playwright")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.run_threads_post import clip_text, parse_images  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class Test文字裁切:
+    def test_短文原樣(self):
+        assert clip_text("三房兩廳好宅") == ("三房兩廳好宅", False)
+
+    def test_超過上限截斷並標記(self):
+        text, truncated = clip_text("哈" * 600)
+        assert truncated is True
+        assert len(text) <= 500
+
+    def test_盡量截在句尾(self):
+        text = ("第一句話。" * 90) + "然後這是一段沒有標點的長尾巴" * 10
+        cut, truncated = clip_text(text)
+        assert truncated is True
+        assert cut.endswith("。")
+
+    def test_空字串(self):
+        assert clip_text("") == ("", False)
+        assert clip_text("  \n ") == ("", False)
+
+
+class Test圖片參數:
+    def test_空字串回空清單(self):
+        assert parse_images("") == []
+
+    def test_不存在的圖整批報錯(self):
+        with pytest.raises(FileNotFoundError):
+            parse_images("/tmp/絕對不存在的圖_9x8y7.jpg")
+
+    def test_存在的圖回路徑並裁到十張(self, tmp_path):
+        files = []
+        for i in range(12):
+            f = tmp_path / f"img{i}.jpg"
+            f.write_bytes(b"fake")
+            files.append(str(f))
+        got = parse_images(",".join(files))
+        assert len(got) == 10
+
+
+class TestCLI失敗路徑:
+    def _run(self, *args):
+        out = Path(tempfile.mkdtemp()) / "r.json"
+        proc = subprocess.run(
+            [sys.executable, "-m", "src.run_threads_post", *args, "--result-json", str(out)],
+            cwd=ROOT, capture_output=True, text=True, timeout=60,
+        )
+        return proc, json.loads(out.read_text(encoding="utf-8")) if out.exists() else None
+
+    def test_沒有文字就報錯並寫結果檔(self):
+        proc, r = self._run("--text", "")
+        assert proc.returncode == 1
+        assert r["success"] is False
+        assert "沒有 --text" in r["error"]
+
+    def test_圖片不存在就報錯不發(self):
+        proc, r = self._run("--text", "測試", "--images", "/tmp/不存在_zz.jpg")
+        assert proc.returncode == 1
+        assert "找不到圖片" in r["error"]
+
+
+from src.run_threads_post import parse_username  # noqa: E402
+
+
+class Test帳號名解析:
+    def test_一般個人頁連結(self):
+        assert parse_username("/@fs_23950868") == "fs_23950868"
+
+    def test_帶查詢字串(self):
+        assert parse_username("/@fs_23950868?hl=zh-tw") == "fs_23950868"
+
+    def test_尾斜線(self):
+        assert parse_username("/@abc/") == "abc"
+
+    def test_不是帳號頁(self):
+        assert parse_username("/login") == ""
+        assert parse_username("") == ""
+
+
+class TestCheck參數:
+    def test_check_未登入也是exit0且留下結果(self, tmp_path, monkeypatch):
+        """--check 探測到未登入是正常結果：exit 0、logged_in=false。"""
+        out = tmp_path / "r.json"
+        code = (
+            "import sys, types; sys.argv=['x','--check','--result-json',r'%s',"
+            "'--profile-dir',r'%s'];\n"
+            "import src.run_threads_post as m\n"
+            "m.do_check=lambda p,headless=True:{'logged_in':False,'username':''}\n"
+            "try: m.main()\n"
+            "except SystemExit as e: sys.exit(e.code)\n"
+        ) % (out, tmp_path / "prof")
+        r = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        data = json.loads(out.read_text())
+        assert data["success"] is True
+        assert data["data"] == {"logged_in": False, "username": ""}
+
+
+class Test開啟登入視窗:
+    def test_open旗標走do_open且有時限上限(self, tmp_path):
+        """--open 不發文；分鐘數會被夾在 1～180。"""
+        import json, subprocess, sys
+        out = tmp_path / "r.json"
+        code = (
+            "import sys; sys.argv=['x','--open','--open-minutes','999','--result-json',r'%s']\n"
+            "import src.run_threads_post as m\n"
+            "seen={}\n"
+            "def fake(p,url,mins,label='Threads'):\n"
+            "    seen.update(url=url,mins=mins); return {'opened':True,'closed_by_user':True,'minutes':1.0}\n"
+            "m.do_open=fake\n"
+            "try: m.main()\n"
+            "except SystemExit as e:\n"
+            "    assert e.code==0, e.code\n"
+            "assert seen['mins']==180 and 'threads' in seen['url'], seen\n"
+        ) % out
+        r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        d = json.loads(out.read_text())
+        assert d["success"] is True and d["data"]["opened"] is True

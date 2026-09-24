@@ -1,0 +1,123 @@
+"""發文去重：同一文案 + 同一社團，N 天內不重複發送。
+
+為什麼要有（2026-08-06 老闆要求）：同一篇文案短時間內重複灌進同一個社團，
+是 FB 判定垃圾訊息最直接的特徵，也會被社團管理員踢出。原本兩條發文路徑
+（排程任務 task_runner、社團直發 group_post_runner）都沒有任何檢查，
+只要排程重疊或客戶手動再按一次，同一社團就會收到重複貼文。
+
+比對的是「正規化後的內文」——發文時會附加時間戳、流水號等每次都不同的
+尾巴，不剝掉的話每篇 hash 都不一樣，等於沒有防護。
+"""
+import datetime
+import hashlib
+import re
+
+from sqlalchemy import select, delete
+
+from .database import PostDedup, SyncSession
+
+DEFAULT_WINDOW_DAYS = 7
+# 同一社團的最短發文間隔（小時）。就算換了文案，短時間內連灌同一個社團
+# 依然是最典型的機器人特徵——交接文件早就點名「同一社團沒有最短間隔」
+# 是目前最可能觸發垃圾訊息判定的組合。
+MIN_GROUP_INTERVAL_HOURS = 6.0
+# 超過這個天數的紀錄沒有意義，順手清掉免得無限長大
+_RETENTION_DAYS = 60
+
+# 每次發文都會變、不該影響「這是不是同一篇文案」判斷的尾巴
+_VOLATILE_PATTERNS = (
+    re.compile(r"---\s*發文時間.*?---", re.S),        # add_timestamp 加的
+    re.compile(r"\(#\d+\)\s*$"),                      # add_sequence 加的流水號
+    re.compile(r"\d{4}[/-]\d{1,2}[/-]\d{1,2}[\s T]+\d{1,2}:\d{2}(:\d{2})?"),
+)
+
+
+def content_key(content: str) -> str:
+    """把內文正規化後取 sha256：剝掉時間戳／流水號、壓平空白。"""
+    text = content or ""
+    for pat in _VOLATILE_PATTERNS:
+        text = pat.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def group_key(group_url: str = "", group_id: str = "") -> str:
+    """社團識別：優先用數字 id（同一社團可能有多種網址寫法）。"""
+    gid = (group_id or "").strip()
+    if gid:
+        return gid
+    m = re.search(r"/groups/(\d+)", group_url or "")
+    if m:
+        return m.group(1)
+    return (group_url or "").strip().rstrip("/")
+
+
+def recently_posted(gkey: str, chash: str, window_days: int = DEFAULT_WINDOW_DAYS) -> datetime.datetime | None:
+    """這個社團在 window_days 內發過這篇文案嗎？發過就回上次發文時間。"""
+    if not gkey or not chash:
+        return None
+    since = datetime.datetime.utcnow() - datetime.timedelta(days=window_days)
+    with SyncSession() as s:
+        return s.execute(
+            select(PostDedup.posted_at)
+            .where(PostDedup.group_key == gkey,
+                   PostDedup.content_hash == chash,
+                   PostDedup.posted_at >= since)
+            .order_by(PostDedup.posted_at.desc())
+        ).scalars().first()
+
+
+def record_post(gkey: str, chash: str, account_id: int | None = None,
+                group_name: str = "") -> None:
+    """記一筆已發送（只在真的發成功時呼叫）。"""
+    if not gkey or not chash:
+        return
+    with SyncSession() as s:
+        s.add(PostDedup(account_id=account_id, group_key=gkey, content_hash=chash,
+                        group_name=group_name))
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=_RETENTION_DAYS)
+        s.execute(delete(PostDedup).where(PostDedup.posted_at < cutoff))
+        s.commit()
+
+
+def last_post_to_group(gkey: str) -> datetime.datetime | None:
+    """這個社團最後一次發文時間（不分文案）。"""
+    if not gkey:
+        return None
+    with SyncSession() as s:
+        return s.execute(
+            select(PostDedup.posted_at)
+            .where(PostDedup.group_key == gkey)
+            .order_by(PostDedup.posted_at.desc())
+        ).scalars().first()
+
+
+def should_skip(group_url: str, content: str, group_id: str = "",
+                window_days: int = DEFAULT_WINDOW_DAYS,
+                min_interval_hours: float = MIN_GROUP_INTERVAL_HOURS) -> tuple[bool, str, str, str]:
+    """發文前的兩道檢查。回 (要不要跳過, 說明, group_key, content_hash)。
+
+    1. 同社團同文案 window_days 天內不重發。
+    2. 同社團**任何**文案至少間隔 min_interval_hours 小時——就算換了文案，
+       短時間內連續灌同一個社團依然是最典型的機器人行為。
+    """
+    gkey = group_key(group_url, group_id)
+    chash = content_key(content)
+    now = datetime.datetime.utcnow()
+
+    last = recently_posted(gkey, chash, window_days)
+    if last is not None:
+        ago_h = int((now - last).total_seconds() // 3600)
+        return True, f"{window_days} 天內已發過同一篇文案（{ago_h} 小時前）", gkey, chash
+
+    if min_interval_hours > 0:
+        last_any = last_post_to_group(gkey)
+        if last_any is not None:
+            elapsed_h = (now - last_any).total_seconds() / 3600
+            if elapsed_h < min_interval_hours:
+                return (True,
+                        f"距上次發文只有 {elapsed_h:.1f} 小時，未達同社團最短間隔"
+                        f" {min_interval_hours} 小時",
+                        gkey, chash)
+
+    return False, "", gkey, chash

@@ -1,0 +1,138 @@
+"""舊便攜包 → 新包的一次性資料遷移（僅限手動指定來源）。
+
+原本會自動搜尋桌面／下載／文件底下的 moyu-* 資料夾，把最新那份的資料搬過來
+（SPEC-P23 §3.2、驗收條件 8）。2026-08-01 決定停用自動搜尋：機器上留有多份
+解壓資料夾時，新包會無聲地把「別份」的帳號、cookie 整批吸進來——測試時每開
+一個新包就被舊資料污染，客戶端也可能搬到不是他要的那一份。
+
+現在只在 MOYU_MIGRATE_FROM 明確指向舊資料夾時才搬。自動搜尋的舊實作見
+git 歷史（commit c94fdf1 起）。
+
+⚠️ 必須在 init_db() **之前**跑。一旦建了空的 fb_poster.db，就分不出「全新安裝」
+   和「還沒搬過來」了。
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+from pathlib import Path
+
+from .config import DATA_DIR, DATA_ROOT
+
+# 這個包自己的根（backend/app/data_migration.py → 包根）。便攜包的目的地就是它。
+PKG_ROOT = Path(__file__).resolve().parents[2]
+
+# 要搬的四處：DB／上傳圖、cookie 與設定、截圖存證、Chrome 個人檔案。
+# 來源相對於舊包根；目的地兩種佈局各一份——安裝版在資料根底下，便攜包就在自己的
+# 包裡（規則見 config.py 與 FB_Auto/src/paths.py，三處必須一致）。
+MOVES = (
+    # (來源, 安裝版目的地／相對資料根, 便攜包目的地／相對新包根)
+    ("backend/data", "backend", "backend/data"),
+    ("FB_Auto/data", "fb_auto/data", "FB_Auto/data"),
+    ("FB_Auto/screenshot", "fb_auto/screenshot", "FB_Auto/screenshot"),
+    ("FB_Auto/user_data", "fb_auto/user_data", "FB_Auto/user_data"),
+)
+# Chrome 個人檔案裡的快取佔了絕大多數體積（實測一個 profile 197MB 裡有 136MB 是
+# Cache + Code Cache），而且它們是瀏覽器自己會重建的東西。搬它們只會讓客戶第一次
+# 啟動多等好幾十秒——健康檢查只等 90 秒，等過頭就變成假的「啟動失敗」。
+# 真正不能少的是 Cookies / Login Data / Local Storage 這些登入狀態。
+CHROME_CACHE_DIRS = {
+    "Cache", "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache",
+    "DawnWebGPUCache", "DawnGraphiteCache", "CacheStorage", "Service Worker",
+    "component_crx_cache", "optimization_guide_prediction_model_downloads",
+}
+SKIP_DIRS = {"logs", "__pycache__", ".update_staging", ".update_backup"} | CHROME_CACHE_DIRS
+SKIP_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}      # 作業系統的垃圾檔
+DB_REL = "backend/data/fb_poster.db"        # 用它認出「這是一個舊包」
+
+
+def find_old_package(explicit: str) -> Path | None:
+    """驗證使用者指定的舊包資料夾（要含 backend/data/fb_poster.db 才算數）。"""
+    if not explicit:
+        return None
+    p = Path(explicit).expanduser()
+    return p if (p / DB_REL).is_file() else None
+
+
+def _copy_tree(src: Path, dst: Path) -> tuple[int, int, list[str]]:
+    """複製而不是搬移：舊資料夾原封不動留著，客戶想反悔還回得去。
+
+    已存在的檔案一律不覆蓋——這只在「新的那邊還沒有資料」時跑，真的撞名
+    表示狀況跟預期不同，保留新的比較安全。
+    """
+    files = total = 0
+    errors: list[str] = []
+    for s in src.rglob("*"):
+        rel = s.relative_to(src)
+        if any(part in SKIP_DIRS for part in rel.parts) or s.name in SKIP_FILES:
+            continue
+        if not s.is_file() or s.is_symlink():
+            continue
+        target = dst / rel
+        if target.exists():
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(s, target)
+            files += 1
+            total += target.stat().st_size
+        except OSError as e:
+            errors.append(f"{rel}: {e}")
+    return files, total, errors
+
+
+def migrate_if_needed() -> dict:
+    """MOYU_MIGRATE_FROM 有指定舊資料夾時，把它的資料（帳號、cookie、物件、授權）
+    搬過來。沒指定就什麼都不做——不再自動搜尋（原因見模組開頭）。
+
+    任何情況都不該讓後端起不來：找不到舊資料、複製失敗、權限不足，一律只記錄。
+    """
+    if (DATA_DIR / "fb_poster.db").is_file():
+        return {"status": "skipped", "reason": "已有資料，不需要遷移"}
+
+    explicit = os.environ.get("MOYU_MIGRATE_FROM", "").strip()
+    if not explicit:
+        return {"status": "disabled",
+                "reason": "自動搬移已停用；要從舊包搬資料請設 MOYU_MIGRATE_FROM 指向舊資料夾"}
+
+    old = find_old_package(explicit)
+    if not old:
+        return {"status": "not_found",
+                "reason": f"MOYU_MIGRATE_FROM 指定的資料夾不含舊資料：{explicit}"}
+
+    files = total = 0
+    errors: list[str] = []
+    for src_rel, root_rel, pkg_rel in MOVES:
+        src = old / src_rel
+        if not src.is_dir():
+            continue
+        dst = (DATA_ROOT / root_rel) if DATA_ROOT else (PKG_ROOT / pkg_rel)
+        f, b, errs = _copy_tree(src, dst)
+        files, total, errors = files + f, total + b, errors + errs
+
+    result = {
+        "status": "migrated" if files else "not_found",
+        "source": str(old),
+        "files": files,
+        "bytes": total,
+        "errors": errors[:10],
+    }
+    if files:
+        # 留一筆給儀表板：客戶必須看得到「資料是從哪裡搬過來的」，
+        # 不然他只會覺得「東西怎麼自己出現了」或「是不是少了什麼」
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            (DATA_DIR / ".migration.json").write_text(
+                json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+    return result
+
+
+def read_state() -> dict | None:
+    try:
+        data = json.loads((DATA_DIR / ".migration.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None

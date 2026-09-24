@@ -1,0 +1,131 @@
+"""自動加好友 API（SPEC-P31）：設定、名單、現在跑一次。
+
+Threads 的設定沿用 P29 的 threads_lead_config（同一份資料、兩個入口），
+這裡把它映射成跟 FB/IG 一樣的欄位形狀，前端一個元件吃三個平台。
+"""
+import datetime
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..database import get_session, FriendConfig, FriendAction, ThreadsLeadConfig
+from ..scheduler import friend_runner as fr
+
+router = APIRouter(prefix="/api/friend", tags=["friend"], redirect_slashes=False)
+
+
+class FriendConfigIn(BaseModel):
+    enabled: bool = False
+    daily_max: int = Field(4, ge=1, le=20)
+    sources: str = ""            # FB/IG：逗號分隔來源；Threads：關鍵字
+    hashtags: str = ""           # IG：hashtag；Threads：地區
+    like_probability: int = Field(20, ge=0, le=100)
+    window_start: str = "10:00"
+    window_end: str = "21:00"
+
+
+def _check_window(*ts: str) -> None:
+    for t in ts:
+        try:
+            h, m = t.split(":")
+            assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+        except Exception:
+            raise HTTPException(422, f"時段格式錯誤：{t}（應為 HH:MM）")
+
+
+def _out(platform: str, cfg, planned: str) -> dict:
+    if platform == "threads":
+        c: ThreadsLeadConfig = cfg
+        return {"platform": "threads", "enabled": bool(c.enabled),
+                "daily_max": max(1, min(fr.HARD_CAP["threads"], c.daily_limit or 10)),
+                "hard_cap": fr.HARD_CAP["threads"], "sources": c.keywords or "",
+                "hashtags": c.region or "", "like_probability": 40,
+                "window_start": c.window_start or "10:00", "window_end": c.window_end or "21:00",
+                "last_run_date": c.last_run_date or "", "today_planned": planned}
+    return {"platform": platform, "enabled": bool(cfg.enabled),
+            "daily_max": fr.effective_max(platform, cfg.daily_max), "hard_cap": fr.HARD_CAP[platform],
+            "sources": fr.clean_sources(platform, cfg.sources), "hashtags": cfg.hashtags or "",
+            "like_probability": cfg.like_probability or 0,
+            "window_start": cfg.window_start or "10:00", "window_end": cfg.window_end or "21:00",
+            "last_run_date": cfg.last_run_date or "", "today_planned": planned}
+
+
+def _platform(p: str) -> str:
+    if p not in fr.PLATFORMS:
+        raise HTTPException(422, "platform 只收 fb / ig / threads")
+    return p
+
+
+async def _threads_cfg(session: AsyncSession) -> ThreadsLeadConfig:
+    c = (await session.execute(select(ThreadsLeadConfig))).scalars().first()
+    if c is None:
+        c = ThreadsLeadConfig()
+        session.add(c)
+        await session.flush()
+    return c
+
+
+@router.get("/config")
+async def get_config(account_id: int, platform: str = "fb", session: AsyncSession = Depends(get_session)):
+    platform = _platform(platform)
+    cfg = await _threads_cfg(session) if platform == "threads" else await fr.get_or_create_config(session, account_id, platform)
+    await session.commit()
+    return _out(platform, cfg, fr.scheduled_time_today(platform))
+
+
+@router.put("/config")
+async def put_config(account_id: int, data: FriendConfigIn, platform: str = "fb",
+                     session: AsyncSession = Depends(get_session)):
+    platform = _platform(platform)
+    _check_window(data.window_start, data.window_end)
+    if platform == "threads":
+        c = await _threads_cfg(session)
+        c.enabled = data.enabled
+        c.daily_limit = max(1, min(fr.HARD_CAP["threads"], data.daily_max))
+        if data.sources.strip():
+            c.keywords = data.sources.strip()
+        c.region = data.hashtags.strip()
+        c.window_start, c.window_end = data.window_start, data.window_end
+        cfg = c
+    else:
+        cfg = await fr.get_or_create_config(session, account_id, platform)
+        cfg.enabled = data.enabled
+        cfg.daily_max = fr.effective_max(platform, data.daily_max)     # 硬上限：設定再大也夾回來
+        cfg.sources = fr.clean_sources(platform, data.sources)
+        cfg.hashtags = data.hashtags.strip()[:300]
+        cfg.like_probability = data.like_probability
+        cfg.window_start, cfg.window_end = data.window_start, data.window_end
+    await session.commit()
+    try:
+        await fr.plan_and_schedule()
+    except Exception as e:
+        print(f"[friend] 重排失敗：{e}", flush=True)
+    return _out(platform, cfg, fr.scheduled_time_today(platform))
+
+
+@router.post("/run")
+async def run_now(account_id: int, platform: str = "fb"):
+    """現在跑一輪（不看開關、不看今天跑過沒；其餘保護照常）。"""
+    platform = _platform(platform)
+    r = await fr.run_friend_once(account_id, platform, force=True)
+    if r.get("skipped"):
+        raise HTTPException(409, r["skipped"])
+    return {"job_id": r["job_id"], "state": "pending"}
+
+
+@router.get("/actions")
+async def list_actions(platform: str = "fb", limit: int = 20, session: AsyncSession = Depends(get_session)):
+    platform = _platform(platform)
+    rows = (await session.execute(
+        select(FriendAction).where(FriendAction.platform == platform)
+        .order_by(FriendAction.created_at.desc()).limit(max(1, min(200, limit))))).scalars().all()
+    today = datetime.date.today()
+    total = len(fr.known_keys(platform))
+    return {"total": total,
+            "items": [{"id": r.id, "key": r.target_key, "name": r.target_name, "url": r.target_url,
+                       "source": r.source, "status": r.status, "liked": bool(r.liked),
+                       "created_at": (r.created_at.replace(tzinfo=datetime.timezone.utc).isoformat()
+                                      if r.created_at else None),
+                       "today": bool(r.created_at and r.created_at.date() == today)} for r in rows]}

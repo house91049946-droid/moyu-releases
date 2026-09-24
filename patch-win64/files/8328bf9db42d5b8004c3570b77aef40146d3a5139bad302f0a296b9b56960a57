@@ -1,0 +1,42 @@
+"""後端跑著的時候不讓電腦閒置睡著（老闆 2026-09-10：要提醒客戶關閉休眠、自動關機）。
+
+排程發文都在半夜或客戶不在電腦前的時候跑，電腦一睡就全停。提醒歸提醒，程式能擋的先擋：
+  - macOS：跟著後端起一個 `caffeinate -i -w <pid>`，後端活著就不會閒置睡眠（蓋上蓋子仍會睡，那要客戶自己設）。
+  - Windows：SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)，效果一樣。
+自動關機、蓋上筆電這些擋不了，新手村頁有說明。
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+_proc = None
+
+
+def start() -> str:
+    """回傳做了什麼（給啟動日誌）。任何失敗都吞掉——這是加分項，不能影響啟動。"""
+    global _proc
+    try:
+        if sys.platform == "darwin":
+            _proc = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return "caffeinate 已啟動，後端跑著就不會閒置睡眠"
+        if os.name == "nt":
+            import ctypes
+            ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+            return "已向 Windows 宣告不要閒置睡眠"
+        return "此平台不處理"
+    except Exception as e:                       # noqa: BLE001
+        return f"擋睡眠失敗（不影響）：{str(e)[:80]}"
+
+
+def stop() -> None:
+    global _proc
+    try:
+        if _proc is not None and _proc.poll() is None:
+            _proc.terminate()
+    except Exception:
+        pass
+    _proc = None

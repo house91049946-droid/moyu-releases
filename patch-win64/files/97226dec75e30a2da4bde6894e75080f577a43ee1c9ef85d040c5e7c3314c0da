@@ -1,0 +1,25 @@
+"""config.json 語言字典載入器。"""
+import json
+
+from src.paths import CONFIG_PATH
+
+_config = None
+_default_lang = "zh"
+
+
+def _load():
+    global _config
+    if _config is None:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            _config = json.load(f)
+    return _config
+
+
+def T(key, lang=None):
+    lang = lang or _default_lang
+    return _load()["translations"][lang][key]
+
+
+def language_name(lang=None):
+    lang = lang or _default_lang
+    return _load()["languages"].get(lang, lang)

@@ -1,0 +1,74 @@
+"""密碼對稱加密（P13）。
+
+DB 的 password 欄位存 `enc:<fernet 密文>`；無前綴一律視為明文（相容既有資料）。
+金鑰來源優先 env FB_SECRET_KEY，否則落地 backend/data/.secret_key（0600）並印警告。
+"""
+import contextlib
+import os
+import stat
+import sys
+
+from cryptography.fernet import Fernet, InvalidToken
+
+from .config import DATA_DIR
+
+_PREFIX = "enc:"
+_KEY_FILE = DATA_DIR / ".secret_key"
+_fernet: Fernet | None = None
+
+
+class DecryptError(Exception):
+    """密文無法解密（金鑰遺失或損壞）。"""
+
+
+def _load_or_create_key() -> bytes:
+    env_key = os.environ.get("FB_SECRET_KEY", "").strip()
+    if env_key:
+        return env_key.encode()
+
+    if _KEY_FILE.exists():
+        return _KEY_FILE.read_bytes().strip()
+
+    key = Fernet.generate_key()
+    _KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _KEY_FILE.write_bytes(key)
+    with contextlib.suppress(OSError):
+        os.chmod(_KEY_FILE, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    print(
+        f"[crypto] 已產生新的加密金鑰於 {_KEY_FILE}（0600）。"
+        f"正式環境請改用環境變數 FB_SECRET_KEY 並妥善保管。",
+        file=sys.stderr,
+    )
+    return key
+
+
+def _get_fernet() -> Fernet:
+    global _fernet
+    if _fernet is None:
+        _fernet = Fernet(_load_or_create_key())
+    return _fernet
+
+
+def encrypt_secret(plain: str) -> str:
+    """加密明文為 `enc:...`。空字串原樣回傳（不加密空密碼）。"""
+    if not plain:
+        return ""
+    token = _get_fernet().encrypt(plain.encode())
+    return _PREFIX + token.decode()
+
+
+def decrypt_secret(stored: str) -> str:
+    """解密。無 `enc:` 前綴視為明文直接回傳（相容遷移）。密文解不開拋 DecryptError。"""
+    if not stored:
+        return ""
+    if not stored.startswith(_PREFIX):
+        return stored  # 明文相容
+    token = stored[len(_PREFIX):].encode()
+    try:
+        return _get_fernet().decrypt(token).decode()
+    except InvalidToken as e:
+        raise DecryptError("密碼無法解密（加密金鑰可能遺失或已更換）") from e
+
+
+def is_encrypted(stored: str) -> bool:
+    return bool(stored) and stored.startswith(_PREFIX)

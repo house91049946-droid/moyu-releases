@@ -1,0 +1,82 @@
+"""測試 CLI — 對已上架商品用「在更多地方上架」把它補刊到指定社團（功能 A 驗證用）。
+
+用法（在 Terminal.app、非 headless 才看得到視窗）：
+  cd FB_Auto
+  # 直接指定社團名稱
+  python -m src.run_list_more_places --fbid 1133957806 \
+      --item-title "測試商品-高級無線藍牙耳機" \
+      --groups "台中市房地產（租、買、賣）自由PO" "🏠台中房地產買賣"
+
+  # 或從已同步社團檔隨機取 N 個來測（比較方便）
+  python -m src.run_list_more_places --fbid 1133957806 \
+      --item-title "測試商品-高級無線藍牙耳機" --from-synced 3
+"""
+import argparse
+import json
+import random
+import sys
+
+from src.utils import launch_browser
+from src.login import _try_cookie_login
+from src.marketplacePost import list_in_more_places
+from src.paths import DATA_DIR
+
+
+def _load_synced_group_names(fbid: str, n: int) -> list[str]:
+    p = DATA_DIR / f"{fbid}.json"
+    if not p.exists():
+        print(f"❌ 找不到已同步社團檔: {p}")
+        return []
+    with open(p, encoding="utf-8") as f:
+        names = list(json.load(f).keys())
+    random.shuffle(names)
+    return names[:n]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="測試『在更多地方上架』流程")
+    parser.add_argument("--fbid", required=True)
+    parser.add_argument("--item-title", required=True, help="要補刊的商品標題（selling 頁上的名稱）")
+    parser.add_argument("--groups", nargs="*", default=[], help="社團名稱（可多個）")
+    parser.add_argument("--from-synced", type=int, default=0, help="改從已同步社團檔隨機取 N 個測")
+    parser.add_argument("--list-only", action="store_true",
+                        help="只開對話框、印出實際可轉發的社團清單，不勾選")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="勾選但不點發佈（安全驗證勾選動作）")
+    parser.add_argument("--headless", action="store_true")
+    args = parser.parse_args()
+
+    groups = list(args.groups)
+    if args.from_synced > 0:
+        groups = _load_synced_group_names(args.fbid, args.from_synced)
+    if not args.list_only and not groups:
+        print("❌ 沒有要測試的社團，請用 --groups 或 --from-synced N（或 --list-only 只看清單）")
+        sys.exit(1)
+
+    print(f"[test] 商品: {args.item_title}")
+
+    browser, context, page = launch_browser(fbid=args.fbid, headless=args.headless)
+    try:
+        if not _try_cookie_login(page, context, args.fbid):
+            print("❌ Cookie 登入失敗（可能過期，先用一鍵登入刷新）")
+            sys.exit(1)
+
+        result = list_in_more_places(page, args.fbid, args.item_title, groups,
+                                     list_only=args.list_only, dry_run=args.dry_run)
+        avail = result.get("available", [])
+        if args.list_only:
+            print(f"\n[test] 『在更多地方上架』對話框實際可轉發社團共 {len(avail)} 個：")
+            for g in avail:
+                print(f"   - {g}")
+        else:
+            print(f"\n[test] 結果: 成功勾選 {result['selected']} 個；可轉發清單 {len(avail)} 個；錯誤: {result['errors']}")
+        print("[test] 截圖存在 FB_Auto/screenshot/ 目錄（lmp_* 開頭），有問題把截圖給我")
+        input("\n按 Enter 關閉瀏覽器...")
+    finally:
+        import contextlib
+        with contextlib.suppress(Exception):
+            context.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,50 @@
+"""清單擷取的實網 smoke test——DOM→文字行那一段只能真的開瀏覽器才驗得到。
+
+預設 skip（會連外網、要開瀏覽器、樂屋網改版就會壞）。要跑：
+
+    cd FB_Auto && RAKUYA_LIVE=1 python3 -m pytest tests/test_import_list_live.py -v -s
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("playwright")
+
+ROOT = Path(__file__).resolve().parents[1]
+
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("RAKUYA_LIVE"),
+    reason="需要外網與瀏覽器；設 RAKUYA_LIVE=1 才跑",
+)
+
+# 任一個樂屋網清單頁。版面改了就換一個。
+SAMPLE = "https://www.rakuya.com.tw/sell/result"
+
+
+def _run(url):
+    out = Path(tempfile.mkdtemp()) / "r.json"
+    subprocess.run(
+        [sys.executable, "-m", "src.run_import_list",
+         "--url", url, "--max-pages", "1", "--max-items", "30",
+         "--result-json", str(out)],
+        cwd=ROOT, check=False, timeout=180,
+    )
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def test_從清單頁抓得到物件而且欄位有內容():
+    r = _run(SAMPLE)
+    assert r["success"], r["error"]
+    items = r["data"]["items"]
+    assert len(items) >= 5
+    assert all(i["url"].startswith("http") for i in items)
+    assert all("rent_item" not in i["url"] for i in items)          # 只收出售
+    assert all("from=" not in i["url"] for i in items)              # 網址已正規化
+    # 版面對得上時，多數卡片該有標題與價格。全空代表 DOM 抽取那段壞了。
+    assert sum(1 for i in items if i["title"]) >= len(items) * 0.8
+    assert sum(1 for i in items if i["price"] > 0) >= len(items) * 0.8

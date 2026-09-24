@@ -1,0 +1,58 @@
+"""對外 HTTPS 的共用設定：憑證信任來源。
+
+為什麼需要這個模組（2026-08-06 Windows 驗收挖出）：
+
+httpx 預設**只信任 certifi 內建的憑證庫**，不看作業系統的憑證存放區。
+企業網路的防毒／DLP／TLS 檢查類軟體會用自己的 CA 把連線重簽一次，
+而那張 CA 只會裝進 **Windows 憑證存放區**——certifi 當然不認得，於是
+所有 httpx 請求一律 `CERTIFICATE_VERIFY_FAILED`。
+
+後果不是單一功能壞掉，是全線失守：授權驗證、心跳、自動更新、AI 文案、
+**連「一鍵回報這個問題」都送不出去**（回報本身也走 HTTPS）。客戶只會說
+「明明有授權卻不能用」，而我們這邊完全查不到原因。
+
+解法：自己建一個 SSL context，**同時**載入作業系統憑證庫與 certifi。
+- Windows：`create_default_context()` 會讀 Windows 憑證存放區（含企業 CA）
+- macOS/Linux：OpenSSL 預設路徑可能是空的，所以再把 certifi 併進來
+兩邊都載入是相加的，不會互斥，任一來源認得就過。
+"""
+import contextlib
+import os
+import ssl
+
+import httpx
+
+_CTX: ssl.SSLContext | None = None
+
+
+def ssl_context() -> ssl.SSLContext:
+    """信任「系統憑證庫 + certifi」的 SSL context（建一次快取起來）。"""
+    global _CTX
+    if _CTX is not None:
+        return _CTX
+    # ⚠️ 一定要在 create_default_context() 之前。TLS 監控軟體會把 SSLKEYLOGFILE
+    # 注入成裝置路徑（\\.\xxx），CPython 會把它交給 OpenSSL fopen，而包內的
+    # OpenSSL 沒有 applink，拿到那種 FILE* 會**直接 abort 整個進程**——不是丟
+    # 例外，try/except 完全攔不到，後端就這樣無聲無息地死掉（2026-08-06 Windows
+    # 實測）。摸魚不需要側錄 TLS 金鑰，拔掉零風險。
+    os.environ.pop("SSLKEYLOGFILE", None)
+    ctx = ssl.create_default_context()          # Windows 上會載入系統憑證存放區
+    with contextlib.suppress(Exception):        # certifi 缺席不該讓整個連線功能死掉
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())
+    _CTX = ctx
+    return ctx
+
+
+def client(timeout: float = 15, **kwargs) -> httpx.Client:
+    """建立 httpx.Client——**對外請求一律走這裡**，不要直接 httpx.Client()。
+
+    呼叫端已明確指定 verify 時（例如刻意關閉驗證）尊重其選擇。
+    """
+    kwargs.setdefault("verify", ssl_context())
+    return httpx.Client(timeout=timeout, **kwargs)
+
+
+def async_client(timeout: float = 15, **kwargs) -> httpx.AsyncClient:
+    kwargs.setdefault("verify", ssl_context())
+    return httpx.AsyncClient(timeout=timeout, **kwargs)

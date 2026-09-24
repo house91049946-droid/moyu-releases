@@ -1,0 +1,150 @@
+"""端到端冒煙驗收（P14）。
+
+預設 skip；需 RUN_E2E=1 才實跑（會開真瀏覽器發文）。
+用既有 cookie 的 fbid 走 bind-fbid 捷徑，避免人工登入卡住無人環境。
+
+用法：
+  # 前提：FB_Auto/data/cookies/<fbid>.json 已存在（用 UI 一鍵登入過）
+  RUN_E2E=1 E2E_FBID=1133957806 E2E_GROUP_URL="https://mbasic.facebook.com/groups/xxxx/" \
+      python -m scripts.e2e_smoke
+
+驗收步驟：
+  1. 全新臨時 DB，建帳號（email+password）。
+  2. bind-fbid（用既有 cookie 的 fbid）→ 帳號 active。
+  3. 建 immediate 發文任務（1 個社團）→ 輪詢至 PostHistory 出現 success 且 post_url 非空。
+  4. 建 cycle 任務 → 斷言 scheduler.get_jobs() 含該 job。
+  5. restore_jobs 後 cycle job 仍在。
+任一步失敗即非零退出。
+"""
+import asyncio
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+PASS, FAIL = "\033[32mPASS\033[0m", "\033[31mFAIL\033[0m"
+
+
+def datetime_now():
+    import datetime
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _check(cond, label):
+    print(f"  [{PASS if cond else FAIL}] {label}")
+    if not cond:
+        raise SystemExit(f"E2E 失敗於：{label}")
+
+
+async def run():
+    fbid = os.environ.get("E2E_FBID", "").strip()
+    group_url = os.environ.get("E2E_GROUP_URL", "").strip()
+    if not fbid or not group_url:
+        raise SystemExit("需要 E2E_FBID 與 E2E_GROUP_URL 環境變數")
+
+    # 臨時 DB
+    tmpdb = tempfile.mktemp(suffix=".db")
+    os.environ["FB_DATABASE_URL"] = f"sqlite+aiosqlite:///{tmpdb}"
+
+    import app.database as db
+    from sqlalchemy import create_engine
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+    from sqlalchemy.orm import sessionmaker
+    db.sync_engine = create_engine(f"sqlite:///{tmpdb}")
+    db.async_engine = create_async_engine(f"sqlite+aiosqlite:///{tmpdb}")
+    db.SyncSession = sessionmaker(db.sync_engine)
+    db.async_session_factory = async_sessionmaker(db.async_engine, class_=AsyncSession, expire_on_commit=False)
+    db.init_db()
+
+    import app.scheduler.task_runner as tr
+    tr.async_session_factory = db.async_session_factory
+    from app.database import Account, PostTask, PostHistory, Article
+    from app.fbauto_bridge import cookie_exists
+    from sqlalchemy import select
+
+    test_content = os.environ.get(
+        "E2E_CONTENT",
+        f"[E2E 測試] 自動化冒煙測試貼文 {datetime_now()}（可刪除）",
+    )
+
+    print("步驟 1：建帳號")
+    async with db.async_session_factory() as s:
+        acc = Account(email="e2e@test.local", password="", status="inactive")
+        s.add(acc)
+        await s.commit()
+        await s.refresh(acc)
+        acc_id = acc.id
+    _check(acc_id is not None, "帳號已建立")
+
+    print("步驟 2：bind-fbid（用既有 cookie）")
+    _check(cookie_exists(fbid), f"cookie 存在: {fbid}")
+    async with db.async_session_factory() as s:
+        acc = (await s.execute(select(Account).where(Account.id == acc_id))).scalar_one()
+        acc.fb_user_id = fbid
+        acc.status = "active"
+        await s.commit()
+
+    print("步驟 3：immediate 發文任務 → 等 PostHistory success")
+    tr.task_scheduler.start()
+    async with db.async_session_factory() as s:
+        art = Article(title="E2E", content=test_content, category="test")
+        s.add(art)
+        await s.commit()
+        await s.refresh(art)
+        task = PostTask(account_id=acc_id, schedule_type="immediate",
+                        target_groups=[{"name": "E2E", "url": group_url}],
+                        groups_per_run=1, sleep_seconds=1, total_count=1,
+                        article_id=art.id, status="pending")
+        s.add(task)
+        await s.commit()
+        await s.refresh(task)
+        task_id = task.id
+    await tr.run_post_task(task_id)  # 直接跑（同 scheduler 觸發）
+
+    async with db.async_session_factory() as s:
+        hist = (await s.execute(select(PostHistory).where(PostHistory.task_id == task_id))).scalars().all()
+    _check(len(hist) >= 1, "PostHistory 有紀錄")
+    ok = [h for h in hist if h.status == "success" and h.post_url]
+    _check(len(ok) >= 1, "至少一筆 success 且 post_url 非空")
+
+    print("步驟 4：cycle 任務 → scheduler 含該 job")
+    import datetime
+    async with db.async_session_factory() as s:
+        ct = PostTask(account_id=acc_id, schedule_type="cycle", cycle_hours=1,
+                      target_groups=[{"name": "E2E", "url": group_url}],
+                      groups_per_run=1, total_count=1,
+                      next_run=datetime.datetime.utcnow() + datetime.timedelta(hours=1),
+                      status="pending")
+        s.add(ct)
+        await s.commit()
+        await s.refresh(ct)
+        cycle_id = ct.id
+    tr.task_scheduler.add_task(await _load(db, cycle_id))
+    job_ids = {j.id for j in tr.task_scheduler._scheduler.get_jobs()}
+    _check(f"task_{cycle_id}" in job_ids, "cycle job 已在 scheduler")
+
+    print("步驟 5：restore_jobs 還原")
+    for j in list(tr.task_scheduler._scheduler.get_jobs()):
+        j.remove()
+    restored = await tr.restore_jobs()
+    job_ids = {j.id for j in tr.task_scheduler._scheduler.get_jobs()}
+    _check(f"task_{cycle_id}" in job_ids, f"重啟後 cycle job 仍在（restored={restored}）")
+
+    tr.task_scheduler.stop()
+    print("\n\033[32m✓ E2E 全部通過\033[0m")
+
+
+async def _load(db, task_id):
+    from app.database import PostTask
+    from sqlalchemy import select
+    async with db.async_session_factory() as s:
+        return (await s.execute(select(PostTask).where(PostTask.id == task_id))).scalar_one()
+
+
+if __name__ == "__main__":
+    if os.environ.get("RUN_E2E") != "1":
+        print("E2E 冒煙測試預設 skip。設 RUN_E2E=1 並提供 E2E_FBID / E2E_GROUP_URL 才實跑。")
+        sys.exit(0)
+    asyncio.run(run())
