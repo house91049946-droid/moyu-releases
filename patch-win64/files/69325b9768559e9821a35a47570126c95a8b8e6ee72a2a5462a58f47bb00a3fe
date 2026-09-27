@@ -1,0 +1,114 @@
+"""手機版案子縮圖（老闆 2026-09-27：「手機版的案子應該要出現照片」）。
+
+照片在客戶電腦上，手機碰不到，所以電腦把每個案子的封面縮成小圖送上雲端。
+
+刻意不用 Pillow：打包的 Python 沒有它，加進依賴會改變 deps_hash，
+等於逼所有客戶重新下載整包（補丁補不了 site-packages）。改用作業系統內建的：
+  - macOS：sips（系統自帶）
+  - Windows：PowerShell 的 System.Drawing（Windows PowerShell 5.1 自帶）
+都失敗時，原圖夠小（≤ 60KB）就直接用原圖，否則這個案子先不顯示照片。
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from .config import DATA_DIR
+
+MAX_PX = 360
+SMALL_ENOUGH = 60 * 1024
+CACHE = DATA_DIR / "thumbs"
+
+
+def cover_path(prop) -> Path | None:
+    """這個案子的封面檔：先看首頁候選，再看圖片池；/uploads/... 對到 DATA_DIR/uploads。"""
+    for rel in list(prop.cover_ids or []) + list(prop.image_pool or []):
+        if not isinstance(rel, str) or not rel:
+            continue
+        fp = (DATA_DIR / "uploads" / rel[len("/uploads/"):]) if rel.startswith("/uploads/") else Path(rel)
+        if fp.is_file():
+            return fp
+    return None
+
+
+def _cache_key(src: Path) -> str:
+    st = src.stat()
+    return hashlib.sha1(f"{src}|{st.st_size}|{int(st.st_mtime)}|{MAX_PX}".encode()).hexdigest()[:16]
+
+
+def _shrink_mac(src: Path, dst: Path) -> bool:
+    r = subprocess.run(["sips", "-Z", str(MAX_PX), "-s", "format", "jpeg",
+                        "-s", "formatOptions", "70", str(src), "--out", str(dst)],
+                       capture_output=True, timeout=30)
+    return r.returncode == 0 and dst.is_file()
+
+
+_PS = r"""
+Add-Type -AssemblyName System.Drawing
+$src = [System.Drawing.Image]::FromFile($args[0])
+$r = [Math]::Min({max} / $src.Width, {max} / $src.Height); if ($r -gt 1) {{ $r = 1 }}
+$w = [int]($src.Width * $r); $h = [int]($src.Height * $r)
+$bmp = New-Object System.Drawing.Bitmap $w, $h
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+$g.DrawImage($src, 0, 0, $w, $h)
+$codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object {{ $_.MimeType -eq 'image/jpeg' }}
+$ep = New-Object System.Drawing.Imaging.EncoderParameters 1
+$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality), 70L
+$bmp.Save($args[1], $codec, $ep)
+$g.Dispose(); $bmp.Dispose(); $src.Dispose()
+""".replace("{max}", str(MAX_PX)).replace("{{", "{").replace("}}", "}")
+
+
+def _shrink_win(src: Path, dst: Path) -> bool:
+    # 用 -File 才拿得到 $args（-Command 會把後面的參數接成字串）
+    script = CACHE / "_shrink.ps1"
+    if not script.is_file():
+        script.write_text(_PS, encoding="utf-8-sig")
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                        str(script), str(src), str(dst)],
+                       capture_output=True, timeout=60, creationflags=flags)
+    return r.returncode == 0 and dst.is_file()
+
+
+def cached(prop) -> tuple[str, bytes] | None:
+    """已經做好的縮圖（不會現做）。同步迴圈先用這個，沒有的再慢慢補。"""
+    src = cover_path(prop)
+    if src is None:
+        return None
+    try:
+        dst = CACHE / f"{_cache_key(src)}.jpg"
+        return (dst.stem, dst.read_bytes()) if dst.is_file() else None
+    except OSError:
+        return None
+
+
+def thumb_bytes(prop) -> tuple[str, bytes] | None:
+    """回傳（hash, JPEG bytes）；做不出來回 None（手機就顯示預設圖）。有快取，不會每 30 秒重做。"""
+    src = cover_path(prop)
+    if src is None:
+        return None
+    try:
+        key = _cache_key(src)
+        CACHE.mkdir(parents=True, exist_ok=True)
+        dst = CACHE / f"{key}.jpg"
+        if not dst.is_file():
+            ok = False
+            try:
+                if sys.platform == "darwin":
+                    ok = _shrink_mac(src, dst)
+                elif os.name == "nt":
+                    ok = _shrink_win(src, dst)
+            except (OSError, subprocess.SubprocessError):
+                ok = False
+            if not ok:
+                if src.stat().st_size <= SMALL_ENOUGH:
+                    return key, src.read_bytes()
+                return None
+        return key, dst.read_bytes()
+    except OSError:
+        return None
