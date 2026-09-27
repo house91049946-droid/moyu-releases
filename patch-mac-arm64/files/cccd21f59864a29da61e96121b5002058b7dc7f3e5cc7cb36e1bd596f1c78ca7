@@ -1,0 +1,34 @@
+"""樂屋已下架的物件（老闆 2026-09-28：「大量抓取物件會一直失敗」）。
+
+實況：用 9/10 存的店家清單在 9/27 匯入，46 筆全部回 HTTP 404——每一頁都寫著「已下架／已成交」。
+那不是被擋、也不是軟體壞，是物件真的沒了。要略過並講清楚，不能算失敗。
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import run_import_batch as rb  # noqa: E402
+
+
+def test_兩邊的前綴一致():
+    from src.run_import_url import DELISTED_PREFIX
+    assert rb.DELISTED_PREFIX == DELISTED_PREFIX
+
+
+def test_辨認下架頁():
+    from src.run_import_url import is_delisted_page
+    assert is_delisted_page("<title>【售屋】台中…</title> … 此物件已下架 …")
+    assert is_delisted_page("…已成交…")
+    assert not is_delisted_page("<title>台中北屯三房</title> 總價 1288 萬")
+
+
+def test_下架算略過不算失敗():
+    def fn(url):
+        if "gone" in url:
+            raise Exception(rb.DELISTED_PREFIX + "這筆在樂屋已下架或成交，略過")
+        return {"title": url}
+    r = rb.batch_import(["a", "gone1", "b", "gone2"], fn, pause=None, backoff=0)
+    assert r["done"] == 2 and r["gone"] == 2 and r["failed"] == 0
+    assert all(i.get("gone") for i in r["items"] if "gone" in i["url"])
+    assert "【已下架】" not in r["items"][1]["error"]          # 顯示給人看的字不帶內部前綴
