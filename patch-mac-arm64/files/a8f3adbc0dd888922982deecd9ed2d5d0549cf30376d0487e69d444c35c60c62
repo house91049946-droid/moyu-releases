@@ -1,0 +1,57 @@
+"""文案防線：不准用屋主／房東的第一人稱賣房（老闆 2026-09-27）。
+
+起因：mini 上實際發出去的 Marketplace 標題是「我想把住了六年的這間平房賣掉」，
+內文「因為工作要調去北部，不得不搬」——這是 AI 被要求寫一版「屋主口吻」時編出來的。
+兩個問題一起：
+  1. 客戶是房仲，貼文卻假裝成屋主自售——文末又附經紀人資訊，自相矛盾，
+     也可能構成不實廣告（跟「自售／非仲介」是同一類問題）。
+  2. 「住了六年、工作調北部」全是捏造的事實，違反數字與事實原封不動的鐵律。
+
+提示詞已經改掉，但 **已經存在客戶資料庫裡的舊版本** 還會被輪到發出去，
+所以發文當下也要過這一關：命中就不用那一版。
+
+經紀人自己的第一人稱（「這間我親自帶看過」「我推薦給小家庭」）不算——那是房仲在講話。
+"""
+from __future__ import annotations
+
+import re
+
+# 只收「屋主／房東在講自己的房子」這種專屬句型；寧可漏抓也不要誤殺正常文案
+_OWNER_PATTERNS = [
+    r"我們?(想|要|打算|決定|準備)把.{0,24}(賣|售|出租|租出)",
+    r"我們?(已經)?住了.{0,6}(年|個月)",
+    r"住了.{0,6}(年|個月).{0,12}(捨不得|要搬|搬走|搬家|不得不)",
+    r"我家|我們家|我的房子|自己的房子|我自己住",
+    r"(因為|由於).{0,14}(工作|調職|調去|換屋|小孩|退休|移民).{0,14}(不得不|只好|所以要|才要).{0,6}(賣|搬|出租)",
+    r"我(這間|的這間|這間房子).{0,8}(整理好了|想租給|希望租給|要租給)",
+    r"屋主自售|屋主直售|自售|自租|非仲介|免仲介費|免服務費",
+]
+_OWNER_RE = re.compile("|".join(f"(?:{p})" for p in _OWNER_PATTERNS))
+
+
+def owner_voice_reason(text: str) -> str:
+    """命中就回那一段文字（給日誌看），沒命中回空字串。"""
+    m = _OWNER_RE.search(text or "")
+    return m.group(0) if m else ""
+
+
+def is_owner_voice(text: str) -> bool:
+    return bool(owner_voice_reason(text))
+
+
+def filter_versions(titles: list, bodies: list) -> tuple[list, list, int]:
+    """把標題或內文是屋主口吻的那幾版剔掉。回傳（標題, 內文, 剔掉幾版）。
+
+    標題與內文是成對的（同一個索引＝同一個角度），所以一起剔。
+    全部都被剔掉時回傳空清單，呼叫端照原本的後備邏輯（改用基底文案）。
+    """
+    titles, bodies = list(titles or []), list(bodies or [])
+    n = min(len(titles), len(bodies))
+    keep_t, keep_b, dropped = [], [], 0
+    for i in range(n):
+        if is_owner_voice(titles[i]) or is_owner_voice(bodies[i]):
+            dropped += 1
+            continue
+        keep_t.append(titles[i])
+        keep_b.append(bodies[i])
+    return keep_t, keep_b, dropped
