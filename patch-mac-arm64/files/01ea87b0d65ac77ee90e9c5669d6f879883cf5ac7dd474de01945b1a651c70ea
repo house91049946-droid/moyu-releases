@@ -1,0 +1,196 @@
+"""手機開關同步（SPEC-P30 v2）：每 30 秒推快照、拿指令、套用、回報。
+
+電腦端唯一的工作。手機碰不到電腦，所有事都經雲端信箱：
+  推：所有物件（兩個頻道）的 id／名稱／開關狀態。
+  拿：手機撥過的開關指令 → 直接改 DB 的 enabled（與 UI 上的開關同一個欄位）。
+  報：下一次同步時把套用結果（成功／找不到物件）帶回去，手機頁才會從
+     「等電腦套用」變成「已套用」。
+
+雲端不可用（斷網、未授權）就安靜跳過，絕不影響本機任何功能。
+"""
+import datetime
+
+from sqlalchemy import select
+
+from ..database import async_session_factory, Property
+
+_applied_buffer: list[dict] = []          # 上次套用的結果，下次同步一起帶上去
+_sent_thumbs: dict[int, str] = {}         # 已送上雲端的縮圖（物件 id → hash），沒變就不重送
+NEW_PER_SYNC = 4                          # 每輪最多現做幾張縮圖（Windows 每張要開一次 PowerShell）
+SEND_PER_SYNC = 8                         # 每輪最多送幾張上雲端，請求不要一次太大
+
+
+def _thumbs_for(rows) -> tuple[dict, dict]:
+    """回傳（每個物件的縮圖 hash, 這一輪要送上去的 {id: (hash, base64)}）。"""
+    import base64
+    from .. import thumbs
+    hashes, outgoing, made = {}, {}, 0
+    for p in rows:
+        t = thumbs.cached(p)
+        if t is None and made < NEW_PER_SYNC:
+            t = thumbs.thumb_bytes(p)
+            made += 1 if t is not None else 0
+        if t is None:
+            continue
+        h, data = t
+        hashes[p.id] = h
+        if _sent_thumbs.get(p.id) != h and len(outgoing) < SEND_PER_SYNC:
+            outgoing[str(p.id)] = (h, base64.b64encode(data).decode())
+    return hashes, outgoing
+_last = {"synced_at": None, "error": "", "commands": 0}
+
+
+def case_items(rows, live_ids=None, delist=None, thumb_hashes=None) -> list[dict]:
+    """手機 v3：一個案子一筆、一個開關，不分平台（老闆 2026-09-27「以案子為主，不用管平台」）。
+
+    live_ids：目前還在 Marketplace 架上的物件 id（None＝不知道，手機就不顯示這欄）。
+    delist：強制下架的進度 {"<id>": {"state", "detail", "at"}}。"""
+    delist = delist or {}
+    out = []
+    for p in rows:
+        d = delist.get(str(p.id)) or {}
+        out.append({
+            "channel": "case", "id": p.id, "name": p.name or "",
+            "enabled": bool(p.enabled) if p.enabled is not None else True,
+            "price": int(p.price or 0), "city": p.city or "",
+            "deal": getattr(p, "deal_type", "") or "",
+            "live_mp": (p.id in live_ids) if live_ids is not None else None,
+            "last_post_at": (p.last_posted_at.isoformat() + "Z") if getattr(p, "last_posted_at", None) else "",
+            "delist": d.get("state", ""), "delist_detail": d.get("detail", ""),
+            "thumb": (thumb_hashes or {}).get(p.id, ""),
+        })
+    return out
+
+
+def _live_ids_or_none():
+    """還在 Marketplace 架上的物件 id；沒有近兩天的「你的商品」快照就回 None——
+    手機上寧可不顯示，也不要把「不知道」顯示成「已下架」。"""
+    try:
+        from ..metrics import latest_rows_sync, live_property_ids_sync, today_taipei
+        d, rows = latest_rows_sync()
+        if not rows:
+            return None
+        if (datetime.date.fromisoformat(today_taipei()) - datetime.date.fromisoformat(d)).days > 2:
+            return None
+        return live_property_ids_sync()
+    except Exception:           # noqa: BLE001
+        return None
+
+
+def stats_sync() -> dict:
+    """即時（今天）與本月的數據，跟電腦首頁同一份曝光表（exposure_daily）。"""
+    try:
+        from ..database import SyncSession, ExposureDaily, TAIPEI
+        from ..exposure import aggregate
+        today = datetime.datetime.now(TAIPEI).strftime("%Y-%m-%d")
+        with SyncSession() as s:
+            rows = s.execute(select(ExposureDaily.date, ExposureDaily.platform, ExposureDaily.posts,
+                                    ExposureDaily.shares, ExposureDaily.mp_posts, ExposureDaily.gp_posts)).all()
+        a = aggregate(rows, today)
+        ch = a["channels"]
+        return {
+            "today": {"posts": a["today"]["posts"], "exposure": a["today"]["exposure"]},
+            "month": {"posts": a["month"]["posts"], "exposure": a["month"]["exposure"],
+                      "mp": ch["mp"]["month"], "gp": ch["gp"]["month"],
+                      "ig": ch["ig"]["month"], "threads": ch["threads"]["month"]},
+            "total_exposure": a["total"]["exposure"],
+        }
+    except Exception:           # noqa: BLE001 — 數據拿不到不該擋住開關同步
+        return {}
+
+
+def snapshot_items(props, listings) -> list[dict]:
+    out = []
+    for p in props:
+        out.append({"channel": "marketplace", "id": p.id, "name": p.name or "",
+                    "enabled": bool(p.enabled) if p.enabled is not None else True,
+                    "price": int(p.price or 0), "city": p.city or ""})
+    for g in listings:
+        out.append({"channel": "group_post", "id": g.id, "name": g.name or "",
+                    "enabled": bool(g.enabled) if g.enabled is not None else True,
+                    "price": 0, "city": ""})
+    return out
+
+
+async def apply_commands(session, commands: list[dict]) -> list[dict]:
+    """把雲端指令套到 DB，回每筆的結果。找不到物件也要回報，手機才知道沒套上。"""
+    results = []
+    for c in commands:
+        # 兩種通道現在都是 Property（gp_listings 已併入，2026-09-06）
+        row = (await session.execute(
+            select(Property).where(Property.id == int(c.get("item_id", 0))))).scalar_one_or_none()
+        if row is None:
+            results.append({"cmd_id": c["cmd_id"], "ok": False, "error": "物件不存在（可能已刪除）"})
+            continue
+        if c.get("channel") == "delist":
+            # 強制下架：先關開關（當下生效），平台上的貼文交給 force_delist 排隊刪
+            row.enabled = False
+            await session.commit()
+            msg = await _start_delist(session, row)
+            results.append({"cmd_id": c["cmd_id"], "ok": True, "error": msg})
+            _log_toggle({**c, "enabled": False}, row.name or "")
+            continue
+        row.enabled = bool(c.get("enabled"))
+        results.append({"cmd_id": c["cmd_id"], "ok": True, "error": ""})
+        _log_toggle(c, row.name or "")
+    await session.commit()
+    return results
+
+
+async def _start_delist(session, row) -> str:
+    from ..database import Account
+    from .. import force_delist
+    acc = None
+    if getattr(row, "account_id", None):
+        acc = (await session.execute(select(Account).where(Account.id == row.account_id))).scalar_one_or_none()
+    if acc is None:
+        acc = (await session.execute(select(Account).order_by(Account.id))).scalars().first()
+    fbid = (acc.fb_user_id if acc else "") or ""
+    import asyncio
+    return await asyncio.to_thread(force_delist.start, row, fbid, acc.id if acc else None)
+
+
+def _log_toggle(c: dict, name: str):
+    """寫一筆執行紀錄：老闆的規則——講清楚「什麼東西」被關／開。"""
+    try:
+        from ..fbauto_bridge import create_run_log_sync, update_run_log_sync, BridgeResult
+        log_id = create_run_log_sync("mobile_toggle")
+        update_run_log_sync(log_id, BridgeResult(success=True, data={"enabled": bool(c.get("enabled")),
+                                                                      "channel": c.get("channel")}),
+                            context={"title": name})
+    except Exception:
+        pass
+
+
+async def sync_once() -> dict:
+    from ..cloud_client import cloud_enabled, mobile_sync, CloudError
+    if not cloud_enabled():
+        return {"skipped": "cloud_disabled"}
+    global _applied_buffer
+    import asyncio
+    async with async_session_factory() as s:
+        rows = (await s.execute(select(Property).order_by(Property.id.desc()))).scalars().all()
+    live = await asyncio.to_thread(_live_ids_or_none)
+    from .. import force_delist
+    hashes, outgoing = await asyncio.to_thread(_thumbs_for, rows)
+    items = case_items(rows, live, force_delist.states(), hashes)
+    stats = await asyncio.to_thread(stats_sync)
+    try:
+        commands = await asyncio.to_thread(mobile_sync, items, list(_applied_buffer), stats, outgoing)
+        _sent_thumbs.update({pid: h for pid, h in ((int(k), v[0]) for k, v in outgoing.items())})
+        _applied_buffer = []
+    except CloudError as e:
+        _last["error"] = str(e)[:120]
+        return {"error": str(e)}
+    if commands:
+        async with async_session_factory() as s:
+            _applied_buffer = await apply_commands(s, commands)
+        print(f"[mobile] 套用手機開關指令 {len(commands)} 筆", flush=True)
+    _last.update(synced_at=datetime.datetime.utcnow(), error="", commands=len(commands))
+    return {"items": len(items), "commands": len(commands)}
+
+
+def status() -> dict:
+    t = _last["synced_at"]
+    return {"synced_at": t.replace(tzinfo=datetime.timezone.utc).isoformat() if t else None,
+            "error": _last["error"], "last_commands": _last["commands"]}
