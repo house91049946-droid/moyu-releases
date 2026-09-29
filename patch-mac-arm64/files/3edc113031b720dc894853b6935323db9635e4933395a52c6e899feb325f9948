@@ -1,0 +1,148 @@
+"""視窗追蹤（老闆 2026-09-29）：客戶回報「整晚一直跳新視窗、開了一整排」，當時的日誌查不出是誰開的。
+
+每 10 分鐘看一次：摸魚開的 Chrome 有幾個、有沒有畫面、開多久、開它的任務（src.run_*）還在不在。
+結果寫進 DATA_DIR/logs/window_watch.log，「回報問題」時一起附上。
+只在狀況改變或可疑時才寫，平常不洗版。
+
+可疑＝
+- 孤兒：Chrome 還開著，但開它的任務已經結束（上層找不到 src.run_ 進程）→ 視窗會一直堆
+- 開太久：同一個 Chrome 超過 LONG_MIN 分鐘
+- 任務跑太久：同一個 src.run_ 超過 LONG_MIN 分鐘
+"""
+from __future__ import annotations
+
+import datetime
+from pathlib import Path
+
+LONG_MIN = 90
+KEEP_LINES = 600
+
+_last_sig: str | None = None
+
+
+def _log_path() -> Path:
+    from .config import DATA_DIR
+    return DATA_DIR / "logs" / "window_watch.log"
+
+
+def _fb_auto_root() -> Path:
+    from .fbauto_bridge import FB_AUTO_DATA_DIR
+    return FB_AUTO_DATA_DIR.parent
+
+
+def _profile_of(cmdline: list[str]) -> str:
+    for a in cmdline:
+        if a.startswith("--user-data-dir="):
+            return a.split("=", 1)[1].strip('"')
+    return ""
+
+
+def _task_of(cmdline: list[str]) -> str:
+    """python -m src.run_xxx → run_xxx；不是任務回空字串。"""
+    for i, a in enumerate(cmdline):
+        if a == "-m" and i + 1 < len(cmdline) and cmdline[i + 1].startswith("src.run_"):
+            return cmdline[i + 1][4:]
+    return ""
+
+
+def summarize(browsers: list[dict], tasks: list[dict], now: float) -> tuple[str, list[str], bool]:
+    """純函式。browsers：{pid, profile, headless, started, task}（task＝上層任務名，空＝孤兒）；
+    tasks：{pid, task, started}。回傳（狀態簽名、要寫的行、是否可疑）。"""
+    lines: list[str] = []
+    suspicious = False
+
+    def age(t):
+        return int((now - t) / 60)
+
+    for b in browsers:
+        kind = "無頭" if b["headless"] else "有畫面"
+        prof = Path(b["profile"]).name or "?"
+        if not b["task"]:
+            suspicious = True
+            lines.append(f"  ⚠ 孤兒 Chrome（開它的任務已結束）pid={b['pid']} {kind} 帳號資料夾={prof} 已開 {age(b['started'])} 分")
+        elif age(b["started"]) >= LONG_MIN:
+            suspicious = True
+            lines.append(f"  ⚠ Chrome 開太久 pid={b['pid']} {kind} 任務={b['task']} 已開 {age(b['started'])} 分")
+        else:
+            lines.append(f"  Chrome pid={b['pid']} {kind} 任務={b['task']} 已開 {age(b['started'])} 分")
+    for t in tasks:
+        if age(t["started"]) >= LONG_MIN:
+            suspicious = True
+            lines.append(f"  ⚠ 任務跑太久 {t['task']} pid={t['pid']} 已跑 {age(t['started'])} 分")
+    visible = sum(1 for b in browsers if not b["headless"])
+    head = (f"Chrome {len(browsers)} 個（有畫面 {visible}）、任務 {len(tasks)} 個"
+            + ("——有可疑狀況" if suspicious else ""))
+    # 簽名只看「有哪些 pid、誰是孤兒」，分鐘數變了不算改變
+    sig = "|".join(sorted(f"b{b['pid']}{'o' if not b['task'] else ''}" for b in browsers)
+                   + sorted(f"t{t['pid']}" for t in tasks))
+    return sig, [head] + lines, suspicious
+
+
+def _scan() -> tuple[list[dict], list[dict]]:
+    import psutil
+    root = str(_fb_auto_root().resolve()).lower()
+    tasks: dict[int, dict] = {}
+    chrome: list[psutil.Process] = []
+    for p in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
+        try:
+            cmd = p.info["cmdline"] or []
+            t = _task_of(cmd)
+            if t:
+                tasks[p.info["pid"]] = {"pid": p.info["pid"], "task": t, "started": p.info["create_time"]}
+                continue
+            if any(a.startswith("--type=") for a in cmd):
+                continue                      # Chrome 的子進程（渲染、GPU…），只看主進程
+            prof = _profile_of(cmd)
+            if prof and str(Path(prof).resolve()).lower().startswith(root):
+                chrome.append(p)
+        except (psutil.Error, OSError, ValueError):
+            continue
+    browsers = []
+    for p in chrome:
+        try:
+            owner = ""
+            for a in p.parents():
+                if a.pid in tasks:
+                    owner = tasks[a.pid]["task"]
+                    break
+            cmd = p.cmdline()
+            browsers.append({"pid": p.pid, "profile": _profile_of(cmd),
+                             "headless": any(a.startswith("--headless") for a in cmd),
+                             "started": p.create_time(), "task": owner})
+        except (psutil.Error, OSError):
+            continue
+    return browsers, list(tasks.values())
+
+
+def _append(lines: list[str]) -> None:
+    f = _log_path()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%m-%d %H:%M")
+    old = f.read_text(encoding="utf-8", errors="replace").splitlines() if f.is_file() else []
+    new = old + [f"[{stamp}] {lines[0]}"] + lines[1:]
+    f.write_text("\n".join(new[-KEEP_LINES:]) + "\n", encoding="utf-8")
+
+
+def check_once() -> None:
+    """排程呼叫。永遠不能自己炸掉。"""
+    global _last_sig
+    try:
+        import time
+        browsers, tasks = _scan()
+        sig, lines, suspicious = summarize(browsers, tasks, time.time())
+        if sig != _last_sig or suspicious:
+            _append(lines)
+            _last_sig = sig
+    except Exception as e:      # noqa: BLE001 — 診斷用
+        try:
+            _append([f"（視窗追蹤失敗：{str(e)[:120]}）"])
+        except Exception:       # noqa: BLE001
+            pass
+
+
+def tail(n: int = 40) -> list[str]:
+    f = _log_path()
+    if not f.is_file():
+        return []
+    return f.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-n:]
+
