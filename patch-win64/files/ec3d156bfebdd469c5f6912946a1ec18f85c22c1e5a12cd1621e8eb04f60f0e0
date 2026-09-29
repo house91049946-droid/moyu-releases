@@ -1,0 +1,88 @@
+"""物件「定時發」（老闆 2026-09-29）：跟「立即發」同一套選項，排到指定時間發一次。
+
+排定的時間存在 properties.scheduled_post_at（UTC），重開機會從資料庫排回去。
+關機錯過了：晚 MISSED_GRACE 以內照發，更久就不發了、記一筆執行紀錄讓客戶知道。
+"""
+from __future__ import annotations
+
+import datetime
+
+from apscheduler.triggers.date import DateTrigger
+from sqlalchemy import select
+
+from ..database import async_session_factory, Property, TAIPEI
+from .task_runner import scheduler
+
+MISSED_GRACE = datetime.timedelta(hours=2)
+
+
+def parse_taipei(s: str) -> datetime.datetime:
+    """"2026-09-30T14:00"（台北時間）→ UTC naive。格式不對丟 ValueError。"""
+    t = datetime.datetime.fromisoformat((s or "").strip())
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=TAIPEI)
+    return t.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+
+def _job_id(prop_id: int) -> str:
+    return f"sched_post_{prop_id}"
+
+
+def schedule_job(prop_id: int, at_utc: datetime.datetime) -> None:
+    scheduler.add_job(func=run_scheduled_post, trigger=DateTrigger(run_date=at_utc.replace(tzinfo=datetime.timezone.utc)),
+                      args=[prop_id], id=_job_id(prop_id), replace_existing=True, misfire_grace_time=int(MISSED_GRACE.total_seconds()))
+
+
+def unschedule_job(prop_id: int) -> None:
+    job = scheduler.get_job(_job_id(prop_id))
+    if job:
+        job.remove()
+
+
+def _log(prop_name: str, ok: bool, msg: str) -> None:
+    from ..fbauto_bridge import create_run_log_sync, update_run_log_sync, BridgeResult
+    log_id = create_run_log_sync("scheduled_post")
+    update_run_log_sync(log_id, BridgeResult(success=ok, error="" if ok else msg),
+                        context={"title": prop_name, "summary": msg})
+
+
+async def run_scheduled_post(prop_id: int) -> None:
+    from fastapi import HTTPException
+    from ..api.properties import start_post, PostNowIn
+    async with async_session_factory() as s:
+        p = (await s.execute(select(Property).where(Property.id == prop_id))).scalar_one_or_none()
+        if not p or not p.scheduled_post_at:
+            return                              # 已取消或物件刪了
+        opts = dict(p.scheduled_post_opts or {})
+        name = p.name or ""
+        p.scheduled_post_at = None              # 先清掉：失敗也不重試，免得同一篇發兩次
+        p.scheduled_post_opts = None
+        await s.commit()
+        try:
+            started = await start_post(s, prop_id, PostNowIn(**opts))
+        except HTTPException as e:
+            _log(name, False, f"定時發〈{name[:30]}〉沒發出去：{e.detail}")
+            return
+    where = "＋".join("Marketplace" if c == "mp" else "社團發文" for c in started)
+    _log(name, True, f"定時發〈{name[:30]}〉已開始：{where}（結果看同時間的發文紀錄）")
+
+
+async def restore_scheduled_posts() -> int:
+    """開機時把還沒發的排回去；錯過太久的清掉並記錄。回傳排回幾個。"""
+    now = datetime.datetime.utcnow()
+    n = 0
+    async with async_session_factory() as s:
+        rows = (await s.execute(select(Property).where(Property.scheduled_post_at.is_not(None)))).scalars().all()
+        for p in rows:
+            at = p.scheduled_post_at
+            if at < now - MISSED_GRACE:
+                local = at.replace(tzinfo=datetime.timezone.utc).astimezone(TAIPEI)
+                p.scheduled_post_at = None
+                p.scheduled_post_opts = None
+                _log(p.name or "", False, f"定時發〈{(p.name or '')[:30]}〉錯過了：排在 {local:%m/%d %H:%M}，"
+                                          f"那時摸魚沒有在跑（電腦關機或睡眠），這次不補發")
+                continue
+            schedule_job(p.id, max(at, now + datetime.timedelta(seconds=30)))
+            n += 1
+        await s.commit()
+    return n
