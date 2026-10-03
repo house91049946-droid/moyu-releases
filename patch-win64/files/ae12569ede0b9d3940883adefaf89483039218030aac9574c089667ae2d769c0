@@ -1,0 +1,34 @@
+"""Windows 不可以執行 chrome.exe --version（會開出客戶自己的 Chrome 新視窗，2026-10-02 回報）。"""
+import subprocess
+
+from src import utils
+
+
+def _fake_chrome(tmp_path, *versions):
+    app = tmp_path / "Google" / "Chrome" / "Application"
+    app.mkdir(parents=True)
+    (app / "chrome.exe").write_text("")
+    for v in versions:
+        (app / v).mkdir()
+    return app
+
+
+def test_windows_reads_version_dir_without_running_chrome(tmp_path, monkeypatch):
+    _fake_chrome(tmp_path, "99.0.1.2", "151.0.7922.76", "SetupMetrics")
+    monkeypatch.setattr(utils, "_IS_WINDOWS", True)
+    monkeypatch.setenv("PROGRAMFILES", str(tmp_path))
+    monkeypatch.delenv("PROGRAMFILES(X86)", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+
+    def boom(*a, **k):
+        raise AssertionError("不可以執行 Chrome")
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert utils.chrome_major_version() == "151"     # 數字比大小，不是字串（"99" > "151"）
+
+
+def test_windows_without_chrome_falls_back_without_running(tmp_path, monkeypatch):
+    monkeypatch.setattr(utils, "_IS_WINDOWS", True)
+    for k in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        monkeypatch.setenv(k, str(tmp_path / "none"))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不可以執行")))
+    assert utils.chrome_major_version() == utils._CHROME_MAJOR_FALLBACK
