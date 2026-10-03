@@ -1,0 +1,17 @@
+"""通知面板的句子不能被當成社團名（2026-10-03 客戶紀錄）。"""
+from src.getclub import _clean_group_name
+
+
+def test_welcome_notice_extracts_group_name():
+    assert _clean_group_name("未讀歡迎加入中部房屋買賣網。你現在可以發佈貼文、留言") == "中部房屋買賣網"
+    assert _clean_group_name("歡迎加入台中房地產論壇區、台中買房、大台中首購。你現在可以發") == "台中房地產論壇區、台中買房、大台中首購"
+
+
+def test_can_post_notice_extracts_group_name():
+    assert _clean_group_name("未讀你現在可以在房屋、土地買賣安心快速成交網中發佈貼文和留言。") == "房屋、土地買賣安心快速成交網"
+
+
+def test_other_notice_dropped_and_normal_names_kept():
+    assert _clean_group_name("未讀王小明分享了一則貼文。3小時") == ""
+    assert _clean_group_name("台中租屋、超急快租❤️") == "台中租屋、超急快租❤️"
+    assert _clean_group_name("大台中房屋買賣討論中心\n上次發文時間：1 小時") == "大台中房屋買賣討論中心"
