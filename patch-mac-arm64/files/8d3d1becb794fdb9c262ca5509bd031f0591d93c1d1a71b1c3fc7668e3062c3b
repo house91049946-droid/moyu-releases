@@ -1,0 +1,28 @@
+"""文字指紋（2026-10-06 Codex 審查）：去重 hash 與標題比對共用的正規化。
+
+「北屯三房，近捷運」「北屯三房,近捷運」「北屯三房｜近捷運」「🏡北屯三房｜2,380萬」
+要被當成同一段字：NFKC（全形→半形）、去零寬字元、去 emoji／裝飾符號、
+拿掉標點與分隔符（｜|,，、/／空白…）、拿掉數字的千分位逗號；小數點保留。
+"""
+from __future__ import annotations
+
+import re
+import unicodedata
+
+_ZERO_WIDTH = re.compile(r"[​-‏⁠-⁤﻿­︀-️]")
+_THOUSANDS = re.compile(r"(?<=\d)[,，](?=\d{3}(?!\d))")
+_DECIMAL = "\x00"
+
+
+def fingerprint(text: str) -> str:
+    t = unicodedata.normalize("NFKC", text or "")
+    t = _ZERO_WIDTH.sub("", t)
+    t = _THOUSANDS.sub("", t)
+    t = re.sub(r"(?<=\d)\.(?=\d)", _DECIMAL, t)          # 38.6 坪的小數點留著
+    out = []
+    for ch in t:
+        cat = unicodedata.category(ch)
+        if cat[0] in ("L", "N") or ch == _DECIMAL:
+            out.append(ch)
+        # 其他：標點（P*）、符號／emoji（S*）、空白（Z*）、控制字元（C*）一律拿掉
+    return "".join(out).replace(_DECIMAL, ".").lower()

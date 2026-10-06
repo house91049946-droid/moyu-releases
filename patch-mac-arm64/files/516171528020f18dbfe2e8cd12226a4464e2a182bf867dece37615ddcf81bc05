@@ -1,0 +1,245 @@
+"""照物件自動挑社團（老闆 2026-09-07：「預設社團可以設定成 AI 辨識，自動選擇適合的群嗎」）。
+
+做法：把物件也用同一套分類器分一次（名稱＋文案＋縣市 → 類別、區域），
+再跟已分類的社團比對打分——同區域最重要，其次是同類型（透天／大樓／預售／中古），
+買賣 vs 租賃對不上就扣分。「非房產」社團一律不選。
+
+不用真的叫 AI：規則分類在 697 個真社團上已經分掉 93%，而且結果可預期、可離線、
+零成本。之後雲端有 /ai/classify 再把「其他」那些補進來即可。
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import functools
+import random
+import re
+import unicodedata
+
+from .group_classify import classify_name, TAG_RULES, REGIONS, has_positive, norm_region
+
+TYPE_TAGS = ("土地", "中古屋", "透天", "大樓", "預售")
+INTENT_TAGS = ("買賣", "租賃")
+
+# 沒有任何線索時：Marketplace 幾乎都是賣，預設當買賣
+_RENT_HINTS = ("出租", "租金", "月租", "押金", "租屋", "招租", "承租", "押二付一", "押一付一", "元/月", "元／月")
+# 全文掃租的線索時（2026-10-06 Codex 審查：租金常寫在第 500 字），賣房也常寫「可出租收租金」，
+# 所以有賣的字樣就不翻成租。
+_RENT_STRONG = ("月租", "押金", "押二付一", "押一付一", "元/月", "元／月", "招租", "承租")
+_SALE_HINTS = ("售價", "總價", "開價", "出售", "售屋", "自售", "急售", "買賣")
+
+
+# 房子的文案幾乎都寫「土地坪數 25 坪」「土地持分 8 坪」——這是在描述房子，不是在賣土地。
+# 2026-10-06 老闆發現客戶的物件全被配到土地社團：就是這幾個詞把房子判成「土地」（設計錯誤）。
+_LAND_MEASURE = re.compile(r"(土地|基地)\s*(坪數|面積|持分|權狀|使用分區|分區)|持分|地坪|基地坪|土地約?\s*\d")
+_BUILDING_HINTS = ("房", "樓", "透天", "大樓", "公寓", "華廈", "電梯", "車位", "屋齡", "店面", "套房", "別墅", "社區", "建物")
+# 「農舍」是建物（住宅型農舍），不是土地（2026-10-06 Codex 審查）
+_LAND_NAME_WORDS = ("土地", "農地", "建地", "工業地", "地主", "素地", "重劃區土地")
+
+
+def _deal_tag(deal_type: str) -> str:
+    return {"sale": "買賣", "rent": "租賃"}.get((deal_type or "").strip().lower(), "")
+
+
+def classify_property(name: str, base_content: str = "", city: str = "", deal_type: str = "") -> dict:
+    """物件 → {'tags': [...], 'region': '台中'}。
+    deal_type（Property.deal_type：sale／rent）跟 city 是結構化欄位，優先於文案猜的（2026-10-06 Codex 審查）。"""
+    full = f"{name or ''}\n{base_content or ''}"
+    text = f"{name or ''}\n{(base_content or '')[:400]}"
+    c = classify_name(_LAND_MEASURE.sub("", text))
+    tags = [t for t in c["tags"] if t not in ("非房產", "其他")]
+    # 是房子（文案有房／樓／透天／屋齡…）而且名稱沒寫土地 → 不算土地物件
+    if "土地" in tags and not any(w in (name or "") for w in _LAND_NAME_WORDS) \
+            and any(h in text for h in _BUILDING_HINTS):
+        tags = [t for t in tags if t != "土地"]
+        if "農舍" in text and not any(t in tags for t in TYPE_TAGS):
+            tags.append("透天")                          # 住宅型農舍當房子
+    # 買賣／租賃：結構化 deal_type 最優先；沒有才看文案（全文找租的線索，有賣的字樣不翻）
+    dt = _deal_tag(deal_type)
+    if dt:
+        tags = [t for t in tags if t not in INTENT_TAGS] + [dt]
+    else:
+        rent = any(has_positive(full, h) for h in _RENT_HINTS)
+        sale = any(has_positive(full, h) for h in _SALE_HINTS)
+        if not any(t in INTENT_TAGS for t in tags):
+            tags.append("租賃" if rent and not sale else "買賣")
+        elif "租賃" in tags and "買賣" not in tags and sale \
+                and not any(has_positive(full, h) for h in _RENT_STRONG):
+            # 「總價 588 萬，目前出租中，租金 1.2 萬」是賣投資套房，不是租件
+            tags = [t for t in tags if t != "租賃"] + ["買賣"]
+    # 區域：結構化 city 最優先（「到台北 40 分鐘」不能蓋掉 city=新北市）；沒有才用文案
+    cn = norm_region(city)
+    region = cn if cn in REGIONS else c["region"]
+    return {"tags": tags, "region": region}
+
+
+def score_group(g_tags: list[str], g_region: str, p_tags: list[str], p_region: str,
+                g_excluded: list[str] | None = None) -> int:
+    """分數 > 0 才算「適合」。g_excluded：社團名稱明講不收的類型（「謝絕土地」），物件是那類就重扣。"""
+    if "非房產" in (g_tags or []):
+        return -100
+    s = 0
+    if set(g_excluded or ()) & set(p_tags or ()):
+        s -= 10                                          # 2026-10-06 Codex 審查：否定語意
+    g_region, p_region = norm_region(g_region), norm_region(p_region)
+    if p_region and g_region:
+        s += 3 if g_region == p_region else -3          # 同區加、異區扣（台中的房不該發到高雄社團）
+    elif p_region and not g_region:
+        s += 1                                           # 全國性／看不出區域的社團：可以，但排後面
+    p_intent = next((t for t in p_tags if t in INTENT_TAGS), "買賣")
+    g_intents = [t for t in (g_tags or []) if t in INTENT_TAGS]
+    if g_intents:
+        s += 2 if p_intent in g_intents else -4          # 賣房的別發到租屋社團：這條要壓過同區域的 +3
+    shared_types = set(TYPE_TAGS) & set(g_tags or []) & set(p_tags)
+    # 類型相符要壓過「泛用買賣」：老闆 2026-09-07 實測土地物件，55 個土地社團跟 202 個
+    # 買賣社團同分，前 40 名被買賣社團擠滿、一個土地社團都沒選到。
+    s += 4 * len(shared_types)                           # 土地對土地、透天對透天、預售對預售
+    g_types = set(TYPE_TAGS) & set(g_tags or [])
+    p_types = set(TYPE_TAGS) & set(p_tags)
+    if g_types and not shared_types and p_types:
+        s -= 2                                           # 社團專講大樓、物件是土地：不對
+    if p_types and not g_types and "土地" in p_types:
+        s -= 1                                           # 土地物件：泛用住宅買賣社團排後面一點
+    if "土地" in g_types and "土地" not in p_types:
+        s -= 3                                           # 房子別發到土地社團（2026-10-06：房子被配滿土地社團）
+    if not g_types and not g_intents and "其他" in (g_tags or []):
+        s += 0                                           # 泛用房產社團：靠區域決定
+    return s
+
+
+@functools.lru_cache(maxsize=8192)
+def _name_excluded(group_name: str) -> tuple[str, ...]:
+    return tuple(classify_name(group_name).get("excluded") or ())
+
+
+def pick_groups(groups: list[dict], name: str, base_content: str = "", city: str = "",
+                limit: int = 40, mp_only: bool = False, deal_type: str = "", today: _dt.date | None = None) -> dict:
+    """groups: [{'group_name','tags','region','can_post'}, ...]。
+    回 {'tags','region','groups':[names 依分數高→低], 'scored':[(name,score)]}。
+    一個都配不上就回空清單，讓呼叫端決定要不要退回「全部可轉發」。
+    同分的不照名稱排（2026-10-06 Codex 審查：名稱排前面的永遠吃滿名額），
+    用「物件名＋日期」當種子洗牌：同一天結果固定、每天輪替。"""
+    p = classify_property(name, base_content, city, deal_type)
+    facts = property_facts(name, base_content, city, deal_type)
+    cands = [g for g in groups if (g.get("can_post") or not mp_only)
+             and not g.get("post_blocked") and not group_unfit_reason(g.get("rules"), facts)]
+    scored = []
+    for g in cands:
+        gn = g.get("group_name") or ""
+        excluded = g.get("excluded")
+        if excluded is None:
+            excluded = _name_excluded(gn)
+        g_tags = [t for t in (g.get("tags") or []) if t not in excluded]   # 舊分類把「謝絕土地」標成土地的也扣掉
+        sc = score_group(g_tags, g.get("region") or "", p["tags"], p["region"], excluded)
+        if sc > 0:
+            scored.append((gn, sc))
+    rng = random.Random(f"{name}|{(today or _dt.date.today()).isoformat()}")
+    tie = {n: rng.random() for n, _ in sorted(scored)}
+    scored.sort(key=lambda x: (-x[1], tie[x[0]]))
+    return {"tags": p["tags"], "region": p["region"],
+            "groups": [n for n, _ in scored[:limit]], "scored": scored[:limit]}
+
+
+
+# ─── 社團規則 vs 物件（老闆 2026-09-15：AI 讀社團規則，發之前先比，減少被拒絕） ───
+
+_AGE_RES = (re.compile(r"屋齡\s*[:：]?\s*約?\s*(\d+(?:\.\d+)?)\s*年"), re.compile(r"(\d+(?:\.\d+)?)\s*年\s*(?:屋齡|老屋|新古屋)"))
+# 2026-10-06 Codex 審查：「民國98年完工」「2018年落成」「屋齡約十年」也要認得
+_AGE_CN = re.compile(r"屋齡\s*[:：]?\s*約?\s*([一二兩三四五六七八九十]{1,3})\s*年")
+_AGE_ROC = re.compile(r"民國\s*(\d{2,3})\s*年[^，,。\n]{0,8}?(?:完工|落成|建成|竣工|興建|使照|使用執照)")
+_AGE_AD = re.compile(r"(?:西元\s*)?((?:19|20)\d{2})\s*年?[^，,。\n\d]{0,6}?(?:完工|落成|建成|竣工)")
+_CN_DIGIT = {"一": 1, "二": 2, "兩": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_TYPE_WORDS = {"預售": ("預售",), "套房": ("套房", "雅房"),
+               "店面": ("店面", "店住"), "廠房": ("廠房", "廠辦"), "車位": ("車位出售", "車位出租", "售車位", "租車位")}
+# 「土地」改由 classify_property 判（它會扣掉「土地持分／土地坪數」這種描述房子的詞；2026-10-06 Codex 審查）
+
+
+def _cn_num(s: str) -> int | None:
+    """一～九十九的中文數字。"""
+    if not s:
+        return None
+    if "十" in s:
+        a, _, b = s.partition("十")
+        tens = _CN_DIGIT.get(a, 0) if a else 1
+        ones = _CN_DIGIT.get(b, 0) if b else 0
+        if (a and a not in _CN_DIGIT) or (b and b not in _CN_DIGIT):
+            return None
+        return tens * 10 + ones
+    return _CN_DIGIT.get(s) if len(s) == 1 else None
+
+
+def parse_age(text: str, year: int | None = None) -> float | None:
+    """文案 → 屋齡（年）。認不出回 None。預售／未完工的算 0。"""
+    t = unicodedata.normalize("NFKC", text or "")
+    year = year or _dt.date.today().year
+    for rx in _AGE_RES:
+        m = rx.search(t)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return None
+    m = _AGE_CN.search(t)
+    if m and _cn_num(m.group(1)) is not None:
+        return float(_cn_num(m.group(1)))
+    m = _AGE_ROC.search(t)
+    if m:
+        return float(max(0, year - 1911 - int(m.group(1))))
+    m = _AGE_AD.search(t)
+    if m:
+        return float(max(0, year - int(m.group(1))))
+    return None
+
+
+def property_facts(name: str, base_content: str = "", city: str = "", deal_type: str = "") -> dict:
+    """物件要跟社團規則比的事實：區域、買賣／出租、屋齡、特殊類型。"""
+    text = f"{name or ''}\n{base_content or ''}"
+    p = classify_property(name, base_content, city, deal_type)
+    age = parse_age(text)
+    # 「非預售屋」「不是套房」不算（2026-10-06 Codex 審查）
+    types = {t for t, kws in _TYPE_WORDS.items() if any(has_positive(text, k) for k in kws)}
+    if "土地" in p["tags"]:
+        types.add("土地")
+    deal = deal_type if deal_type in ("sale", "rent") else ("rent" if "租賃" in p["tags"] and "買賣" not in p["tags"] else "sale")
+    # has_age_text：有解析出屋齡數字才算（「屋齡資料待確認」不算）
+    return {"region": p["region"], "deal": deal, "age": age, "types": types, "has_age_text": age is not None}
+
+
+def group_unfit_reason(rules: dict | None, facts: dict) -> str:
+    """AI 讀出的社團規則跟這個物件衝突就回原因（人話），沒衝突回空字串。沒讀過規則＝不擋。"""
+    r = rules or {}
+    if not r:
+        return ""
+    if r.get("real_estate") is False:
+        return "不是房地產社團"
+    if r.get("agent_allowed") is False:
+        return "社團禁止仲介"
+    if r.get("ads_allowed") is False:
+        return "社團禁止發物件"
+    if r.get("deal") == "sale" and facts.get("deal") == "rent":
+        return "社團只收買賣"
+    if r.get("deal") == "rent" and facts.get("deal") == "sale":
+        return "社團只收出租"
+    ro = norm_region(r.get("region_only") or "")          # 「臺中」「台中市」都當台中（2026-10-06 Codex 審查）
+    if ro and facts.get("region") and norm_region(facts["region"]) != ro:
+        return f"社團只收{ro}的物件"
+    mx = r.get("max_age_years")
+    if mx and facts.get("age") is not None and facts["age"] > mx:
+        return f"社團限屋齡 {mx} 年內"
+    bad = set(r.get("excluded_types") or []) & set(facts.get("types") or set())
+    if bad:
+        return f"社團不收{'、'.join(sorted(bad))}"
+    if "屋齡" in (r.get("required") or []) and facts.get("age") is None and "土地" not in (facts.get("types") or set()):
+        return "社團規定要寫屋齡，文案沒寫"
+    return ""
+
+
+def filter_by_rules(names: list[str], rules_by_name: dict[str, dict], facts: dict) -> tuple[list[str], dict[str, str]]:
+    """純函式：把規則不合的社團拿掉。回 (留下的名單, {被拿掉的名稱: 原因})。"""
+    keep, dropped = [], {}
+    for n in names:
+        why = group_unfit_reason(rules_by_name.get(n), facts)
+        if why:
+            dropped[n] = why
+        else:
+            keep.append(n)
+    return keep, dropped
