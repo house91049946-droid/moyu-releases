@@ -1,0 +1,148 @@
+"""物件跟著社團自動更新（老闆 2026-10-06：「要，而且應該要呈現所有物件自適應」）。
+
+以前每個物件建立時勾一份固定社團名單，之後新加入的社團永遠不會用到。
+現在發文前照 group_mode 現算要發去哪：
+  fixed  ＝ 存的那份名單（扣掉已停發的）
+  preset ＝ 跟著某個群組（群組被刪就退回 auto）
+  auto   ＝ 用「自動選社團」同一套打分（group_match.pick_groups），從帳號現在的社團挑；
+           配到太少（< 5）就先補同區域的房產社團、再補其他房產社團。
+存的 target_groups／gp_target_groups 不動，切回 fixed 還是原本勾的。
+"""
+from __future__ import annotations
+
+from .group_match import pick_groups, classify_property
+
+MODES = ("auto", "fixed", "preset")
+MP_DEFAULT_CAP = 20     # Marketplace 轉發：沒設 groups_per_listing 時
+GP_CAP = 30             # 社團發文：一輪最多幾個
+MIN_SCORED = 5          # 打分配到的少於這個數就補位
+
+
+def _is_real_estate(g: dict) -> bool:
+    return "非房產" not in (g.get("tags") or [])
+
+
+def _pad(picked: list[str], groups: list[dict], region: str, blocked: set[str],
+         mp_only: bool, cap: int) -> list[str]:
+    """配到的太少就補位：先同區域的房產社團，再任何房產社團。可轉發限制與停發名單照樣算。"""
+    if len(picked) >= MIN_SCORED:
+        return picked[:cap]
+    out = list(picked)
+    have = set(out)
+    pool = [g for g in groups if _is_real_estate(g) and not g.get("post_blocked")
+            and (g.get("can_post") or not mp_only)
+            and g.get("group_name") and g["group_name"] not in blocked and g["group_name"] not in have]
+    same = [g["group_name"] for g in pool if region and (g.get("region") or "") == region]
+    rest = [g["group_name"] for g in pool if g["group_name"] not in same]
+    for n in same + rest:
+        if len(out) >= cap:
+            break
+        out.append(n)
+    return out[:cap]
+
+
+def _auto(prop: dict, groups: list[dict], blocked: set[str], mp_only: bool, cap: int) -> list[str]:
+    name, base, city = prop.get("name") or "", prop.get("base_content") or "", prop.get("city") or ""
+    r = pick_groups(groups, name, base, city, limit=cap, mp_only=mp_only)
+    picked = [n for n in r["groups"] if n not in blocked]
+    region = r.get("region") or classify_property(name, base, city)["region"]
+    return _pad(picked, groups, region, blocked, mp_only, cap)
+
+
+def _preset_names(presets: dict, channel: str, pid) -> list[str] | None:
+    """群組的名單；群組不存在（被刪、沒設）回 None 讓呼叫端退回 auto。"""
+    if pid is None:
+        return None
+    names = (presets.get(channel) or {}).get(int(pid))
+    return None if names is None else list(names)
+
+
+def resolve_targets(prop: dict, groups: list[dict], presets: dict, blocked: set[str]) -> tuple[list[str], list[str]]:
+    """純函式。prop：{name, base_content, city, group_mode, follow_preset_id, follow_gp_preset_id,
+    target_groups, gp_target_groups, groups_per_listing}；groups：帳號的社團
+    [{group_name, tags, region, can_post, post_blocked, rules}]；presets：{"mp": {id: [names]}, "gp": {id: [names]}}；
+    blocked：已停發的社團名稱。回 (Marketplace 轉發名單, 社團發文名單)。"""
+    mode = prop.get("group_mode") or "auto"
+    if mode not in MODES:
+        mode = "auto"
+    blocked = set(blocked or ())
+    cap_mp = int(prop.get("groups_per_listing") or MP_DEFAULT_CAP)
+    if cap_mp < 1:
+        cap_mp = MP_DEFAULT_CAP
+
+    if mode == "fixed":
+        mp = [n for n in (prop.get("target_groups") or []) if n not in blocked]
+        gp = [n for n in (prop.get("gp_target_groups") or []) if n not in blocked]
+        return mp, gp
+
+    mp = gp = None
+    if mode == "preset":
+        can_post = {g["group_name"] for g in groups if g.get("can_post") and not g.get("post_blocked")}
+        names = _preset_names(presets, "mp", prop.get("follow_preset_id"))
+        if names is not None:
+            mp = [n for n in names if n in can_post and n not in blocked]
+        names = _preset_names(presets, "gp", prop.get("follow_gp_preset_id"))
+        if names is not None:
+            gp = [n for n in names if n not in blocked]
+    # auto，或 preset 但群組不在了 → 照物件自動挑
+    if mp is None:
+        mp = _auto(prop, groups, blocked, mp_only=True, cap=cap_mp)
+    if gp is None:
+        gp = _auto(prop, groups, blocked, mp_only=False, cap=GP_CAP)
+    return mp, gp
+
+
+# ─── 跟資料庫接的部分 ───────────────────────────────────
+
+def prop_dict(p) -> dict:
+    """Property ORM → resolve_targets 要的 dict。"""
+    return {
+        "name": p.name or "", "base_content": p.base_content or "", "city": p.city or "",
+        "group_mode": getattr(p, "group_mode", None) or "auto",
+        "follow_preset_id": getattr(p, "follow_preset_id", None),
+        "follow_gp_preset_id": getattr(p, "follow_gp_preset_id", None),
+        "target_groups": list(p.target_groups or []), "gp_target_groups": list(p.gp_target_groups or []),
+        "groups_per_listing": p.groups_per_listing or MP_DEFAULT_CAP,
+    }
+
+
+def resolver_context_sync(account_id: int) -> tuple[list[dict], dict, set[str]]:
+    """一次把帳號的社團、兩種群組、停發名單讀出來（列表頁一個請求只讀一次，不是每個物件讀一次）。"""
+    from sqlalchemy import select
+    from .database import SyncSession, Group, GroupPreset, GpGroupPreset
+    with SyncSession() as s:
+        rows = s.execute(select(Group).where(Group.account_id == account_id)).scalars().all()
+        groups = [{"group_name": g.group_name, "tags": list(g.tags or []), "region": g.region or "",
+                   "can_post": bool(g.can_post), "rules": g.ai_rules, "post_blocked": bool(g.post_blocked)}
+                  for g in rows]
+        presets = {
+            "mp": {r.id: list(r.group_names or []) for r in s.execute(select(GroupPreset)).scalars().all()},
+            "gp": {r.id: list(r.group_names or []) for r in s.execute(select(GpGroupPreset)).scalars().all()},
+        }
+    blocked = {g["group_name"] for g in groups if g["post_blocked"]}
+    return groups, presets, blocked
+
+
+def resolve_targets_sync(prop_id: int) -> tuple[list[str], list[str]]:
+    """讀物件＋帳號社團＋群組＋停發名單，算這間房現在該發去哪。物件不存在回 ([], [])。"""
+    from sqlalchemy import select
+    from .database import SyncSession, Property
+    with SyncSession() as s:
+        p = s.execute(select(Property).where(Property.id == prop_id)).scalar_one_or_none()
+        if p is None:
+            return [], []
+        d, account_id = prop_dict(p), p.account_id
+    groups, presets, blocked = resolver_context_sync(account_id)
+    return resolve_targets(d, groups, presets, blocked)
+
+
+def resolved_counts_sync(props) -> dict[int, dict]:
+    """列表頁用：{物件id: {"mp": n, "gp": n}}。同帳號的社團／群組只讀一次。"""
+    ctx: dict[int, tuple] = {}
+    out: dict[int, dict] = {}
+    for p in props:
+        if p.account_id not in ctx:
+            ctx[p.account_id] = resolver_context_sync(p.account_id)
+        mp, gp = resolve_targets(prop_dict(p), *ctx[p.account_id])
+        out[p.id] = {"mp": len(mp), "gp": len(gp)}
+    return out
