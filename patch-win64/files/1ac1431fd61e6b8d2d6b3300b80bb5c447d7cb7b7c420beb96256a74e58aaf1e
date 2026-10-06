@@ -1,0 +1,93 @@
+"""每日維護（2026-10-06 審查）：只做資料庫與檔案的清理，不開瀏覽器。每天 04:10（台北）跑。
+
+- run_logs 超過 90 天的刪掉（執行紀錄頁與曝光統計都不靠它了：曝光已累計在 exposure_daily）
+- logs/*.log（CLI 日誌）與 FB_Auto 的截圖超過 30 天的刪掉
+- backend.log／frontend.log 超過 20MB 就只留尾端 2MB
+"""
+from __future__ import annotations
+
+import contextlib
+import datetime
+import time
+from pathlib import Path
+
+RUNLOG_KEEP_DAYS = 90
+FILE_KEEP_DAYS = 30
+SERVICE_LOG_MAX_BYTES = 20 * 1024 * 1024
+SERVICE_LOG_TAIL_BYTES = 2 * 1024 * 1024
+
+
+def purge_run_logs(days: int = RUNLOG_KEEP_DAYS) -> int:
+    from sqlalchemy import delete
+    from .database import SyncSession, RunLog
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+    with SyncSession() as s:
+        n = s.execute(delete(RunLog).where(RunLog.created_at < cutoff)).rowcount or 0
+        s.commit()
+    return int(n)
+
+
+def purge_old_files(dirs: list[Path], days: int = FILE_KEEP_DAYS, suffixes: tuple[str, ...] = (), now: float | None = None) -> int:
+    """刪 dirs 底下（含子目錄）修改時間超過 days 天、副檔名在 suffixes（空＝不限）裡的檔。回傳刪了幾個。"""
+    cutoff = (now or time.time()) - days * 86400
+    n = 0
+    for d in dirs:
+        if not d or not d.is_dir():
+            continue
+        for p in d.rglob("*"):
+            try:
+                if not p.is_file():
+                    continue
+                if suffixes and p.suffix.lower() not in suffixes:
+                    continue
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    n += 1
+            except OSError:
+                continue
+    return n
+
+
+def truncate_big_logs(files: list[Path], max_bytes: int = SERVICE_LOG_MAX_BYTES, keep_tail: int = SERVICE_LOG_TAIL_BYTES) -> int:
+    """超過 max_bytes 的日誌只留尾端 keep_tail。Windows 上檔案可能被啟動器開著，失敗就算了。回傳處理了幾個。"""
+    n = 0
+    for f in files:
+        try:
+            if not f.is_file() or f.stat().st_size <= max_bytes:
+                continue
+            with open(f, "rb") as fh:
+                fh.seek(-keep_tail, 2)
+                tail = fh.read()
+            nl = tail.find(b"\n")
+            if 0 <= nl < len(tail) - 1:
+                tail = tail[nl + 1:]            # 從完整的一行開始
+            with open(f, "wb") as fh:
+                fh.write(f"（{datetime.datetime.now():%Y-%m-%d %H:%M} 日誌超過 {max_bytes // 1024 // 1024}MB，只留尾端）\n".encode("utf-8"))
+                fh.write(tail)
+            n += 1
+        except OSError:
+            continue
+    return n
+
+
+def run_daily_maintenance() -> dict:
+    """排程入口（同步；APScheduler 會丟到執行緒）。任何一段失敗都不影響其他段。"""
+    out = {"run_logs": 0, "files": 0, "truncated": 0}
+    with contextlib.suppress(Exception):
+        out["run_logs"] = purge_run_logs()
+    try:
+        from .config import DATA_DIR
+        from .fbauto_bridge import FB_AUTO_DATA_DIR, automation_root
+        out["files"] = purge_old_files([DATA_DIR / "logs"], suffixes=(".log",))
+        out["files"] += purge_old_files([automation_root() / "screenshot", FB_AUTO_DATA_DIR / "debug"],
+                                        suffixes=(".png", ".jpg", ".jpeg"))
+    except Exception as e:                       # noqa: BLE001
+        print(f"[maintenance] 清檔失敗：{e}", flush=True)
+    try:
+        from .api.troubleshoot import SERVICE_LOG_DIRS
+        files = [d / name for d in SERVICE_LOG_DIRS for name in ("backend.log", "frontend.log")]
+        out["truncated"] = truncate_big_logs(files)
+    except Exception as e:                       # noqa: BLE001
+        print(f"[maintenance] 截日誌失敗：{e}", flush=True)
+    print(f"[maintenance] 清掉 {out['run_logs']} 筆舊執行紀錄、{out['files']} 個舊檔，截短 {out['truncated']} 個日誌", flush=True)
+    return out

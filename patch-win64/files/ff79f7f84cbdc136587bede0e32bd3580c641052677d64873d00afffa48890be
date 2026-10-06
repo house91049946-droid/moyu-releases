@@ -1,0 +1,62 @@
+"""每日隨機時間的排程（2026-10-06 審查）。
+
+原本清刊登 03:30、刪文 03:20／03:40／04:00、成效 05:10、社團規則 06:10、通知 06:50、
+Meta 登入檢查 07:30 全部寫死：每個客戶的帳號都在同一分鐘對 FB 做同一件事，
+平台一眼就能把這些帳號串成同一套工具。改成每天 00:0x 在時段內抽一個隨機時刻
+（分、秒都隨機），每台機器、每天都不一樣；半夜電腦睡著錯過 00:0x 的話，
+沿用 task_runner 的 register_daily_replan／catch_up 機制補排。
+"""
+from __future__ import annotations
+
+import datetime
+import random
+
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+
+from ..database import TAIPEI, now_taipei
+from .task_runner import scheduler, register_daily_replan, mark_planned
+
+WINDOW_CLEANUP = (9, 22)      # 清刊登／刪舊文：白天就好，不必擠在凌晨
+WINDOW_DEFAULT = (8, 21)      # 成效、規則、通知、登入檢查
+_rng = random.Random()        # 不給種子：每台機器、每次啟動都不同
+
+
+def pick_time(window: tuple[int, int], now: datetime.datetime,
+              rng: random.Random | None = None, min_lead_sec: int = 120) -> datetime.datetime | None:
+    """今天在 window（小時，[start, end)）內抽一個時刻，分秒皆隨機。
+    已經過了視窗回 None；現在就在視窗裡則從 now+min_lead 之後抽。"""
+    rng = rng or _rng
+    start = now.replace(hour=window[0], minute=0, second=0, microsecond=0)
+    end = now.replace(hour=window[1], minute=0, second=0, microsecond=0)
+    lo = max(start, now + datetime.timedelta(seconds=min_lead_sec))
+    if lo >= end:
+        return None
+    return lo + datetime.timedelta(seconds=rng.uniform(0, (end - lo).total_seconds()))
+
+
+def replan_minute(kind: str) -> int:
+    """00:02–00:07 之間，照名稱固定一個分鐘（要在 task_runner 的 00:10 補排門檻之前）。"""
+    return 2 + sum(map(ord, kind)) % 6
+
+
+def register_random_daily(kind: str, func, window: tuple[int, int], args: list | None = None,
+                          sched=None) -> datetime.datetime | None:
+    """替 func 註冊「每天在 window 內隨機一個時刻跑一次」。回今天排到的時間（已過視窗回 None）。"""
+    target = sched if sched is not None else scheduler
+
+    def _plan():
+        mark_planned(kind)
+        t = pick_time(window, now_taipei())
+        if t is None:
+            print(f"[{kind}] 今天的時段已過，明天再排", flush=True)
+            return None
+        target.add_job(func=func, trigger=DateTrigger(run_date=t), args=list(args or []),
+                       id=f"{kind}_today", replace_existing=True)
+        print(f"[{kind}] 今天排在 {t:%H:%M:%S}", flush=True)
+        return t
+
+    target.add_job(func=_plan, trigger=CronTrigger(hour=0, minute=replan_minute(kind), timezone=TAIPEI),
+                   id=f"{kind}_replan", replace_existing=True)
+    register_daily_replan(kind, _plan)
+    return _plan()

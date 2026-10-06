@@ -1,0 +1,124 @@
+"""強制下架一個案子（老闆 2026-09-27：手機一按就全平台撤掉）。
+
+一按下去做三件事，順序固定：
+  1. 關掉這個案子的發文開關——排程從此不再碰它（當下就生效，不必等瀏覽器）。
+  2. 刪 Marketplace 上這個案子的刊登（只刪標題對得上、而且是本工具上架過的）。
+  3. 刪社團裡這個案子的貼文（用這個案子的標題當比對字串，只刪摸魚發過的）。
+
+2、3 都要開瀏覽器，走 start_long_op 排隊（同帳號瀏覽器互斥）；2 做完才接 3。
+進度寫在 DATA_DIR/.force_delist.json，手機頁拿去顯示「下架中／已下架／失敗」。
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import tempfile
+
+from .config import DATA_DIR
+
+STATE_FILE = DATA_DIR / ".force_delist.json"
+MIN_PHRASE = 8          # 太短的標題拿去比對社團貼文容易誤刪，不用
+
+
+def _load() -> dict:
+    try:
+        d = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+
+
+def _save(d: dict) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def set_state(prop_id: int, state: str, detail: str = "") -> None:
+    d = _load()
+    d[str(prop_id)] = {"state": state, "detail": detail[:200],
+                       "at": datetime.datetime.utcnow().isoformat() + "Z"}
+    _save(d)
+
+
+def states() -> dict:
+    return _load()
+
+
+def case_titles(prop) -> list[str]:
+    """這個案子發出去可能用過的標題：所有 AI 版本＋物件名稱，去重、去空白。"""
+    seen, out = set(), []
+    for t in list(prop.titles or []) + [prop.name or ""]:
+        t = (t or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _tmp_json(payload) -> str:
+    fd, path = tempfile.mkstemp(prefix="force_delist_", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return path
+
+
+def start(prop, fbid: str, account_id: int | None) -> str:
+    """開始下架（開關已由呼叫端關掉）。回傳給手機看的一句話。"""
+    from .fbauto_bridge import start_long_op, wait_profile_free_blocking
+    titles = case_titles(prop)
+    if not titles:
+        set_state(prop.id, "done", "這個案子沒有發過的標題，只關掉了發文開關")
+        return "已關閉發文（沒有找到發過的刊登）"
+    if not fbid:
+        set_state(prop.id, "failed", "帳號沒有綁定 FB，無法下架平台上的貼文（發文已關閉）")
+        return "已關閉發文；平台上的貼文要到電腦上處理"
+
+    set_state(prop.id, "running", "正在刪 Marketplace 刊登")
+    titles_file = _tmp_json(titles)
+    phrases = [t for t in titles if len(t) >= MIN_PHRASE]
+    only_file = _tmp_json({"urls": [], "phrases": phrases, "max_age_days": 0})
+    pid = prop.id
+
+    def _after_groups(result):
+        data = result.data or {}
+        n = sum(1 for p in (data.get("posts") or []) if p.get("status") == "deleted")
+        if result.success:
+            set_state(pid, "done", f"Marketplace 與社團貼文都處理完了（社團刪掉 {n} 則）")
+        else:
+            set_state(pid, "failed", f"社團貼文刪除沒有完成：{result.error or '未知原因'}")
+        for f in (titles_file, only_file):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+    def _after_mp(result):
+        data = result.data or {}
+        n = int(data.get("deleted_count") or 0)
+        if not result.success:
+            set_state(pid, "failed", f"Marketplace 刪除沒有完成：{result.error or '未知原因'}")
+            return
+        set_state(pid, "running", f"Marketplace 刪掉 {n} 則，接著刪社團貼文")
+        try:
+            wait_profile_free_blocking(f"fb:{fbid}")      # 這支在 to_thread 裡跑，短等不卡事件迴圈（2026-10-06 審查）
+            start_long_op("cleanup_fb", "src.run_fb_cleanup",
+                          ["--fbid", fbid, "--older-than", "0", "--force-recent",
+                           "--headless", "--only-file", only_file],
+                          account_id=account_id, fbid=fbid, on_done=_after_groups)
+        except Exception as e:      # noqa: BLE001 — 瀏覽器被占著等情況：記下來，不要炸掉同步迴圈
+            set_state(pid, "failed", f"社團貼文刪除排不進去：{e}")
+
+    try:
+        wait_profile_free_blocking(f"fb:{fbid}")
+        start_long_op("mp_cleanup", "src.run_delete_marketplace",
+                      ["--fbid", fbid, "--max-age-days", "0", "--headless",
+                       "--only-titles-file", titles_file],
+                      account_id=account_id, fbid=fbid, on_done=_after_mp)
+    except Exception as e:          # noqa: BLE001
+        set_state(pid, "failed", f"排不進去（瀏覽器忙）：{e}；發文已關閉，稍後可再按一次")
+        return "已關閉發文；平台下架稍後再試"
+    return "已關閉發文，正在下架平台上的貼文"
