@@ -1,0 +1,193 @@
+"""2026-10-06 Codex 邏輯誤判審查（docs/REVIEW-邏輯誤判-codex-20261006.md）的回歸測試（純函式，不開瀏覽器）。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_logic_review_20261006.py -v
+"""
+import datetime
+import inspect
+import sys
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+pytest.importorskip("playwright")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import marketplacePost as mp  # noqa: E402
+from src import delete_club_post as dc  # noqa: E402
+from src import import_parse as ip  # noqa: E402
+from src import generalpost_www as gp  # noqa: E402
+from src.utils import norm_listing_title, marketplace_item_id  # noqa: E402
+
+
+class Test1_2_3刊登確認:
+    def test_錯誤優先於成功字樣(self):
+        kind, _ = mp.classify_publish_feedback(["刊登成功", "無法發佈：發生錯誤，無法建立刊登"])
+        assert kind == "error"
+        assert mp.classify_publish_feedback(["You've reached the limit for listings"])[0] == "error"
+
+    def test_側欄已發佈商品數不算成功(self):
+        assert mp.classify_publish_feedback(["你有 12 件已發佈商品"]) == ("", "")
+        assert mp.classify_publish_feedback(["刊登成功"])[0] == "success"
+        assert mp.classify_publish_feedback([]) == ("", "")
+
+    def test_只認新的商品ID(self):
+        hrefs = ["https://www.facebook.com/marketplace/you/selling",
+                 "https://www.facebook.com/marketplace/item/111111/",
+                 "https://www.facebook.com/marketplace/item/222222/?ref=x"]
+        assert mp.pick_new_item_url(hrefs, {"111111"}).endswith("222222/?ref=x")
+        assert mp.pick_new_item_url(hrefs[:2], {"111111"}) is None
+        assert marketplace_item_id(hrefs[1]) == "111111"
+
+    def test_你的商品頁要完整標題相等_前24字相同的舊卡不算(self):
+        new = "北屯十期臨路雙車電梯豪墅｜四房三衛 景觀戶"
+        lines = ["北屯十期臨路雙車電梯豪墅｜四房三衛 邊間", "NT$29,880,000", "上架於 9/30"]
+        assert mp.count_listing_matches(lines, new, 29880000) == 0
+        assert mp.count_listing_matches(lines + [new.replace("｜", " | "), "NT$29,880,000"], new, 29880000) == 1
+
+    def test_同標題多張用價格分_分不出來就不是1(self):
+        t = "北屯三房平車"
+        lines = [t, "NT$15,880,000", "x", "x", "x", t, "NT$16,880,000"]
+        assert mp.count_listing_matches(lines, t, 15880000) == 1
+        assert mp.count_listing_matches(lines, t, 0) == 2
+
+    def test_看不到成功證據回unknown不回成功(self):
+        src = inspect.getsource(mp._finish_listing)
+        assert 'success=False, status="unknown"' in src
+        assert 'success=True, status="審核"' not in src
+        assert "known_ids = _known_item_ids(page, fbid)" in src
+
+
+class Test類別下拉嚴格比對:
+    def test_全新不命中近全新_公寓不命中電梯公寓(self):
+        assert mp.match_option_index(["二手 - 近全新", "全新"], "全新") == 1
+        assert mp.match_option_index(["電梯公寓"], "公寓") is None
+        assert mp.match_option_index(["二手 - 尚可"], "二手 - 普通") == 0      # 別名
+
+    def test_驗證顯示值(self):
+        assert mp.option_shown_ok("狀況\n全新", "全新")
+        assert not mp.option_shown_ok("二手 - 近全新", "全新")
+        assert not mp.option_shown_ok("", "全新")
+
+
+class Test4_20認刊登:
+    def test_前20字相同的手動刊登不是自己的(self):
+        ours = {"台中北屯機捷特區三房平車高樓層"}
+        assert dc._title_is_ours("台中北屯機捷特區三房平車屋主自售", ours) is False
+        assert dc._title_is_ours("台中北屯機捷特區三房平車高樓層", ours) is True
+        assert dc._title_is_ours("🏡台中北屯機捷特區三房平車，高樓層", ours) is True    # emoji、標點不影響
+
+    def test_有ID只看ID(self):
+        ids = {"555"}
+        assert dc._card_is_ours({"title": "完全不同的標題xxxxxxxx", "item_id": "555"}, set(), ids) is True
+        assert dc._card_is_ours({"title": "台中北屯機捷特區三房平車高樓層", "item_id": "999"},
+                                {"台中北屯機捷特區三房平車高樓層"}, ids) is False
+        assert dc._card_is_ours({"title": "台中北屯機捷特區三房平車高樓層", "item_id": ""},
+                                {"台中北屯機捷特區三房平車高樓層"}, ids) is True
+
+    def test_只有ID名單也能刪_沒ID沒相同標題就不刪(self):
+        state = [
+            {"idx": 0, "title": "台中北屯機捷特區三房平車高樓層", "item_id": "555", "text": "", "age_days": 9},
+            {"idx": 1, "title": "台中北屯機捷特區三房平車屋主自售", "item_id": "", "text": "", "age_days": 9},
+        ]
+        deleted = []
+
+        def fake_delete_one(page, idx):
+            nonlocal state
+            deleted.append(idx)
+            state = [c for c in state if c["idx"] != idx]
+            return True
+
+        with mock.patch.object(dc, "perform_checks", return_value=dc.CheckResult.OK), \
+             mock.patch.object(dc, "scan_selling_listings", lambda page, fbid, diag=True: list(state)), \
+             mock.patch.object(dc, "_collect_cards", lambda page: (list(state), {})), \
+             mock.patch.object(dc, "_delete_one_listing", fake_delete_one), \
+             mock.patch.object(dc, "_open_selling_page", lambda page: True), \
+             mock.patch.object(dc, "human_sleep", lambda *a, **k: None):
+            page = mock.MagicMock()
+            page.is_closed.return_value = False
+            dc.delete_old_marketplace_listings(page, "fbid", max_age_days=7, dry_run=False,
+                                               allowed_titles=set(), allowed_ids={"555"})
+        assert deleted == [0]
+
+    def test_上架紀錄讀出標題與ID(self, tmp_path, monkeypatch):
+        from src import run_delete_marketplace as rd
+        (tmp_path / "schedule.log").write_text(
+            "2026/10/01 10:00:00;自動上架;成功;fb1;北屯三房平車 高樓景觀;https://www.facebook.com/marketplace/item/777/;1\n"
+            "2026/10/01 11:00:00;自動上架;unknown;fb1;北屯三房平車 邊間;;2\n"
+            "2026/10/01 12:00:00;自動上架;成功;fb2;別人的;https://www.facebook.com/marketplace/item/888/;3\n",
+            encoding="utf-8")
+        monkeypatch.setattr(rd, "DATA_DIR", tmp_path)
+        posted = rd._load_tool_posted("fb1")
+        assert posted[norm_listing_title("北屯三房平車 高樓景觀")] == {"777"}
+        assert posted[norm_listing_title("北屯三房平車 邊間")] == set()
+        assert "888" not in set().union(*posted.values())
+
+    def test_補刊找卡片帶ID與價格(self):
+        src = inspect.getsource(mp.list_in_more_places)
+        assert '"itemId": marketplace_item_id(item_url)' in src and "ambiguous" in src
+        assert "startsWith(title)" not in mp._JS_FIND_ITEM_MORE_BTN
+
+    def test_schedule_log記完整標題(self):
+        assert "item.item_name[:30]" not in inspect.getsource(mp.post_one_sale_item)
+
+
+class Test相對時間用日曆:
+    def test_一個月一年(self):
+        now = datetime.datetime(2026, 3, 31, 10)
+        assert dc.convert_text_to_post_date("1個月前", now) == "2026/02/28"
+        assert dc.convert_text_to_post_date("2個月前", now) == "2026/01/31"
+        assert dc.convert_text_to_post_date("1年", now) == "2025/03/31"
+        assert dc.convert_text_to_post_date("3天前", now) == "2026/03/28"
+
+    def test_絕對日期優先(self):
+        now = datetime.datetime(2026, 3, 31, 10)
+        assert dc.convert_text_to_post_date("2025年12月3日 · 1年", now) == "2025/12/03"
+
+
+class Test22_23匯入解析:
+    def test_總價優先_單價不算(self):
+        assert ip.parse_price("土地 88 坪｜單價 32 萬｜總價 2,816 萬") == 28160000
+        assert ip.parse_price("單價 28.47萬/坪 總價 1,498萬") == 14980000
+        assert ip.parse_price("車位價 150萬，售價 1,980萬") == 19800000
+        assert ip.parse_price("28.47萬/坪") == 0
+        assert ip.parse_price("租金 18,000 元/月") == 18000
+        assert ip.parse_price("１，２８８萬") == 12880000
+        assert ip.parse_price("1750萬") == 17500000
+
+    def test_坪數各種寫法(self):
+        assert ip.parse_area("建坪：38.6坪") == ("38.6坪", 0)
+        assert ip.parse_area("權狀 42.31 坪") == ("42.31坪", 0)
+        assert ip.parse_area("約28坪")[0] == "28坪"
+        assert ip.parse_area("38坪（含車位）")[0] == "38坪"
+        assert ip.parse_area("３８．６坪")[0] == "38.6坪"
+        assert ip.parse_area("主建物 20.5坪") == ("20.5坪", 1)
+        assert ip.parse_area("北屯三房38坪景觀第一排") is None
+        assert ip.parse_area("28.47萬/坪") is None
+
+    def test_卡片建物坪數優先於地坪_不被當標題(self):
+        item = ip._classify(["台中市北屯區", "地坪 25 坪", "建坪：38.6坪", "北屯機捷特區邊間三房平車", "1,688萬"], "u")
+        assert item["area"] == "38.6坪"
+        assert item["title"] == "北屯機捷特區邊間三房平車"
+        assert item["price"] == 16880000
+
+
+class Test待審與封鎖:
+    def test_待審只認完整事件句(self):
+        assert gp.is_pending_text("貼文已提交，等待管理員審核")
+        assert gp.is_pending_text("Your post is pending review")
+        assert not gp.is_pending_text("Review your post before publishing")
+        assert not gp.is_pending_text("社團審核設定")
+
+    def test_封鎖對話框在DOM後段也讀得到(self):
+        from src import run_fb_friend as fr
+        from src.utils import CheckResult
+
+        class P:
+            def evaluate(self, js, arg=None):
+                if arg is not None:                       # _overlay_text
+                    return ["你暫時遭到封鎖，無法使用這項功能"]
+                return "動態牆" * 3000                     # 前 4000 字沒有封鎖字樣
+
+        with mock.patch("src.utils.perform_checks", return_value=CheckResult.OK):
+            assert fr._blocked_reason(P(), "fb1") != ""

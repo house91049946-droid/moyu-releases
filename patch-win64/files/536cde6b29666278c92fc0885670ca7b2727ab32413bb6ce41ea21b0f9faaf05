@@ -1,0 +1,23 @@
+"""別人鎖住個人檔案 ≠ 我們被鎖（2026-10-06 加好友點進陶德的個人檔案被誤判 locked、系統整個暫停）。"""
+from src import utils
+from src.utils import CheckResult
+
+
+class _Page:
+    url = "https://www.facebook.com/profile.php?id=1"
+    def __init__(self, body): self._b = body
+
+
+def _run(monkeypatch, body):
+    monkeypatch.setattr(utils, "_get_body_text", lambda p: body)
+    monkeypatch.setattr(utils, "_has_session_cookie", lambda p: True)
+    return utils.perform_checks(_Page(body), "1")
+
+
+def test_別人鎖個人檔案不算被鎖(monkeypatch):
+    body = "陶德 加朋友 陶德鎖住了他的個人檔案 只有他的朋友能看到他在個人檔案上分享的內容。"
+    assert _run(monkeypatch, body) != CheckResult.LOCKED
+
+
+def test_真的被鎖還是抓得到(monkeypatch):
+    assert _run(monkeypatch, "你的帳號已被鎖住") == CheckResult.LOCKED
