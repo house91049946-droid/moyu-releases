@@ -1,0 +1,25 @@
+"""全域暫停守門（2026-10-06 審查）。
+
+偵測到 FB 保護機制／被登出後系統會全域暫停，但原本只有發文排程看這個旗標，
+清刊登、抓成效、讀社團規則、看通知、Meta 登入檢查、順發……照樣開瀏覽器登帳號。
+被懷疑自動化的時候什麼都不要碰，所以每個會開瀏覽器的背景工作進場先問一句。
+"""
+from __future__ import annotations
+
+
+def paused_reason() -> str:
+    """系統暫停中就回原因（給 log 用的字串，至少是「已暫停」），沒暫停回空字串。"""
+    from ..database import get_system_state_sync
+    st = get_system_state_sync()
+    if not st.get("paused"):
+        return ""
+    return st.get("pause_reason") or st.get("pause_detail") or "已暫停"
+
+
+def skip_if_paused(tag: str) -> dict | None:
+    """暫停中：印一行、回 {"skipped": ...} 讓 run_once 直接 return；否則回 None。"""
+    why = paused_reason()
+    if not why:
+        return None
+    print(f"[{tag}] 系統已暫停（{why}），這輪不開瀏覽器", flush=True)
+    return {"skipped": f"系統已暫停（{why}）"}

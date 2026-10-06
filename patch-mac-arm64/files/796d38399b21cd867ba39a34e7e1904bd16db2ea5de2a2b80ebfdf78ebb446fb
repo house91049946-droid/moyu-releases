@@ -1,0 +1,116 @@
+"""2026-10-06 審查修正：社團發文結果判定、封鎖字樣共用、cookie／profile 一致、CLI --proxy。
+
+執行：cd FB_Auto && python3 -m pytest tests/test_review_20261006.py -v
+"""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import generalpost_www as gp  # noqa: E402
+from src import login  # noqa: E402
+from src.utils import FB_BLOCK_PHRASES  # noqa: E402
+
+
+class Test發文結果判定:
+    def test_PostResult有check欄位_預設None(self):
+        r = gp.PostResult(success=False, status="失敗")
+        assert r.check is None
+        assert gp.PostResult(success=False, status="unknown", check="unknown").check == "unknown"
+
+    def test_審核只認審核字樣(self):
+        assert gp.is_pending_text("你的貼文正在等待管理員審核")
+        assert gp.is_pending_text("Your post is pending review")
+        assert not gp.is_pending_text("貼文已發佈")
+        assert not gp.is_pending_text("")
+
+    def test_FB封鎖字樣命中(self):
+        assert gp.fb_block_phrase("哎呀 你暫時遭到封鎖 請稍後再試") == "你暫時遭到封鎖"
+        assert gp.fb_block_phrase("You’re Temporarily Blocked from posting").lower().startswith("you")
+        assert gp.fb_block_phrase("貼文已發佈到社團") == ""
+        assert gp.fb_block_phrase("") == ""
+
+    def test_封鎖字樣來自utils共用清單(self):
+        from src import run_fb_friend
+        assert run_fb_friend._FB_BLOCK_PHRASES is FB_BLOCK_PHRASES
+        assert "你暫時遭到封鎖" in FB_BLOCK_PHRASES
+
+    def test_不再拿i18n的key去比對頁面(self):
+        import inspect
+        src = inspect.getsource(gp.www_postclub_main)
+        assert '"write_content_box" not in body_text' not in src
+        assert 'T("write_content_box")' in src
+
+    def test_對話框文字只收dialog與toast(self):
+        class _Loc:
+            def __init__(self, texts): self._t = texts
+            def count(self): return len(self._t)
+            def nth(self, i):
+                t = self._t[i]
+                class _N:
+                    def inner_text(self, timeout=0): return t
+                return _N()
+        class _Page:
+            def locator(self, sel):
+                return _Loc({"[role='dialog']": ["等待審核"], "[role='alert']": ["已送出"]}.get(sel, []))
+        txt = gp._dialog_toast_text(_Page())
+        assert "等待審核" in txt and "已送出" in txt
+
+
+class TestCookie與Profile:
+    def _ctx(self, fbid, saved):
+        class _C:
+            def cookies(self): return [{"name": "c_user", "value": fbid}] if fbid else []
+        return _C()
+
+    def test_profile的fbid一致才寫回(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(login, "COOKIES_DIR", tmp_path)
+        assert login.sync_cookies_back(self._ctx("123", None), "123") is True
+        assert json.loads((tmp_path / "123.json").read_text())[0]["value"] == "123"
+
+    def test_fbid不同或沒登入不寫回(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(login, "COOKIES_DIR", tmp_path)
+        assert login.sync_cookies_back(self._ctx("999", None), "123") is False
+        assert login.sync_cookies_back(self._ctx("", None), "123") is False
+        assert login.sync_cookies_back(self._ctx("123", None), None) is False
+        assert not list(tmp_path.iterdir())
+
+    def test_session還活著就不灌cookie(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(login, "COOKIES_DIR", tmp_path)
+        (tmp_path / "123.json").write_text(json.dumps([{"name": "c_user", "value": "old"}]))
+        monkeypatch.setattr(login, "_session_alive_in_profile", lambda page, ctx: "123")
+        added = []
+        class _C:
+            def cookies(self): return [{"name": "c_user", "value": "123"}]
+            def add_cookies(self, c): added.append(c)
+        assert login._try_cookie_login(None, _C(), "123") is True
+        assert added == []                                    # 沒灌
+        assert json.loads((tmp_path / "123.json").read_text())[0]["value"] == "123"   # 新的寫回
+
+    def test_登入profile改名成fbid(self, tmp_path):
+        (tmp_path / "login_abc").mkdir()
+        moved = login.adopt_login_profile(tmp_path, "login_abc", "123")
+        assert moved == tmp_path / "123" and moved.is_dir() and not (tmp_path / "login_abc").exists()
+
+    def test_目標已存在就不動(self, tmp_path):
+        (tmp_path / "login_abc").mkdir(); (tmp_path / "123").mkdir()
+        assert login.adopt_login_profile(tmp_path, "login_abc", "123") is None
+        assert (tmp_path / "login_abc").is_dir()
+        assert login.adopt_login_profile(tmp_path, "login_nope", "123") is None
+        assert login.adopt_login_profile(tmp_path, "login_abc", "") is None
+
+
+class TestProxy參數:
+    def test_群組與Marketplace的CLI都收proxy(self):
+        import inspect
+        from src import run_p1, run_p2, run_mp_reshare
+        for m in (run_p1, run_p2, run_mp_reshare):
+            src = inspect.getsource(m)
+            assert '"--proxy"' in src and "proxy=" in src
+
+    def test_launch_browser接受字串proxy(self):
+        import inspect
+        from src import utils
+        src = inspect.getsource(utils.launch_browser)
+        assert 'proxy = {"server": proxy}' in src
