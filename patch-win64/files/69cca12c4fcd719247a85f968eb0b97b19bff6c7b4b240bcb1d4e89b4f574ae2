@@ -1,0 +1,181 @@
+"""新手村：從付錢到看見第一篇文，每一關過了沒有。
+
+老闆 2026-09-06：「新手村所有項目都勾選完成，新手村的選項隱藏。」
+
+「完成了沒」這件事必須只有一份答案。側欄要靠它決定顯不顯示入口，
+新手村頁要靠它畫打勾——兩邊各算一次遲早會不一致（而且側欄每換一頁
+就要打六、七支 API）。所以規則寫在這裡，前端只負責標題與連結。
+
+刻意不放進 /api/dashboard/summary：那支是首頁每 30 秒輪詢的，
+這支只在進頁面／換頁時問一次，混在一起會讓首頁白白多做一堆查詢。
+"""
+from __future__ import annotations
+
+import asyncio
+import datetime as _dt
+import json
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..database import (get_session, Account, Group, Property, MarketplaceSchedule,
+                        RunLog, UserConsent, SystemState, LegalInfo)
+from ..legal import CONSENT_VERSION
+from .dashboard import POST_TYPES
+
+router = APIRouter(prefix="/api/setup", tags=["setup"], redirect_slashes=False)
+
+# 老闆 2026-10-06：先同意條款再申請授權（申請表本來就要先勾同意）；手機改選做，不算進「全部完成」
+# 老闆 2026-10-07：官網手冊、新手村統一成同一套 7 關（FB 登入＋抓社團合成一關，加「確認法定資訊」）
+STEP_KEYS = ("consent", "license", "fb", "legal", "property", "schedule", "first", "phone", "human")
+OPTIONAL_KEYS = ("phone", "human")
+# 老闆 2026-10-06：讓帳號像真人——摸魚查不到，客戶自己打勾；選做、不擋排程
+HUMAN_TASKS = ("life", "friends", "groups")
+NUDGE_DAYS = 60          # 綁 FB 後前 2 個月才提醒（老闆 2026-10-06「前 2 個月就好」）
+NUDGE_EVERY = 7
+
+
+async def _state_row(session) -> SystemState:
+    st = (await session.execute(select(SystemState))).scalars().first()
+    if st is None:
+        st = SystemState()
+        session.add(st)
+        await session.flush()
+    return st
+
+
+def _human(st) -> dict:
+    try:
+        d = json.loads(st.human_tasks or "{}") if st else {}
+    except ValueError:
+        d = {}
+    return {k: bool(d.get(k)) for k in HUMAN_TASKS}
+
+
+@router.get("/state")
+async def state(session: AsyncSession = Depends(get_session)):
+    """八關各自過了沒。任何一項算不出來一律當「還沒過」，不要因為雲端連不上
+    就宣告使用者「已完成」——寧可多顯示一次入口，也不要把人鎖在外面。"""
+    # 授權：不 probe（會打雲端、慢），只看本地快取的狀態
+    lic_state, lic_expires = "", None
+    try:
+        from ..cloud_client import license_status
+        lic = await asyncio.to_thread(license_status, False)
+        lic_state = lic.get("state") or ""
+        lic_expires = lic.get("expires_at")
+    except Exception:
+        pass
+
+    consent = (await session.execute(
+        select(UserConsent).where(UserConsent.doc_version == CONSENT_VERSION)
+        .order_by(UserConsent.agreed_at.desc()).limit(1))).scalars().first()
+
+    acc = (await session.execute(select(Account).order_by(Account.id))).scalars().first()
+    bound = bool(acc and acc.fb_user_id)
+
+    group_count = mp_group_count = 0
+    if acc:
+        group_count = await session.scalar(
+            select(func.count(Group.id)).where(Group.account_id == acc.id)) or 0
+        mp_group_count = await session.scalar(
+            select(func.count(Group.id)).where(
+                Group.account_id == acc.id, Group.can_post == True)) or 0    # noqa: E712
+
+    legal_row = (await session.execute(select(LegalInfo))).scalars().first()
+    legal_ok = False
+    if legal_row is not None:
+        from .properties import _legal_gate_status
+        legal_ok = _legal_gate_status(legal_row)["ok"]
+
+    prop_count = await session.scalar(select(func.count(Property.id))) or 0
+    running = await session.scalar(
+        select(func.count(MarketplaceSchedule.id))
+        .where(MarketplaceSchedule.status == "running")) or 0
+    posted_ever = (await session.scalar(
+        select(func.count(RunLog.id)).where(
+            RunLog.status == "success", RunLog.task_type.in_(tuple(POST_TYPES))))) or 0
+
+    from ..cloud_client import phone_count
+    phones = phone_count()
+    sysst = (await session.execute(select(SystemState))).scalars().first()
+    human = _human(sysst)
+
+    steps = [
+        {"key": "consent", "done": consent is not None,
+         "detail": f"{consent.signer_name} 已同意" if consent else ""},
+        {"key": "license", "done": lic_state in ("ok", "grace"),
+         "detail": f"到期日 {lic_expires[:10]}" if lic_expires else ""},
+        # FB 登入＋抓社團算同一關：登入完成就會自動抓社團
+        {"key": "fb", "done": bound and group_count > 0,
+         "detail": (f"已綁定 {acc.fb_name or acc.fb_user_id}・{group_count} 個社團，其中 {mp_group_count} 個可轉發"
+                    if bound and group_count else (f"已綁定 {acc.fb_name or acc.fb_user_id}，還沒抓到社團" if bound else ""))},
+        {"key": "legal", "done": legal_ok, "detail": "每則貼文結尾會自動附上" if legal_ok else ""},
+        {"key": "property", "done": prop_count > 0,
+         "detail": f"已有 {prop_count} 個物件" if prop_count else ""},
+        {"key": "schedule", "done": running > 0,
+         "detail": f"{running} 個排程執行中" if running else ""},
+        {"key": "first", "done": posted_ever > 0,
+         "detail": f"已經發過 {posted_ever} 篇" if posted_ever else ""},
+        # 老闆 2026-09-27 要綁手機；老闆 2026-10-06 改成選做（不綁也算完成新手村）
+        {"key": "phone", "done": phones > 0, "optional": True,
+         "detail": f"已綁定 {phones} 支手機" if phones else ""},
+        {"key": "human", "done": all(human.values()), "optional": True, "tasks": human,
+         "detail": f"做了 {sum(human.values())} / {len(human)} 項" if any(human.values()) else ""},
+    ]
+    required = [s for s in steps if s["key"] not in OPTIONAL_KEYS]
+    done_count = sum(1 for s in required if s["done"])
+    return {"steps": steps, "done_count": done_count, "total": len(required),
+            "all_done": done_count == len(required)}
+
+
+class HumanTaskIn(BaseModel):
+    task: str
+    done: bool
+
+
+@router.post("/human")
+async def set_human_task(body: HumanTaskIn, session: AsyncSession = Depends(get_session)):
+    """新手村「讓帳號像真人」打勾／取消。"""
+    if body.task not in HUMAN_TASKS:
+        raise HTTPException(status_code=422, detail="不認得的項目")
+    st = await _state_row(session)
+    d = _human(st)
+    d[body.task] = body.done
+    st.human_tasks = json.dumps(d)
+    await session.commit()
+    return {"tasks": d}
+
+
+def nudge_due(fb_bound_at, last_at, now) -> bool:
+    """綁 FB 後前 NUDGE_DAYS 天內，距上次回答滿 NUDGE_EVERY 天（或從沒回答過）才問。
+    綁定時間不明（舊帳號）就不問——老客戶不需要被當新手提醒。"""
+    if fb_bound_at is None or now - fb_bound_at > _dt.timedelta(days=NUDGE_DAYS):
+        return False
+    return last_at is None or now - last_at >= _dt.timedelta(days=NUDGE_EVERY)
+
+
+@router.get("/human-nudge")
+async def human_nudge(session: AsyncSession = Depends(get_session)):
+    """首頁每週小卡「這週發過生活照了嗎？」要不要出現。"""
+    acc = (await session.execute(select(Account).order_by(Account.id))).scalars().first()
+    st = (await session.execute(select(SystemState))).scalars().first()
+    due = nudge_due(acc.fb_bound_at if acc else None, st.human_nudge_at if st else None, _dt.datetime.utcnow())
+    return {"show": due}
+
+
+class NudgeIn(BaseModel):
+    answer: str     # posted／later
+
+
+@router.post("/human-nudge")
+async def answer_nudge(body: NudgeIn, session: AsyncSession = Depends(get_session)):
+    st = await _state_row(session)
+    st.human_nudge_at = _dt.datetime.utcnow()
+    if body.answer == "posted":
+        d = _human(st)
+        d["life"] = True
+        st.human_tasks = json.dumps(d)
+    await session.commit()
+    return {"ok": True}

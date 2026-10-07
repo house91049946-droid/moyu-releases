@@ -1,0 +1,12 @@
+"""雲端即時公告的本機代理（老闆 2026-10-06）：前端拿來畫頂端橫幅。"""
+import asyncio
+
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/api/announcements", tags=["announce"], redirect_slashes=False)
+
+
+@router.get("")
+async def list_announcements():
+    from ..cloud_client import announcements
+    return await asyncio.to_thread(announcements)
