@@ -1,0 +1,133 @@
+"""對外 HTTPS 的共用設定：憑證信任來源。
+
+為什麼需要這個模組（2026-08-06 Windows 驗收挖出）：
+
+httpx 預設**只信任 certifi 內建的憑證庫**，不看作業系統的憑證存放區。
+企業網路的防毒／DLP／TLS 檢查類軟體會用自己的 CA 把連線重簽一次，
+而那張 CA 只會裝進 **Windows 憑證存放區**——certifi 當然不認得，於是
+所有 httpx 請求一律 `CERTIFICATE_VERIFY_FAILED`。
+
+後果不是單一功能壞掉，是全線失守：授權驗證、心跳、自動更新、AI 文案、
+**連「一鍵回報這個問題」都送不出去**（回報本身也走 HTTPS）。客戶只會說
+「明明有授權卻不能用」，而我們這邊完全查不到原因。
+
+解法：自己建一個 SSL context，**同時**載入作業系統憑證庫與 certifi。
+- Windows：`create_default_context()` 會讀 Windows 憑證存放區（含企業 CA）
+- macOS/Linux：OpenSSL 預設路徑可能是空的，所以再把 certifi 併進來
+兩邊都載入是相加的，不會互斥，任一來源認得就過。
+"""
+import contextlib
+import os
+import ssl
+
+import httpx
+
+_CTX: ssl.SSLContext | None = None
+
+
+def ssl_context() -> ssl.SSLContext:
+    """信任「系統憑證庫 + certifi」的 SSL context（建一次快取起來）。"""
+    global _CTX
+    if _CTX is not None:
+        return _CTX
+    # ⚠️ 一定要在 create_default_context() 之前。TLS 監控軟體會把 SSLKEYLOGFILE
+    # 注入成裝置路徑（\\.\xxx），CPython 會把它交給 OpenSSL fopen，而包內的
+    # OpenSSL 沒有 applink，拿到那種 FILE* 會**直接 abort 整個進程**——不是丟
+    # 例外，try/except 完全攔不到，後端就這樣無聲無息地死掉（2026-08-06 Windows
+    # 實測）。摸魚不需要側錄 TLS 金鑰，拔掉零風險。
+    os.environ.pop("SSLKEYLOGFILE", None)
+    ctx = ssl.create_default_context()          # Windows 上會載入系統憑證存放區
+    with contextlib.suppress(Exception):        # certifi 缺席不該讓整個連線功能死掉
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())
+    _CTX = ctx
+    return ctx
+
+
+# ── 雲端備援（老闆 2026-10-06：授權客戶使用不能出問題）──
+# 主雲端（Zeabur）連不上、或回 502/503/504 時，同一個請求自動改送備用伺服器（mini）。
+# 主雲端剛壞的 2 分鐘內直接走備用，不必每次都先等逾時。
+DEFAULT_FALLBACK = "https://mac-mini.tail49209b.ts.net:10000"
+_DOWN_FOR = 120
+_down_until = {"t": 0.0}
+
+
+def fallback_url() -> str:
+    v = os.environ.get("MOYU_CLOUD_FALLBACK_URL")
+    return (DEFAULT_FALLBACK if v is None else v).strip().rstrip("/")
+
+
+def _primary_host() -> str:
+    from urllib.parse import urlsplit
+    return urlsplit(os.environ.get("MOYU_CLOUD_URL", "").strip()).netloc
+
+
+class FailoverTransport(httpx.BaseTransport):
+    def __init__(self, inner: httpx.BaseTransport):
+        self.inner = inner
+
+    def _to_fallback(self, request: httpx.Request) -> httpx.Request | None:
+        fb = fallback_url()
+        if not fb:
+            return None
+        u = httpx.URL(fb)
+        url = request.url.copy_with(scheme=u.scheme, host=u.host, port=u.port)
+        headers = [(k, v) for k, v in request.headers.raw if k.lower() != b"host"]
+        return httpx.Request(request.method, url, headers=headers, content=request.content,
+                             extensions={**request.extensions, "moyu_fallback": True})
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        import time
+        primary = _primary_host()
+        if not primary or request.url.netloc.decode() != primary:
+            return self.inner.handle_request(request)
+        request.read()
+        if time.time() < _down_until["t"]:
+            fb = self._to_fallback(request)
+            if fb is not None:
+                return self._mark(self.inner.handle_request(fb))
+        try:
+            resp = self.inner.handle_request(request)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError):
+            fb = self._to_fallback(request)
+            if fb is None:
+                raise
+            _down_until["t"] = time.time() + _DOWN_FOR
+            return self._mark(self.inner.handle_request(fb))
+        if resp.status_code in (502, 503, 504):
+            fb = self._to_fallback(request)
+            if fb is not None:
+                resp.close()
+                _down_until["t"] = time.time() + _DOWN_FOR
+                return self._mark(self.inner.handle_request(fb))
+        return resp
+
+    @staticmethod
+    def _mark(resp: httpx.Response) -> httpx.Response:
+        resp.extensions["moyu_fallback"] = True
+        return resp
+
+    def close(self) -> None:
+        self.inner.close()
+
+
+def via_fallback(resp: httpx.Response) -> bool:
+    """這個回應是備用伺服器給的嗎？備用伺服器的資料可能比主雲端舊一天，它說「不行」不能當真。"""
+    return bool((getattr(resp, "extensions", None) or {}).get("moyu_fallback"))
+
+
+def client(timeout: float = 15, **kwargs) -> httpx.Client:
+    """建立 httpx.Client——**對外請求一律走這裡**，不要直接 httpx.Client()。
+
+    呼叫端已明確指定 verify 時（例如刻意關閉驗證）尊重其選擇。
+    打主雲端的請求會自動帶備援（見 FailoverTransport）。
+    """
+    verify = kwargs.pop("verify", ssl_context())
+    if "transport" not in kwargs:
+        kwargs["transport"] = FailoverTransport(httpx.HTTPTransport(verify=verify))
+    return httpx.Client(timeout=timeout, verify=verify, **kwargs)
+
+
+def async_client(timeout: float = 15, **kwargs) -> httpx.AsyncClient:
+    kwargs.setdefault("verify", ssl_context())
+    return httpx.AsyncClient(timeout=timeout, **kwargs)
