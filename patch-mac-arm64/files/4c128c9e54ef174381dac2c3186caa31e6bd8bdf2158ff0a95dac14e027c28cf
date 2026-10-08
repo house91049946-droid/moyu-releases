@@ -1,0 +1,30 @@
+from copy import deepcopy
+from src.group_post_evidence import verified_link, post_key
+
+URL = 'https://www.facebook.com/groups/123/'
+POST = URL + 'posts/456/'
+CARD = {'text':'買房找我  測試完整文案', 'authors':['https://www.facebook.com/profile.php?id=987'],
+        'links':[{'href':POST, 'timestamp':102}]}
+
+
+def check(card, before=set()):
+    return verified_link([card], before, URL, '987', '買房找我 測試完整文案', 100, now=105)
+
+
+def test_confirm_only_current_post():
+    assert check(CARD) == POST
+    assert check(CARD, {post_key(POST)}) is None
+    assert check(CARD, None) is None
+
+
+def test_old_or_other_person_or_partial_content_not_success():
+    for patch in [
+        {'authors':['https://www.facebook.com/111']}, {'text':'買房找我'},
+        {'authors':['https://www.facebook.com/111', 'https://www.facebook.com/987']},
+        {'links':[{'href':POST, 'timestamp':90}]},
+        {'links':[{'href':POST, 'timestamp':None}]},
+        {'links':[{'href':POST, 'timestamp':999}]},
+        {'links':[{'href':'https://www.facebook.com/groups/999/posts/456/', 'timestamp':102}]},
+        {'links':[{'href':'https://evil.test/groups/123/posts/456/', 'timestamp':102}]},
+    ]:
+        assert check({**deepcopy(CARD), **patch}) is None

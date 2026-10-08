@@ -1,0 +1,102 @@
+"""MP 提交證據與週報。缺席不等於不能發，只有正常完成的明確空搜尋才能累計。"""
+import datetime as dt
+import uuid
+from urllib.parse import urlparse
+from sqlalchemy import select
+from .database import SyncSession, Account, Group, MpGroupState, MpGroupAttempt, TAIPEI
+
+
+def group_key(g):
+    return g.group_id or urlparse(g.group_url or '').path.rstrip('/').split('/')[-1]
+
+
+def transition(state, outcome, now):
+    if outcome == 'submitted':
+        state.last_submitted_at = now
+        state.misses = 0
+        state.disabled = False
+    elif outcome in ('selected', 'found'):
+        state.misses = 0
+        state.disabled = False
+    elif outcome == 'missing':
+        state.misses = (state.misses or 0) + 1
+        state.disabled = state.misses >= 3
+    # unknown／登入失效／逾時不增減連續有效搜尋計數。
+
+
+def state_map(session, account_id):
+    return {s.group_key: s for s in session.execute(select(MpGroupState).where(
+        MpGroupState.account_id == account_id)).scalars()}
+
+
+def allowed_names(account_id, names):
+    with SyncSession() as s:
+        states = state_map(s, account_id)
+        disabled = {g.group_name for g in s.execute(select(Group).where(Group.account_id == account_id)).scalars()
+                    if (st := states.get(group_key(g))) and st.disabled}
+    return [n for n in names if n not in disabled]
+
+
+def record(fbid, requested, result, run_id=None):
+    """一個 CLI 執行是一輪；同輪同名去重。舊 CLI 或中斷沒有證據則列unknown。"""
+    run_id = run_id or str(uuid.uuid4())
+    now = dt.datetime.utcnow()
+    try:
+        with SyncSession() as s:
+            account = s.execute(select(Account).where(Account.fb_user_id == fbid)).scalars().all()
+            if len(account) != 1:
+                return
+            aid = account[0].id
+            states = state_map(s, aid)
+            groups = s.execute(select(Group).where(Group.account_id == aid)).scalars().all()
+            by_name = {}
+            for g in groups:
+                by_name.setdefault(g.group_name, []).append(g)
+            evidence = {}
+            for r in (result.data or {}).get('group_evidence', []):
+                if isinstance(r, dict) and r.get('name') in requested and r.get('outcome') in ('submitted', 'selected', 'found', 'missing'):
+                    evidence.setdefault(r['name'], set()).add(r['outcome'])
+            for name in dict.fromkeys(requested):
+                if s.get(MpGroupAttempt, (run_id, name)):
+                    continue
+                choices = evidence.get(name, set())
+                outcome = next(iter(choices)) if len(choices) == 1 else 'unknown'
+                if result.needs_relogin or result.needs_manual_action or not getattr(result, "success", True):
+                    # 成功過的前批提交證據保留；保護／中斷不能製造 miss。
+                    if outcome != 'submitted':
+                        outcome = 'unknown'
+                s.add(MpGroupAttempt(run_id=run_id, group_name=name, account_id=aid,
+                                     outcome=outcome, occurred_at=now))
+                matches = by_name.get(name, [])
+                keys = {group_key(g) for g in matches}
+                if len(keys) != 1 or not next(iter(keys), ''):
+                    continue  # 同名不同社團無法判定，不能停錯團。
+                key = next(iter(keys))
+                st = states.get(key)
+                if st is None:
+                    st = MpGroupState(account_id=aid, group_key=key, misses=0, disabled=False)
+                    states[key] = st
+                    s.add(st)
+                transition(st, outcome, now)
+                for g in matches:
+                    if st.disabled:
+                        g.can_post = False
+                    elif outcome in ('submitted', 'selected', 'found'):
+                        g.can_post = True
+            s.commit()
+    except Exception:
+        print('[mp-health] 結果記錄失敗，不影響原發文流程', flush=True)
+
+
+def weekly(account_id, now=None):
+    now = now or dt.datetime.now(TAIPEI)
+    start = (now - dt.timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    utc_start = start.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    utc_end = now.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    with SyncSession() as s:
+        rows = s.execute(select(MpGroupAttempt).where(MpGroupAttempt.account_id == account_id,
+            MpGroupAttempt.occurred_at >= utc_start, MpGroupAttempt.occurred_at <= utc_end)).scalars().all()
+    counts = {k: sum(r.outcome == k for r in rows) for k in ('submitted', 'selected', 'found', 'missing', 'unknown')}
+    total = len(rows)
+    return {'week_start': start.date().isoformat(), 'requested': total, **counts,
+            'submission_rate': round(counts['submitted'] * 100 / total, 1) if total else None}

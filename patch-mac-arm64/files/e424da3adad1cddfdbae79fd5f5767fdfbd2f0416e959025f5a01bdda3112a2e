@@ -1,0 +1,90 @@
+"""社團直發結果佇列：只上傳社團 ID、結果、時間與隨機事件 ID。
+
+不從 success 布林推導刊登成功（待審也會回 success=True）。未取得結果則不補造紀錄。
+與既有匿名回報開關一致；送成功才移除，離線可重試，不阻擋 FB 發文。
+"""
+import datetime as dt
+import re
+import threading
+import uuid
+from urllib.parse import urlparse
+
+from sqlalchemy import select, delete
+from .database import SyncSession, GroupOutcomeQueue, error_report_enabled_sync
+
+_SEND_LOCK = threading.Lock()
+
+
+def group_id(url: str) -> str:
+    p = urlparse(url or '')
+    if p.scheme != 'https' or p.hostname not in ('www.facebook.com', 'facebook.com', 'm.facebook.com'):
+        return ''
+    m = re.fullmatch(r'/groups/([A-Za-z0-9._-]+)/?', p.path)
+    return m.group(1).lower() if m else ''
+
+
+def classify(result, gid: str) -> str:
+    if result.needs_relogin or result.needs_manual_action:
+        return 'technical_error'
+    for row in result.results or []:
+        if not isinstance(row, dict) or group_id(row.get('group_url', '')) != gid:
+            continue
+        status = row.get('status')
+        if status in ('審核', 'pending_review'):
+            return 'pending'
+        if row.get('check') == 'group_blocked' or status in ('rejected', '拒絕'):
+            return 'rejected'
+        # 舊 CLI 的連結可能屬於他人舊文；只有新驗證器確認本次作者/文案/時間才計入。
+        if status in ('成功', 'success') and row.get('permalink') and row.get('published_verified') is True:
+            return 'published'
+        if status == 'unknown' or result.success:
+            return 'unknown'
+        return 'technical_error'
+    return 'unknown' if result.success else 'technical_error'
+
+
+def record_result(url: str, result) -> None:
+    try:
+        gid = group_id(url)
+        if not gid or not error_report_enabled_sync():
+            return
+        with SyncSession() as s:
+            s.add(GroupOutcomeQueue(event_id=str(uuid.uuid4()), group_id=gid,
+                                    outcome=classify(result, gid)))
+            s.commit()
+    except Exception:
+        # 回報機制不得改變實際發文結果，亦不輸出可能含個資的 exception。
+        print('[group-quality] 結果暫存失敗', flush=True)
+
+
+def send_pending() -> dict:
+    from . import cloud_client as cc
+    if not _SEND_LOCK.acquire(blocking=False):
+        return {'sent': 0}
+    try:
+        if not error_report_enabled_sync():
+            with SyncSession() as s:
+                s.execute(delete(GroupOutcomeQueue)); s.commit()
+            return {'sent': 0}
+        if not cc.cloud_enabled():
+            return {'sent': 0}
+        with SyncSession() as s:
+            s.execute(delete(GroupOutcomeQueue).where(
+                GroupOutcomeQueue.occurred_at < dt.datetime.utcnow() - dt.timedelta(days=90)))
+            s.commit()
+            rows = s.execute(select(GroupOutcomeQueue).order_by(GroupOutcomeQueue.occurred_at).limit(100)).scalars().all()
+            items = [{'event_id': r.event_id, 'group_id': r.group_id, 'outcome': r.outcome,
+                      'occurred_at': r.occurred_at.isoformat() + 'Z'} for r in rows]
+        if not items:
+            return {'sent': 0}
+        status, body = cc._auth_json('POST', '/groups/outcomes', timeout=15, json={'items': items})
+        if status != 200 or not isinstance(body, dict) or body.get('ok') is not True or body.get('accepted') != len(items):
+            return {'sent': 0}
+        with SyncSession() as s:
+            s.execute(delete(GroupOutcomeQueue).where(GroupOutcomeQueue.event_id.in_([i['event_id'] for i in items])))
+            s.commit()
+        return {'sent': len(items)}
+    except Exception:
+        return {'sent': 0}
+    finally:
+        _SEND_LOCK.release()

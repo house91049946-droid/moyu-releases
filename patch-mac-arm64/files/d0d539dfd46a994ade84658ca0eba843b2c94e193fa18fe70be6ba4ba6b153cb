@@ -1,0 +1,58 @@
+from src.mp_group_evidence import rows, mark, submitted, confirm_missing_search
+
+
+def test_exact_submitted_names_not_first_n():
+    r=rows(['A','B','C','A'])
+    mark(r,'B','selected');mark(r,'C','submitted')
+    assert submitted(r)==['C']
+    assert len(r)==3
+
+
+def test_existing_listing_missing_not_global_ineligible():
+    class Page:
+        url='https://www.facebook.com/marketplace/you/selling'
+        def get_by_role(self,*a,**kw): raise AssertionError('must not probe')
+    assert confirm_missing_search(Page(),'A') == 'unknown'
+
+
+def test_lmp_click_fail_dryrun_and_stale_toast_are_not_submitted(monkeypatch):
+    from types import SimpleNamespace as NS
+    from src import marketplacePost as mp
+    for name in ('human_sleep','human_idle','capture_screenshot'):
+        monkeypatch.setattr(mp,name,lambda *a,**kw:None)
+    monkeypatch.setattr(mp,'enhanced_get',lambda *a:True)
+    monkeypatch.setattr(mp,'_click_menu_item',lambda *a:True)
+    monkeypatch.setattr(mp,'get_audience_groups',lambda *a:['A','B'])
+    def select(page,wanted,fbid,evidence):
+        mark(evidence,'B','selected')
+        return 1
+    monkeypatch.setattr(mp,'_select_groups_on_audience_page',select)
+    class Page:
+        mouse=NS(click=lambda *a:None)
+        def __init__(self,before,after): self.values=iter([before,after])
+        def evaluate(self,*a):return {'x':1,'y':2}
+        def locator(self,*a):return NS(all_inner_texts=lambda:next(self.values))
+    ok=['Your listing has been published']
+    for clicked,before,after,want in [(False,[],ok,[]),(True,ok,ok,[]),(True,[],ok,['B']), (True,[],['Something went wrong'],[])]:
+        monkeypatch.setattr(mp,'_click_publish_marketplace',lambda *a,c=clicked:c)
+        result=mp.list_in_more_places(Page(before,after),'id','title',['A','B','C'])
+        assert result['submitted_groups']==want
+        assert not any(r['outcome']=='missing' for r in result['group_evidence'])
+    def no_click(*a): raise AssertionError('dry run must not publish')
+    monkeypatch.setattr(mp,'_click_publish_marketplace',no_click)
+    assert mp.list_in_more_places(Page([],[]),'id','title',['A','B'],dry_run=True)['group_evidence']==[]
+
+
+def test_overflow_preserves_confirmed_batch_if_later_batch_crashes(monkeypatch):
+    from src import marketplacePost as mp
+    calls=[]
+    def run(*a,**kw):
+        calls.append(1)
+        if len(calls)>1: raise RuntimeError('browser closed')
+        return {'submitted_groups':['A'], 'group_evidence':[{'name':'A','outcome':'submitted'}]}
+    monkeypatch.setattr(mp,'list_in_more_places',run)
+    monkeypatch.setattr(mp.time,'sleep',lambda *a:None)
+    result=mp._forward_overflow_groups(None,'id','title',['A']+['B']*20,0,0)
+    assert result[0]['selected']==1
+    assert result[0]['group_evidence']==[{'name':'A','outcome':'submitted'}]
+    assert result[1]['selected']==0 and result[1]['errors']
