@@ -1,0 +1,52 @@
+"""MP 逐團證據，不從勾選數量猜成功名單。"""
+
+def rows(names):
+    return [{'name': n, 'outcome': 'unknown'} for n in dict.fromkeys(names)]
+
+
+def mark(items, name, outcome):
+    for row in items:
+        if row['name'] == name:
+            row['outcome'] = outcome
+
+
+def submitted(items):
+    return [r['name'] for r in items if r['outcome'] == 'submitted']
+
+
+def confirm_missing_search(page, name, lookup=lambda: False):
+    """只有新刊登對象頁的明確搜尋空結果才算 miss；純清單漏載不能算。"""
+    if 'step=audience' not in page.url:
+        return 'unknown'
+    search = page.get_by_role('searchbox', name='搜尋社團', exact=True)
+    if search.count() != 1:
+        search = page.get_by_role('searchbox', name='Search groups', exact=True)
+    if search.count() != 1:
+        return 'unknown'
+    try:
+        if not search.is_visible():
+            return 'unknown'
+        empty = page.get_by_text('找不到社團', exact=True).or_(page.get_by_text('No groups found', exact=True))
+        if empty.count() and empty.first.is_visible():
+            return 'unknown'  # 既有空訊息不能冒充本次搜尋完成。
+        search.fill(name)
+        import time
+        until = time.monotonic() + 5
+        while time.monotonic() < until:
+            if search.input_value() != name or 'step=audience' not in page.url:
+                return 'unknown'
+            if not page.locator('[role="progressbar"], [aria-busy="true"]').count():
+                if lookup():
+                    return 'found'
+                if empty.count() and empty.first.is_visible():
+                    return 'missing'
+            page.wait_for_timeout(200)
+        return 'unknown'
+    except Exception:
+        return 'unknown'
+    finally:
+        try:
+            search.fill('')
+            page.wait_for_timeout(800)
+        except Exception:
+            pass

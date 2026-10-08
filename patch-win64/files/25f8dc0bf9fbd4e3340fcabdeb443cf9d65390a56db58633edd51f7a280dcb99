@@ -1,0 +1,72 @@
+"""只讀頁面確認本次直發；缺少作者、完整文案或發佈時間證據即不確認。"""
+import re
+import time
+from urllib.parse import urlparse, parse_qs
+
+HOSTS = {'facebook.com', 'www.facebook.com', 'm.facebook.com', 'mbasic.facebook.com'}
+
+
+def post_key(url):
+    p = urlparse(url or '')
+    if p.scheme != 'https' or p.hostname not in HOSTS:
+        return None
+    m = re.fullmatch(r'/groups/([^/]+)/(?:posts|permalink)/([^/]+)/?', p.path)
+    return (m.group(1).lower(), m.group(2)) if m else None
+
+
+def is_author(url, fbid):
+    p = urlparse(url or '')
+    if p.hostname not in HOSTS:
+        return False
+    return (p.path.rstrip('/') == '/' + fbid or
+            (p.path == '/profile.php' and parse_qs(p.query).get('id') == [fbid]) or
+            bool(re.fullmatch(r'/groups/[^/]+/user/' + re.escape(fbid) + r'/?', p.path)))
+
+
+def verified_link(cards, before, group_url, fbid, content, started_at, now=None):
+    """比對發佈前後快照；純函式便於用舊文／他人貼文做負向測試。"""
+    if before is None or not content.strip() or not fbid:
+        return None
+    gid = urlparse(group_url).path.strip('/').split('/')[-1].lower()
+    norm = lambda text: re.sub(r'\s+', '', text or '')
+    now = time.time() if now is None else now
+    for card in cards:
+        if norm(content) not in norm(card.get('text')):
+            continue
+        if not card.get('authors') or not all(is_author(u, fbid) for u in card['authors']):
+            continue
+        for link in card.get('links', []):
+            key = post_key(link.get('href'))
+            try:
+                at = float(link.get('timestamp'))
+            except (TypeError, ValueError):
+                continue
+            if key and key[0] == gid and key not in before and started_at <= at <= now + 5:
+                return link['href']
+    return None
+
+
+def snapshot_links(page):
+    try:
+        urls = page.locator('a[href]').evaluate_all('(els) => els.map(e => e.href)')
+        return {key for u in urls if (key := post_key(u))}
+    except Exception:
+        return None
+
+
+def confirm_post(page, before, group_url, fbid, content, started_at):
+    try:
+        cards = page.locator('[role="article"]').evaluate_all(r'''(els) => els.map(e => ({
+          text: Array.from(e.querySelectorAll('[data-ad-preview="message"],[data-ad-comet-preview="message"]'))
+            .filter(m => m.closest('[role="article"]') === e).map(m => m.innerText).join('\n'),
+          authors: Array.from(e.querySelectorAll('h2 a[href],h3 a[href],[role="heading"] a[href]')).filter(a => a.closest('[role="article"]') === e).map(a => a.href),
+          links: Array.from(e.querySelectorAll('a[href]')).filter(a => a.closest('[role="article"]') === e).map(a => {
+            const t = a.querySelector('[data-utime],time[datetime]');
+            const raw = a.getAttribute('data-utime') || t?.getAttribute('data-utime');
+            const iso = a.getAttribute('datetime') || t?.getAttribute('datetime');
+            return {href: a.href, timestamp: raw ? Number(raw) : (iso ? Date.parse(iso)/1000 : null)};
+          })
+        }))''')
+        return verified_link(cards, before, group_url, fbid, content, started_at)
+    except Exception:
+        return None
