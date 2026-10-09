@@ -1,0 +1,64 @@
+"""唯讀核對已知 MP 網址。登入失效、空白或看不到商品均不等於已刪除。"""
+import argparse
+import contextlib
+import json
+import re
+from urllib.parse import urlsplit, parse_qs
+from src.utils import launch_browser, human_sleep, capture_screenshot
+from src.login import _try_cookie_login
+
+GONE = ('此商品已不存在', '此刊登已不存在', 'this listing is no longer available',
+        'this item is no longer available', '此商品已無法購買', '此刊登已無法查看')
+BLOCKED = ('登入 facebook', 'log into facebook', '確認你的身分', 'confirm your identity')
+
+
+def item_id(url):
+    u=urlsplit(url)
+    if u.scheme!='https' or u.hostname not in ('facebook.com','www.facebook.com'):return ''
+    m=re.fullmatch(r'/marketplace/item/(\d+)/?',u.path)
+    return m.group(1) if m else ''
+
+
+def verify(page,url):
+    wanted=item_id(url)
+    if not wanted:return False
+    page.goto(url,wait_until='domcontentloaded',timeout=45000)
+    human_sleep(3,5)
+    body=page.inner_text('body').lower()
+    actual=urlsplit(page.url)
+    # FB 刪後可能導回 Marketplace 並顯示特定的商品移除橫幅。
+    same_target=item_id(page.url)==wanted
+    removed_redirect=(actual.scheme=='https' and actual.hostname in ('facebook.com','www.facebook.com')
+                      and bool(re.fullmatch(r'/marketplace(?:/[A-Za-z0-9_-]+)?/?', actual.path))
+                      and parse_qs(actual.query).get('unavailable_product')==['1'])
+    return (same_target or removed_redirect) and not any(x in body for x in BLOCKED) and any(x in body for x in GONE)
+
+
+def main():
+    ap=argparse.ArgumentParser();ap.add_argument('--fbid',required=True);ap.add_argument('--urls-file',required=True)
+    ap.add_argument('--headless',action='store_true');ap.add_argument('--result-json',required=True);args=ap.parse_args()
+    result={'success':False,'error':'尚未核對','data':{'posts':[]}}
+    ctx=None
+    try:
+        urls=json.loads(open(args.urls_file,encoding='utf8').read())
+        if not isinstance(urls,list) or not urls or any(not item_id(u) for u in urls):
+            raise ValueError('缺少有效的舊 MP 網址，不能以空清單確認下架')
+        browser,ctx,page=launch_browser(fbid=args.fbid,headless=args.headless)
+        if not _try_cookie_login(page,ctx,args.fbid):raise ValueError('登入失效，無法核對')
+        for u in dict.fromkeys(urls):
+            ok=verify(page,u)
+            capture_screenshot(page,args.fbid,'verify_removed_'+item_id(u))
+            result['data']['posts'].append({'url':u,'status':'gone' if ok else 'unknown'})
+        result['success']=all(p['status']=='gone' for p in result['data']['posts'])
+        result['error']='' if result['success'] else '舊 MP 尚未確認刪除，保留重試入口'
+    except Exception as e:result['error']=str(e)
+    finally:
+        if ctx:
+            with contextlib.suppress(Exception):ctx.close()
+        from src.utils import collect_screenshots
+        result['data']['screenshots']=collect_screenshots()
+        with open(args.result_json,'w',encoding='utf8') as f:json.dump(result,f,ensure_ascii=False)
+    return 0 if result['success'] else 1
+
+
+if __name__=='__main__':raise SystemExit(main())

@@ -1,0 +1,204 @@
+"""Marketplace 自動刪除的安全網：只刪本工具上架的刊登，不碰帳號手動貼的商品。
+
+背景（2026-08-09）：自動刪除原本掃整個銷售頁、照天數刪，誤刪了帳號既有的
+商品。加了 allowed_titles 白名單後，第一版只擋住「候選計數」與 dry-run，卻
+漏掉了『實刪迴圈』——迴圈就地重收卡片、只用 age 挑下一個要刪的，繞過了標題
+比對。這支測試用「工具的 + 手動的」混合清單跑實刪迴圈，確保手動商品不被刪。
+"""
+import sys
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+pytest.importorskip("playwright")  # 需要 playwright（module 頂層 import Page）
+
+# 讓 `import src.xxx` 解得到（FB_Auto 為套件根）
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import src.delete_club_post as m  # noqa: E402
+
+
+def _mixed_cards():
+    return [
+        {"idx": 0, "title": "太平七街 四房透天 1798萬", "text": "太平七街 四房透天 1798萬", "age_days": 5},
+        {"idx": 1, "title": "可愛狗狗潔牙骨 大包裝",   "text": "可愛狗狗潔牙骨 大包裝",   "age_days": 5},
+        {"idx": 2, "title": "太平七街 四房透天 1798萬", "text": "太平七街 四房透天 1798萬", "age_days": 5},
+    ]
+
+
+def test_實刪迴圈只刪本工具_跳過手動商品():
+    allowed = {"太平七街 四房透天 1798萬"}
+    state = _mixed_cards()
+    deleted = []
+
+    def fake_collect(page):
+        return list(state), {}
+
+    def fake_scan(page, fbid, diag=True):
+        return list(state)
+
+    def fake_delete_one(page, idx):
+        nonlocal state
+        card = next((c for c in state if c["idx"] == idx), None)
+        if not card:
+            return False
+        deleted.append(card["title"])
+        state = [c for c in state if c["idx"] != idx]
+        return True
+
+    with mock.patch.object(m, "perform_checks", return_value=m.CheckResult.OK), \
+         mock.patch.object(m, "scan_selling_listings", fake_scan), \
+         mock.patch.object(m, "_collect_cards", fake_collect), \
+         mock.patch.object(m, "_delete_one_listing", fake_delete_one), \
+         mock.patch.object(m, "_open_selling_page", lambda page: True), \
+         mock.patch.object(m, "human_sleep", lambda *a, **k: None):
+        page = mock.MagicMock()
+        page.is_closed.return_value = False
+        r = m.delete_old_marketplace_listings(page, "fbid", max_age_days=0,
+                                              dry_run=False, allowed_titles=allowed)
+
+    assert "可愛狗狗潔牙骨 大包裝" not in deleted        # 手動商品絕不能刪
+    assert deleted == ["太平七街 四房透天 1798萬"] * 2   # 只刪本工具那 2 筆
+    assert r.get("skipped_not_mine") == 1
+
+
+def test_查無本工具紀錄_一筆都不刪():
+    """allowed_titles 為空 → 直接短路、不掃不刪。"""
+    r = m.delete_old_marketplace_listings(mock.MagicMock(), "fbid",
+                                          max_age_days=0, dry_run=False,
+                                          allowed_titles=set())
+    assert r["deleted"] == []
+    assert r.get("note") == "no_tool_listings_recorded"
+
+
+def test_標題比對只認完整相等_前綴不算():
+    """2026-10-06 Codex 審查：前綴比對會把使用者手動貼的同前綴商品當成自己的而誤刪，改成完整正規化相等。"""
+    allowed = {"太平七街 四房透天 1798萬 全新整理"}
+    assert m._title_is_ours("太平七街 四房透天 1798萬 全新整理", allowed) is True
+    assert m._title_is_ours("太平七街 四房透天 1798萬 全新整理 近學區", allowed) is False  # 多了字＝別筆
+    assert m._title_is_ours("太平七街 四房透天 1798萬", allowed) is False                  # 少了字＝別筆
+    assert m._title_is_ours("可愛狗狗潔牙骨 大包裝好評熱賣中", allowed) is False           # 帳號手動商品
+    assert m._title_is_ours("太平七街 四房透天 1798萬 全新整理", set()) is False          # 空白名單
+
+
+def test_FB把全形標點換成半形也要比對得出來():
+    """2026-08-10 實測：工具送出全形逗號，FB 賣場頁顯示成半形，害自動刪除永遠不刪。"""
+    logged = "台中太平四房透天，23坪地，近市區機能好"      # 我們記錄的（全形）
+    on_fb = "台中太平四房透天,23坪地,近市區機能好"          # FB 頁面顯示的（半形）
+    assert m._title_is_ours(on_fb, {logged}) is True
+
+
+def test_表情符號被FB吃掉也要比對得出來():
+    logged = "🏠台中太平四房透天｜23坪地｜近市區"
+    on_fb = "台中太平四房透天 23坪地 近市區"
+    assert m._title_is_ours(on_fb, {logged}) is True
+
+
+def test_太短的標題不比對_避免誤刪():
+    """去掉標點後不足 10 字就不比——短字串太容易跟別人的刊登撞在一起。"""
+    assert m._title_is_ours("太平透天", {"太平透天"}) is False
+
+
+def test_keep_newest_只留最新一則():
+    """同一個案子重複上架（2026-09-27 一間掛了 24 則）：只留最新的，其餘由舊到新刪。"""
+    allowed = {"中區自由路 透套華廈三房 968萬", "中區自由路 近台中火車站 透套"}
+    state = [
+        {"idx": 0, "title": "中區自由路 透套華廈三房 968萬", "text": "", "age_days": 10},
+        {"idx": 1, "title": "中區自由路 近台中火車站 透套", "text": "", "age_days": 1},
+        {"idx": 2, "title": "可愛狗狗潔牙骨 大包裝", "text": "", "age_days": 30},
+        {"idx": 3, "title": "中區自由路 透套華廈三房 968萬", "text": "", "age_days": 4},
+        {"idx": 4, "title": "中區自由路 近台中火車站 透套", "text": "", "age_days": -1},  # 年齡未知：不刪，但算在保留數內
+    ]
+    deleted = []
+
+    def fake_delete_one(page, idx):
+        nonlocal state
+        card = next(c for c in state if c["idx"] == idx)
+        deleted.append(card["age_days"])
+        state = [c for c in state if c["idx"] != idx]
+        return True
+
+    with mock.patch.object(m, "perform_checks", return_value=m.CheckResult.OK), \
+         mock.patch.object(m, "scan_selling_listings", lambda page, fbid, diag=True: list(state)), \
+         mock.patch.object(m, "_collect_cards", lambda page: (list(state), {})), \
+         mock.patch.object(m, "_delete_one_listing", fake_delete_one), \
+         mock.patch.object(m, "_open_selling_page", lambda page: True), \
+         mock.patch.object(m, "human_sleep", lambda *a, **k: None):
+        page = mock.MagicMock()
+        page.is_closed.return_value = False
+        dry = m.delete_old_marketplace_listings(page, "fbid", max_age_days=0, dry_run=True,
+                                                allowed_titles=allowed, keep_newest=1)
+        r = m.delete_old_marketplace_listings(page, "fbid", max_age_days=0, dry_run=False,
+                                              allowed_titles=allowed, keep_newest=1)
+
+    assert len(dry["candidates"]) == 3
+    assert deleted == [10, 4, 1]            # 由舊到新；剩下年齡未知那則 → 共留 1 則
+    assert [c["idx"] for c in state] == [2, 4]
+    assert r["delete_action_count"] == 3
+    assert r["unidentified_delete_actions"] == 3
+    assert r["deleted"] == []
+
+
+def test_failed_delete_is_not_reported_as_success():
+    cards=_mixed_cards()[:1]
+    with mock.patch.object(m,'perform_checks',return_value=m.CheckResult.OK), \
+         mock.patch.object(m,'scan_selling_listings',return_value=cards), \
+         mock.patch.object(m,'_collect_cards',return_value=(cards,{})), \
+         mock.patch.object(m,'_delete_one_listing',return_value=False), \
+         mock.patch.object(m,'_open_selling_page',return_value=True), \
+         mock.patch.object(m,'human_sleep'):
+        page=mock.MagicMock();page.is_closed.return_value=False
+        result=m.delete_old_marketplace_listings(page,'123',max_age_days=0,allowed_titles={cards[0]['title']})
+    assert not result['success']
+    assert result['deleted']==[]
+
+
+def test_legacy_group_deletion_navigates_exact_post_never_group_home():
+    import src.run_fb_cleanup as fb
+    url='https://www.facebook.com/groups/123/posts/456/'
+    page=mock.MagicMock();page.url=url
+    with mock.patch.object(m,'perform_checks',return_value=m.CheckResult.OK), \
+         mock.patch.object(m,'enhanced_get',return_value=True) as navigate, \
+         mock.patch.object(m,'human_sleep'),mock.patch.object(fb,'_delete_one',return_value=True) as delete:
+        assert m.www_delete_club_post_main(page,'1','https://mbasic.facebook.com/groups/123/',url)
+        navigate.assert_called_once_with(page,url)
+        delete.assert_called_once_with(page,url)
+        navigate.reset_mock();delete.reset_mock()
+        assert not m.www_delete_club_post_main(page,'1','https://mbasic.facebook.com/groups/123/')
+        assert not navigate.called and not delete.called
+
+
+@pytest.mark.parametrize('destination,body,expected', [
+    ('https://www.facebook.com/marketplace/taichung/?unavailable_product=1', '此商品已無法購買', True),
+    ('https://www.facebook.com/marketplace/taichung/', '此商品已無法購買', False),
+    ('https://www.facebook.com/marketplace/', '本日精選', False),
+    ('https://www.facebook.com/marketplace/', '此商品已無法購買 登入 Facebook', False),
+    ('https://evil.test/marketplace/', '此商品已無法購買', False),
+    ('https://www.facebook.com/marketplace/item/999/', '此商品已無法購買', False),
+])
+def test_removed_mp_redirect_requires_platform_and_gone_banner(monkeypatch,destination,body,expected):
+    from src import run_verify_removed as v
+    monkeypatch.setattr(v,'human_sleep',lambda *a:None)
+    class Page:
+        url=destination
+        def goto(self,*a,**k):pass
+        def inner_text(self,*a):return body
+    assert v.verify(Page(),'https://www.facebook.com/marketplace/item/123/') is expected
+
+
+def test_repeated_same_item_counts_actions_separately(monkeypatch):
+    card = {"idx": 0, "item_id": "12345", "title": "測試同商品延遲消失", "age_days": 1}
+    states = iter([([card], {}), ([card], {}), ([], {}), ([], {})])
+    monkeypatch.setattr(m, "perform_checks", lambda *a: m.CheckResult.OK)
+    monkeypatch.setattr(m, "scan_selling_listings", lambda *a: [card])
+    monkeypatch.setattr(m, "_collect_cards", lambda *a: next(states))
+    monkeypatch.setattr(m, "_delete_one_listing", lambda *a: True)
+    monkeypatch.setattr(m, "_open_selling_page", lambda *a: True)
+    monkeypatch.setattr(m, "human_sleep", lambda *a: None)
+    page = mock.Mock();page.is_closed.return_value = False
+    r = m.delete_old_marketplace_listings(page, 'fb', max_age_days=0, allowed_ids={'12345'})
+    assert r['success']
+    assert r['delete_action_count'] == 2
+    assert r['deleted'] == ['https://www.facebook.com/marketplace/item/12345/']
+    assert r['scanned'] == 1

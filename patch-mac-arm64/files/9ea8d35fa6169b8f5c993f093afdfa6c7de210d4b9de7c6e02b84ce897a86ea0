@@ -1,0 +1,6 @@
+playwright>=1.52.0
+# 可選：反偵測強化（未安裝時程式會自動略過）
+# playwright-stealth
+
+# 去識別診斷配置圖產生器（實機不可只留下 JSON 而缺圖片）
+Pillow>=10.4.0

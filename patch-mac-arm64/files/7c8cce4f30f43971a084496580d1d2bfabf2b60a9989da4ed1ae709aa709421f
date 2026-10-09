@@ -1,0 +1,75 @@
+"""Bounded step evidence. Only read-only DOM sampling can retry; never replay actions.
+
+Cloud images are de-identified layout diagrams rendered from an allowlist of
+control labels. Raw screenshots remain local; no page text, values, URLs or
+account identifiers enter these diagrams.
+"""
+import datetime
+import json
+import re
+import time
+from pathlib import Path
+
+_STARTED = time.monotonic()
+_COUNT = 0
+MAX_STEPS = 12
+SAFE_LABELS = ('標題', '價格', '類別', '狀況', '繼續', '發佈', '發布',
+               'Title', 'Price', 'Category', 'Condition', 'Next', 'Publish')
+
+
+def read_state(page):
+    # Every operation in this retry loop is a read. No navigation, click or fill.
+    last = None
+    for attempt in range(2):
+        try:
+            state = page.evaluate('''(labels) => {
+                const controls = [...document.querySelectorAll('input,textarea,[role="combobox"],[role="button"],button')];
+                return {viewport: {width: innerWidth, height: innerHeight},
+                    language: navigator.language,
+                    browser: navigator.userAgent,
+                    controls: controls.map(el => {
+                        const r = el.getBoundingClientRect();
+                        const label = el.getAttribute('aria-label') || el.labels?.[0]?.innerText || el.innerText || '';
+                        const safe = labels.find(x => label.trim() === x || label.trim().startsWith(x+'\\n')) || 'other';
+                        return {label:safe,role:el.getAttribute('role') || el.tagName.toLowerCase(),
+                            filled: !!el.value,disabled:!!el.disabled || el.getAttribute('aria-disabled')==='true',
+                            x:r.x,y:r.y,width:r.width,height:r.height};
+                    }).filter(r => r.width>0 && r.height>0 && r.y<innerHeight && r.x<innerWidth).slice(0,80)};
+            }''', list(SAFE_LABELS))
+            state['read_attempts'] = attempt + 1
+            return state
+        except Exception as exc:
+            last = type(exc).__name__
+    return {'read_attempts': 2, 'read_error': last}
+
+
+def capture_step(page, raw_path, step):
+    global _COUNT
+    if _COUNT >= MAX_STEPS:
+        return
+    _COUNT += 1
+    state = read_state(page)
+    safe_step = str(step) if re.fullmatch(r'[a-zA-Z_-]{1,60}', str(step)) else 'snapshot'
+    state.update(step=safe_step, elapsed_ms=int((time.monotonic()-_STARTED)*1000),
+                 captured_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                 image_kind='redacted_control_layout')
+    path = Path(raw_path)
+    # No screenshot pixels are reused. Names, passwords, photos, arbitrary text
+    # and even unknown labels cannot leak into an automatically uploaded image.
+    try:
+        from PIL import Image, ImageDraw
+        vp=state.get('viewport', {})
+        w=max(320,min(int(vp.get('width',800)),1600));h=max(200,min(int(vp.get('height',900)),1200))
+        im=Image.new('RGB',(w,h),'white');draw=ImageDraw.Draw(im)
+        draw.text((8,8),'REDACTED CONTROL LAYOUT - not a raw screenshot',fill='black')
+        for i,c in enumerate(state.get('controls',[])):
+            x=max(0,min(w,int(c['x'])));y=max(30,min(h,int(c['y'])))
+            right=max(x,min(w,int(c['x']+c['width'])));bottom=max(y,min(h,int(c['y']+c['height'])))
+            draw.rectangle((x,y,right,bottom),outline='gray',fill='#eeeeee' if c['disabled'] else '#e4f4ee')
+            # Keep the index in the picture; exact safe labels are in JSON.
+            draw.text((x+2,y+2),f"#{i} {'filled' if c['filled'] else 'empty'}",fill='black')
+        im.save(path.with_suffix('.diagnostic.jpg'),quality=70)
+        state['image_available']=True
+    except Exception:
+        state['image_available']=False
+    path.with_suffix('.diagnostic.json').write_text(json.dumps(state,ensure_ascii=False),encoding='utf-8')
