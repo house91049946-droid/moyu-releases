@@ -1,0 +1,13 @@
+"""主打權重只套用呼叫端已篩選的合格物件，不改上限或指定發文。"""
+import random
+from sqlalchemy import select
+from .database import SyncSession, Property
+
+
+def pick_property_id(ids, rng=None):
+    ids=list(dict.fromkeys(ids))
+    if not ids:
+        raise ValueError("沒有合格物件")
+    with SyncSession() as s:
+        featured=set(s.execute(select(Property.id).where(Property.id.in_(ids), Property.featured == True)).scalars())
+    return (rng or random).choices(ids, weights=[2 if i in featured else 1 for i in ids], k=1)[0]

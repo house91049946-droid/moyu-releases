@@ -1,0 +1,16 @@
+"""Known placeholder images; never classify a real photo by brightness."""
+import hashlib
+from pathlib import Path
+from .config import DATA_DIR
+
+PLACEHOLDER_SHA256 = {"31a1d2b16073ade3ca98814e36cb9c8f6f313e5fb524fef26f92441b45b5c4af"}
+
+
+def is_placeholder(path: str) -> bool:
+    if not path:
+        return False
+    fp = DATA_DIR / path.lstrip("/") if path.startswith("/uploads/") else Path(path)
+    try:
+        return fp.is_file() and hashlib.sha256(fp.read_bytes()).hexdigest() in PLACEHOLDER_SHA256
+    except OSError:
+        return False

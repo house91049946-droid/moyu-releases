@@ -1,0 +1,56 @@
+"""Escalate repeated failures without replaying a browser operation."""
+import base64
+import datetime as dt
+import json
+from pathlib import Path
+from sqlalchemy import select
+from .error_report import scrub
+
+THRESHOLD = 3
+WINDOW_HOURS = 24
+
+
+def attach(session, log, item):
+    from .database import RunLog
+    from .fbauto_bridge import FB_AUTO_DATA_DIR
+    from .api.troubleshoot import _machine_info
+    if not log.created_at:
+        return
+    rows=session.execute(select(RunLog).where(
+        RunLog.account_id == log.account_id, RunLog.fbid == log.fbid,
+        RunLog.task_type == log.task_type,
+        RunLog.created_at >= log.created_at-dt.timedelta(hours=WINDOW_HOURS),
+        RunLog.id <= log.id).order_by(RunLog.id.desc())).scalars().all()
+    failures=[]
+    for row in rows:
+        if row.status == 'success':break
+        if row.status in ('failed','needs_manual'):failures.append(row)
+    # Escalate each third consecutive failure; success resets the streak.
+    if len(failures)<THRESHOLD or len(failures)%THRESHOLD:
+        return
+    root=(FB_AUTO_DATA_DIR.parent/'screenshot').resolve()
+    steps=[];images=[]
+    for rel in (log.screenshot_paths or [])[-6:]:
+        path=(root/rel).resolve()
+        if not path.is_relative_to(root):continue
+        meta=path.with_suffix('.diagnostic.json').resolve();jpg=path.with_suffix('.diagnostic.jpg').resolve()
+        if not meta.is_relative_to(root) or not jpg.is_relative_to(root):continue
+        try:
+            if meta.stat().st_size>50_000:continue
+            d=json.loads(meta.read_text())
+            if d.get('image_kind')!='redacted_control_layout':continue
+            # Producer serializes only allowlisted UI labels, booleans and geometry.
+            d['step'] = scrub(d.get('step'), 60)
+            d['browser'] = scrub(d.get('browser'), 300)
+            steps.append(d)
+            if d.get('image_available') and jpg.stat().st_size<200_000:
+                images.append('data:image/jpeg;base64,'+base64.b64encode(jpg.read_bytes()).decode())
+        except (OSError,ValueError,TypeError):continue
+    item['diagnostic']={
+        'schema':1,'repeat_count':len(failures),'window_hours':WINDOW_HOURS,
+        'environment':_machine_info(),'steps':steps,'images':images,
+        'related_log_ids':[r.id for r in failures[:6]],
+        'timeline':[{'id':r.id,'status':r.status,'error':scrub(r.error_message),
+                     'duration_sec':r.duration_sec} for r in reversed(failures[:6])],
+        'retry_policy':'read_dom_once_only; never replay publish/delete/payment',
+    }

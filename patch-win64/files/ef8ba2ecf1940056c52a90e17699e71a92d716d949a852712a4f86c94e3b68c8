@@ -1,0 +1,68 @@
+"""Browser regression: search fields, number prices and reordered controls."""
+import os
+import sys
+from pathlib import Path
+import pytest
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from src import run_detect_mp_groups as detect
+
+@pytest.fixture
+def page(monkeypatch):
+    from playwright.sync_api import sync_playwright
+    from src import utils
+    monkeypatch.setattr(utils,'human_sleep',lambda *a:None)
+    monkeypatch.setattr(utils,'simulate_human_click',lambda page,el:el.click())
+    import src.marketplacePost as mp
+    monkeypatch.setattr(mp,'human_sleep',lambda *a:None)
+    monkeypatch.setattr(mp,'simulate_human_click',lambda page,el:el.click())
+    with sync_playwright() as p:
+        b=p.chromium.launch(headless=True,**({'executable_path':os.environ['TEST_CHROME']} if os.environ.get('TEST_CHROME') else {}))
+        yield b.new_page()
+        b.close()
+
+@pytest.mark.parametrize('price_type',['text','number'])
+@pytest.mark.parametrize('category_role',['option','presentation'])
+def test_fill_with_search_and_reordered_combos(page,price_type,category_role):
+    page.set_content('''<input id="search" aria-label="搜尋 Facebook">
+    <label role="combobox" aria-label="狀況" id="condition" onclick="document.querySelector('#new').hidden=false">狀況</label>
+    <div role="option" id="new" hidden onclick="document.querySelector('#condition').textContent='狀況 全新';this.hidden=true">全新</div>
+    <label role="combobox" aria-label="庫存狀況">庫存狀況</label>
+    <label for="price">價格</label><input id="price" type="'''+price_type+'''">
+    <label for="title">標題</label><input id="title">
+    <label role="combobox" aria-label="類別" id="category" onclick="document.querySelector('#option').hidden=false">類別</label>
+    <div role="'''+category_role+'''" id="option" hidden onclick="document.querySelector('#category').textContent='類別 工具';this.hidden=true">工具</div>''')
+    detect._fill_detect_fields(page)
+    assert page.locator('#search').input_value()==''
+    assert page.locator('#title').input_value()=='test'
+    assert page.locator('#price').input_value()=='100'
+
+
+def test_missing_field_fails_without_filling_search(page):
+    page.set_content('<input aria-label="搜尋 Facebook">')
+    with pytest.raises(RuntimeError,match='找不到唯一'):
+        detect._visible_field(page,('標題','Title'))
+    assert page.locator('input').input_value()==''
+
+
+def test_diagnostic_read_retry_is_bounded_and_never_clicks():
+    from src.diagnostics import read_state
+    class Page:
+        attempts=0
+        def evaluate(self,*args):
+            self.attempts+=1
+            raise RuntimeError('temporary failure')
+    p=Page();result=read_state(p)
+    assert p.attempts==2 and result['read_attempts']==2
+
+
+def test_diagnostic_excludes_private_values(page,tmp_path):
+    import json
+    from src import diagnostics as d
+    d._COUNT=0
+    page.set_content('<div>PRIVATE PERSON</div><input aria-label="PASSWORD SECRET" value="secret-value"><input aria-label="標題" value="private-property"><img alt="private-photo">')
+    path=tmp_path/'test.png';d.capture_step(page,path,'test')
+    raw=path.with_suffix('.diagnostic.json').read_text()
+    assert all(x not in raw for x in ['PRIVATE','secret-value','private-property','private-photo'])
+    meta=json.loads(raw)
+    assert meta['image_kind']=='redacted_control_layout'
+    assert meta['image_available'] and path.with_suffix('.diagnostic.jpg').is_file()

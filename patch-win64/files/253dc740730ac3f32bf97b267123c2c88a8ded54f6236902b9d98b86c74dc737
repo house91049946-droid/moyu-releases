@@ -1,0 +1,329 @@
+"""使用者指定的物件生命週期。外部寫入逐步執行，未知結果絕不自動重送。"""
+import asyncio
+import datetime as dt
+import json
+import random
+import uuid
+import re
+from urllib.parse import urlsplit
+from sqlalchemy import select, or_, and_
+from .database import SyncSession, Property, PublicationJob, PostHistory, Account
+from .config import DATA_DIR
+
+BUSY = {'queued', 'running', 'waiting', 'reposting'}
+STAGES = {'relist': ['mp', 'mp_verify'], 'all': ['mp', 'mp_verify', 'fb_direct', 'fb_scan', 'ig_direct', 'ig_scan', 'threads_direct', 'threads_scan']}
+_LOCK = asyncio.Lock()
+
+
+def _mp_item_id(url):
+    try:
+        parsed = urlsplit(url or '')
+        if parsed.netloc and (parsed.scheme != 'https' or parsed.hostname not in ('www.facebook.com', 'facebook.com', 'm.facebook.com')):
+            return ''
+        match = re.fullmatch(r'/marketplace/item/(\d+)/?', parsed.path)
+        return match.group(1) if match else ''
+    except (ValueError, TypeError):
+        return ''
+
+
+def _old_item_urls(p):
+    for listings in [p.live_listings or []] + [h.get('live_listings', []) for h in reversed(p.round_history or []) if isinstance(h, dict)]:
+        urls = [x['item_url'] for x in (listings or []) if isinstance(x, dict) and x.get('item_url')]
+        if urls:
+            return urls
+    return []
+
+
+def _restore_verification_urls(j, p):
+    if j.mode == 'all' and not j.payload.get('item_urls'):
+        j.payload = dict(j.payload, item_urls=_old_item_urls(p))
+
+
+def snapshot(pid):
+    with SyncSession() as s:
+        j = s.get(PublicationJob, pid)
+        if not j:
+            return None
+        return dict(mode=j.mode, status=j.status, detail=j.detail,
+                    due_at=j.due_at.isoformat()+'Z' if j.due_at else None,
+                    stage=j.stage, receipts=j.receipts or [])
+
+
+def enqueue(pid, mode):
+    if mode not in STAGES:
+        raise ValueError('未知操作')
+    with SyncSession() as s:
+        p = s.get(Property, pid)
+        if not p:
+            raise ValueError('物件不存在')
+        j = s.get(PublicationJob, pid)
+        if j and j.status == 'done' and mode == 'all' and p.publication_state == 'archived':
+            return '此物件已全部下架'
+        if j and j.status in BUSY:
+            if j.mode != mode:
+                if j.status != 'waiting':
+                    raise ValueError('正在處理中，請待本步完成後再全部下架')
+            else:
+                return '已在處理中，不會重複建立工作'
+        from .force_delist import case_titles
+        titles = case_titles(p)
+        other_titles=set()
+        for other in s.execute(select(Property).where(Property.id!=pid,Property.account_id==p.account_id)).scalars():
+            other_titles.update(case_titles(other))
+        if any(a in b or b in a for a in titles for b in other_titles if a and b):
+            raise ValueError('其他物件有相同標題，請先區分名稱／文案，避免下架錯誤物件')
+        acc = s.get(Account, p.account_id) if p.account_id else None
+        if not acc or not acc.fb_user_id:
+            raise ValueError('此物件尚未綁定 FB 帳號')
+        from .fbauto_bridge import _profile_busy
+        from .scheduler.marketplace_runner import _MP_LOCK
+        from .scheduler.group_post_runner import _GP_LOCK
+        if _GP_LOCK.locked() or _MP_LOCK.locked() or _profile_busy(f'fb:{acc.fb_user_id}') or _profile_busy('meta'):
+            raise ValueError('目前仍有發文或瀏覽器工作，完成後再下架以免新舊工作交錯')
+        if j and j.status == 'failed' and j.mode == mode:
+            if j.stage >= len(STAGES[mode]):
+                raise ValueError('重新刊登結果不明，請先核對 FB；不會自動重複刊登')
+            # 每個刪除步驟都可驗證後重試；已完成平台不重做。
+            _restore_verification_urls(j, p)
+            j.status, j.detail = 'queued', '已排入重試'
+        else:
+            item_urls = [x['item_url'] for x in (p.live_listings or []) if isinstance(x, dict) and x.get('item_url')]
+            # 續刊等待時已把舊網址移至歷史；改為全部下架仍須能再次核對。
+            if mode == 'all' and not item_urls:
+                item_urls = _old_item_urls(p)
+            if j:
+                s.delete(j); s.flush()
+            urls = {}
+            urls['fb']=list(s.execute(select(PostHistory.post_url).where(PostHistory.property_id==pid, PostHistory.account_id==acc.id, PostHistory.group_url!='', PostHistory.deleted==False, PostHistory.post_url!='')).scalars())
+            for platform, name in [('ig','Instagram'), ('threads','Threads')]:
+                urls[platform] = list(s.execute(select(PostHistory.post_url).where(
+                    PostHistory.property_id == pid, PostHistory.account_id == acc.id,
+                    PostHistory.group_name == name, PostHistory.deleted == False,
+                    PostHistory.post_url != '')).scalars())
+            j = PublicationJob(property_id=pid, token=uuid.uuid4().hex, mode=mode, status='queued', stage=0,
+                payload={'titles': titles, 'urls': urls, 'fbid': acc.fb_user_id, 'account_id':acc.id,
+                         'item_urls':item_urls,
+                         'starting_count':p.post_count_total or 0, 'original_enabled':p.enabled,
+                         'price':p.price, 'passes':0, 'had_mp':bool(p.live_listings or p.post_count_total)}, receipts=[], detail='等待平台下架')
+            s.add(j)
+        if mode == 'relist' and not j.payload.get('item_urls'):
+            raise ValueError('沒有舊 MP 網址，無法確認刪除；請先補回刊登紀錄')
+        p.enabled = False
+        p.publication_state = 'cleanup'
+        p.scheduled_post_at = None
+        p.scheduled_post_opts = None
+        s.commit()
+    return '已排入全部下架' if mode == 'all' else '已排入繼續刊登；確認舊 MP 刪除後等待 1–5 日'
+
+
+def fail(pid, token, message):
+    with SyncSession() as s:
+        j=s.get(PublicationJob,pid); p=s.get(Property,pid)
+        if j and p and j.token == token:
+            j.status='failed'; j.detail=message[:1000]; p.publication_state='failed'; p.enabled=False
+            s.commit()
+
+
+def stage_args(j):
+    stage=STAGES[j.mode][j.stage]; data=j.payload
+    folder=DATA_DIR/'publication_jobs'/j.token
+    folder.mkdir(parents=True,exist_ok=True)
+    def save(name,value):
+        path=folder/name; path.write_text(json.dumps(value,ensure_ascii=False),encoding='utf-8'); return str(path)
+    if stage=='mp_verify':
+        return 'mp_verify','src.run_verify_removed',[
+            '--fbid',data['fbid'],'--urls-file',save('mp-verify.json',data['item_urls']),'--headless'],f"fb:{data['fbid']}"
+    if stage=='mp':
+        return 'mp_cleanup','src.run_delete_marketplace',[
+            '--fbid', data['fbid'], '--max-age-days','0','--headless',
+            '--only-titles-file',save('titles.json',data['titles']),
+            '--item-urls-file',save('mp-urls.json',data['item_urls'])],f"fb:{data['fbid']}"
+    platform=stage.split('_')[0]
+    only={'urls':data['urls'].get(platform,[]),
+          'phrases':[] if stage.endswith('_direct') else [t for t in data['titles'] if len(t)>=8],
+          'max_age_days':36500, 'exact_phrases':True}
+    args=['--older-than','0','--force-recent','--max','50','--headless','--only-file',save(stage+'.json',only)]
+    if platform=='fb':
+        return 'cleanup_fb','src.run_fb_cleanup',args+['--fbid',data['fbid'],'--groups']+(['--direct-urls'] if stage.endswith('_direct') else []),f"fb:{data['fbid']}"
+    if stage.endswith('_direct'):
+        args+=['--direct-urls']
+    return 'cleanup_'+platform,'src.run_meta_cleanup',args+['--platform',platform],'meta'
+
+
+async def execute_stage(j):
+    from .fbauto_bridge import start_long_op, wait_profile_free
+    stage=STAGES[j.mode][j.stage]
+    if stage.endswith('_direct') and not j.payload['urls'].get(stage.split('_')[0]):
+        from .fbauto_bridge import BridgeResult
+        return BridgeResult(success=True,data={'deleted':0,'posts':[]})
+    if stage=='mp_verify' and not j.payload.get('item_urls') and not j.payload.get('had_mp'):
+        from .fbauto_bridge import BridgeResult
+        return BridgeResult(success=True,data={'posts':[]})
+    op,module,args,key=stage_args(j)
+    busy=await wait_profile_free(key,max_wait_sec=30,tag='[lifecycle]')
+    if busy is not None:
+        raise RuntimeError('瀏覽器忙碌，請稍後重試')
+    loop=asyncio.get_running_loop(); done=loop.create_future()
+    def callback(result):
+        loop.call_soon_threadsafe(lambda: done.set_result(result) if not done.done() else None)
+    await asyncio.to_thread(start_long_op,op,module,args,account_id=j.payload['account_id'],
+                            fbid=j.payload['fbid'] if key.startswith('fb:') else '',on_done=callback)
+    return await asyncio.wait_for(done, timeout=7200)
+
+
+def complete_stage(pid, token, result):
+    with SyncSession() as s:
+        j=s.get(PublicationJob,pid);p=s.get(Property,pid)
+        if not j or not p or j.token!=token or j.status != 'running':return
+        data=result.data or {}
+        stage=STAGES[j.mode][j.stage]
+        if not result.success or data.get('skipped_undated') or data.get('skipped_unknown') or data.get('completion') == 'needs_review':
+            j.status='failed'; j.detail='下架未完成：'+(result.error or '仍有日期或結果不明的貼文')[:600]
+            p.publication_state='failed';s.commit();return
+        if (stage == 'fb' or stage.endswith('_scan')) and (not data.get('scan_complete') or data.get('skipped_pinned')):
+            j.status='failed';j.detail='下架未完成：掃描範圍未確認完整或仍有置頂貼文';p.publication_state='failed';s.commit();return
+        count=int(data.get('deleted_count') or data.get('deleted') or 0)
+        actions=int(data.get('delete_action_count') or count)
+        receipts=list(j.receipts or []);receipts.append({'stage':stage,'at':dt.datetime.utcnow().isoformat(),
+            'deleted':count,'delete_actions':actions,'deleted_urls':data.get('deleted_urls',[]),'posts':data.get('posts',[]),'screenshots':data.get('screenshots',[]),'result':'confirmed' if stage=='mp_verify' else 'reported'});j.receipts=receipts
+        payload=dict(j.payload)
+        if stage=='mp' and data.get('note')=='no_tool_listings_recorded' and payload.get('had_mp'):
+            j.status='failed';j.detail='找不到舊刊登紀錄，不能確認已下架';p.publication_state='failed';s.commit();return
+        if stage=='mp_verify' and not payload.get('mp_deleted_at'):
+            payload['mp_deleted_at']=dt.datetime.utcnow().isoformat()
+            if j.mode=='relist':
+                j.due_at=dt.datetime.utcnow()+dt.timedelta(days=random.randint(1,5))
+        if data.get('limit_reached') or (actions and not stage.endswith('_direct')):
+            # 再掃一次确认空集合；防止達單輪上限便誤認全部下架。
+            payload['passes']=int(payload.get('passes',0))+1
+            if payload['passes']>=20:
+                j.status='failed';j.detail='清理仍有剩餘，請檢查後重試';p.publication_state='failed'
+            else:
+                j.status='queued'
+                j.detail=(f'{stage} 已執行 {actions} 次刪除操作，等待再次掃描確認' if stage=='mp' else f'{stage} 已刪 {count} 則，等待再次掃描確認')
+        else:
+            j.stage+=1;payload['passes']=0;j.status='queued';j.detail=f'{stage} 已完成核對'
+        deleted_urls=[x.get('url') for x in data.get('posts',[]) if x.get('status') in ('deleted','already_gone')]
+        if deleted_urls:
+            for row in s.execute(select(PostHistory).where(PostHistory.property_id==pid,PostHistory.post_url.in_(deleted_urls))).scalars():
+                row.deleted=True
+        j.updated_at=dt.datetime.utcnow()
+        j.payload=payload
+        if j.stage>=len(STAGES[j.mode]):
+            history=list(p.round_history or []);history.append({'at':dt.datetime.utcnow().isoformat(),
+                'live_listings':p.live_listings or [],'shared_groups':p.shared_groups or [],'mode':j.mode})
+            p.round_history=history;p.live_listings=[]
+            if j.mode=='all':
+                p.publication_state='archived';j.status='done';j.detail='全部下架完成'
+            else:
+                p.publication_state='waiting';j.status='waiting';j.detail='舊刊登已清理，等待重新刊登'
+        s.commit()
+
+
+async def tick():
+    if _LOCK.locked():return
+    from .database import get_system_state_sync
+    if get_system_state_sync().get('paused'):return
+    async with _LOCK:
+        with SyncSession() as s:
+            j=s.execute(select(PublicationJob).where(or_(PublicationJob.status=='queued', and_(PublicationJob.status=='waiting', PublicationJob.due_at<=dt.datetime.utcnow())))
+                .order_by(PublicationJob.updated_at)).scalars().first()
+            if not j:return
+            pid,token=j.property_id,j.token
+            if j.status=='waiting':
+                if not j.due_at or j.due_at>dt.datetime.utcnow():return
+                p=s.get(Property,pid)
+                if not p:return
+                if p.price != j.payload.get('price'):
+                    j.status='failed';j.detail='價格已修改，請確認七版文案與含價圖片後重新安排';p.publication_state='failed';s.commit();return
+                p.enabled=False;p.publication_state='reposting';j.status='reposting';s.commit()
+                repost=True
+            else:
+                j.status='running';s.commit();s.refresh(j);s.expunge(j);repost=False
+        try:
+            if not repost:
+                result=await execute_stage(j);complete_stage(pid,token,result)
+            else:
+                from .scheduler.marketplace_runner import prepare_post_now,run_prepared_post_now
+                snap,fbid=await prepare_post_now(pid,True,[],lifecycle_token=token)
+                snap['lifecycle_token']=token
+                await run_prepared_post_now(snap,fbid,pid)
+                with SyncSession() as s:
+                    j=s.get(PublicationJob,pid);p=s.get(Property,pid)
+                    if not j or not p or j.token != token or j.status != 'reposting':
+                        return
+                    old_ids = {_mp_item_id(url) for url in j.payload.get('item_urls', [])}
+                    new_ids = {_mp_item_id(x.get('item_url')) for x in (p.live_listings or []) if isinstance(x, dict)} - old_ids - {''}
+                    if (p.post_count_total or 0)>int(j.payload.get('starting_count',0)) and new_ids:
+                        j.status='done';j.detail='新一輪已刊登';p.publication_state='active';p.enabled=bool(j.payload.get('original_enabled'))
+                    else:
+                        j.status='failed';j.detail='重新刊登結果或新商品網址尚未確認，先查證，勿重複刊登';p.publication_state='failed';p.enabled=False
+                    s.commit()
+        except Exception as e:
+            fail(pid,token,str(e))
+
+
+async def restore():
+    # 外部寫入中斷後不重送；保留現場待確認。等待中的 due_at 不變。
+    with SyncSession() as s:
+        for j in s.execute(select(PublicationJob).where(PublicationJob.status.in_(['running','reposting']))).scalars():
+            j.status='failed';j.detail='工作中斷，需先核對平台結果再重試'
+            p=s.get(Property,j.property_id)
+            if p:p.enabled=False;p.publication_state='failed'
+        s.commit()
+    from .scheduler.task_runner import scheduler
+    from .scheduler.task_runner import require_license
+    scheduler.add_job(require_license(task_type='publication_lifecycle')(tick),'interval',seconds=60,id='publication_lifecycle',replace_existing=True,max_instances=1)
+
+
+def allowed_to_post(pid, token=''):
+    with SyncSession() as s:
+        p=s.get(Property,pid)
+        if not p:return False
+        state=p.publication_state or 'active'
+        if not token:return state=='active' and p.enabled is not False
+        j=s.get(PublicationJob,pid)
+        return bool(j and state=='reposting' and j.status=='reposting' and j.token==token)
+
+
+def card_statuses(ids):
+    from .group_resolver import resolve_targets_sync
+    out={}
+    with SyncSession() as s:
+        for pid in ids:
+            p=s.get(Property,pid)
+            if not p:continue
+            targets,_=resolve_targets_sync(pid)
+            shared=set(p.shared_groups or [])
+            complete=bool(p.live_listings and targets and set(targets)<=shared)
+            out[pid]={'publication':snapshot(pid),'round_complete':complete}
+    return out
+
+
+def control(pid,action):
+    with SyncSession() as s:
+        p=s.get(Property,pid);j=s.get(PublicationJob,pid)
+        if not p:raise ValueError('物件不存在')
+        if action=='restore' and p.publication_state=='archived':
+            p.publication_state='active';p.enabled=False
+            if j:j.status='done'
+        elif action=='cancel' and j and j.status=='waiting':
+            j.status='cancelled';j.detail='已取消續刊，物件保持暫停'
+            p.publication_state='active';p.enabled=False
+        elif action=='confirm-copy' and j and j.status=='failed' and j.detail.startswith('價格已修改'):
+            data=dict(j.payload);data['price']=p.price;j.payload=data
+            j.status='waiting';p.publication_state='waiting';j.detail='已確認更新文案與照片，等待續刊'
+        elif action=='retry' and j and j.status=='failed' and j.stage<len(STAGES[j.mode]):
+            _restore_verification_urls(j, p)
+            j.status='queued';p.publication_state='cleanup';j.detail='已排入重試'
+        else:raise ValueError('目前狀態不適用此操作')
+        s.commit()
+    return '已更新物件狀態'
+
+
+def mobile_states():
+    with SyncSession() as s:
+        rows=s.execute(select(PublicationJob)).scalars().all()
+        return {str(j.property_id): {'state': ('done' if j.mode=='all' and j.status=='done' else
+                'failed' if j.status=='failed' else 'running' if j.status in BUSY else ''),
+                'detail':j.detail} for j in rows}
